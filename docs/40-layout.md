@@ -52,3 +52,19 @@ SPAだがクライアントサイドルーティングで**本物のURLを持つ
 ## フロントのビルド成果物
 
 `web/dist` を `embed.FS` で `campd` に埋め込み、単一バイナリで配る。開発時はViteのdevサーバーへプロキシする。
+
+## 運用上の注意: システムの `sqlite3` CLI では FTS を触れない
+
+Fedora の `sqlite3` コマンドは **FTS5 モジュールを持っていない**（`no such module: fts5`）。テーブルの中身は読めるが、`messages_fts` に対する `integrity-check` や `MATCH` は失敗する。
+
+Camp本体は `modernc.org/sqlite` が FTS5 を同梱しているので問題ない。**点検は `campd doctor` を使うこと。**
+
+```
+$ campd doctor -v
+ok    sqlite                   3.53.3
+ok    journal_mode             wal
+ok    foreign_keys             on
+ok    fts5                     利用可
+ok    messages_fts integrity   整合
+ok    foreign_key_check        違反なし
+```
