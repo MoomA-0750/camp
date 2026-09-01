@@ -2,9 +2,11 @@ package ingest
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/MoomA-0750/camp/internal/store"
 )
@@ -21,18 +23,30 @@ type Result struct {
 	SessionRuns int
 	SourceFiles int
 	Messages    int
-	Reread      int      // (dev,inode,size) の食い違いで先頭から取り直したファイル
+	Reread      int      // (dev,inode,size) の食い違いで世代を進めたファイル
+	Missing     int      // 今回の走査で消えていたファイル（行は残す）
+	Unchanged   int      // 追記が無く、要約を再利用して読み飛ばしたファイル
 	Orphans     []string // 親が見つからず stub に落としたサイドカー候補
 }
 
 // Ingest は root 以下の会話記録を DB に取り込む。再実行しても重複しない。
 func Ingest(db *store.DB, host, root string) (*Result, error) {
-	corpus, err := Survey(root)
+	res := &Result{Host: host, Root: root, RoleCounts: map[string]int{}}
+
+	prior, err := loadPrior(db, host)
 	if err != nil {
 		return nil, err
 	}
+	corpus, err := Survey(root, prior)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range corpus.Files {
+		if p, ok := prior[f.Path]; ok && p.Offset > 0 && p.Offset == f.EndOffset {
+			res.Unchanged++
+		}
+	}
 
-	res := &Result{Host: host, Root: root, RoleCounts: map[string]int{}}
 	for _, f := range corpus.Files {
 		res.RoleCounts[f.Role]++
 	}
@@ -63,12 +77,13 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	}
 	res.Sessions = len(sessions)
 
-	fileIDs, reread, err := writeSourceFiles(tx, hostID, corpus, sessions)
+	fileIDs, reread, missing, err := writeSourceFiles(tx, hostID, corpus, sessions)
 	if err != nil {
 		return nil, err
 	}
 	res.SourceFiles = len(fileIDs)
 	res.Reread = reread
+	res.Missing = missing
 
 	nRuns, nLinks, err := writeRuns(tx, corpus, fileIDs)
 	if err != nil {
@@ -98,10 +113,41 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 		res.Messages += n
 	}
 
-	if err := refreshCounts(db); err != nil {
-		return nil, err
+	// 追記が1行も無ければ集計は変わらない。ポーリングで回すので、
+	// 何も起きていないときのコストをゼロに寄せる。
+	if res.Messages > 0 {
+		if err := refreshCounts(db); err != nil {
+			return nil, err
+		}
 	}
 	return res, nil
+}
+
+// loadPrior は前回保存した要約とオフセットをパスで引けるようにする。
+// これが無いと毎回165MBを読み直すことになり「差分追尾」にならない。
+func loadPrior(db *store.DB, host string) (map[string]*Prior, error) {
+	rows, err := db.Query(`
+		select f.path, f.ingested_offset, coalesce(f.dev,0), coalesce(f.inode,0),
+		       f.summary_version, coalesce(f.resume_sha,''), f.summary_json
+		  from source_files f join hosts h on h.id = f.host_id
+		 where h.name = ? and f.superseded_at is null`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]*Prior{}
+	for rows.Next() {
+		var path string
+		var p Prior
+		var ver sql.NullInt64
+		if err := rows.Scan(&path, &p.Offset, &p.Dev, &p.Inode, &ver, &p.ResumeSHA, &p.Summary); err != nil {
+			return nil, err
+		}
+		p.Version = int(ver.Int64)
+		out[path] = &p
+	}
+	return out, rows.Err()
 }
 
 func upsertHost(db *store.DB, name string) (int64, error) {
@@ -339,11 +385,15 @@ func b2i(b bool) int {
 	return 0
 }
 
-// writeSourceFiles は物理ファイル層を作る。
-// (dev, inode) が変わっていたら別の実体なので、オフセットを0に戻して取り直す。
-func writeSourceFiles(tx *sql.Tx, hostID int64, c *Corpus, g map[string][]*FileSummary) (map[string]int64, int, error) {
-	ids := map[string]int64{}
-	reread := 0
+// writeSourceFiles は物理ファイル層を作り、消えたファイルに印を付ける。
+//
+// (dev, inode) が変わった、または size < ingested_offset のときは、同じ行の
+// オフセットを0に戻してはいけない。新しい中身が古い中身と同じバイト位置に
+// 現れるので、messages の UNIQUE(source_file_id, byte_offset) に当たって
+// 新しい行が黙って捨てられる。世代（incarnation）を1つ進めた別の行を作る。
+func writeSourceFiles(tx *sql.Tx, hostID int64, c *Corpus, g map[string][]*FileSummary) (ids map[string]int64, reread, missing int, err error) {
+	ids = map[string]int64{}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	for _, f := range c.Files {
 		// 0バイトのファイルは sessions を作っていない。存在しないセッションを
@@ -355,54 +405,94 @@ func writeSourceFiles(tx *sql.Tx, hostID int64, c *Corpus, g map[string][]*FileS
 		if _, ok := g[sess]; !ok {
 			sess = ""
 		}
+		mtime := f.MTime.Format(time.RFC3339Nano)
 
-		var prevID, prevDev, prevInode, prevSize, prevOffset sql.NullInt64
-		err := tx.QueryRow(
-			`select id, dev, inode, size, ingested_offset from source_files where host_id = ? and path = ?`,
-			hostID, f.Path).Scan(&prevID, &prevDev, &prevInode, &prevSize, &prevOffset)
+		var prevID, prevIncarn sql.NullInt64
+		err := tx.QueryRow(`
+			select id, incarnation from source_files
+			 where host_id = ? and path = ? and superseded_at is null`,
+			hostID, f.Path).Scan(&prevID, &prevIncarn)
 		if err != nil && err != sql.ErrNoRows {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 
+		incarnation := int64(0)
 		if prevID.Valid {
-			rotated := prevDev.Int64 != f.Dev || prevInode.Int64 != f.Inode || f.Size < prevOffset.Int64
-			if rotated {
-				// 中身が入れ替わった。過去のレコードは残したまま先頭から読み直す。
-				if _, err := tx.Exec(`update source_files set ingested_offset = 0 where id = ?`, prevID.Int64); err != nil {
-					return nil, 0, err
+			// 世代を進めるかどうかは summarize が既に決めている。
+			// 判定を2箇所に持つと、読み方と保存の仕方が食い違う。
+			if !f.Rotated {
+				if _, err := tx.Exec(`
+					update source_files set role = ?, session_id = ?, agent_id = ?,
+						dev = ?, inode = ?, size = ?, mtime = ?, missing_at = null
+					where id = ?`,
+					f.Role, nz(sess), nz(f.AgentID), f.Dev, f.Inode, f.Size, mtime, prevID.Int64); err != nil {
+					return nil, 0, 0, err
 				}
-				reread++
+				ids[f.Path] = prevID.Int64
+				continue
 			}
-			if _, err := tx.Exec(`
-				update source_files set role = ?, session_id = ?, agent_id = ?,
-					dev = ?, inode = ?, size = ?, mtime = ?, missing_at = null
-				where id = ?`,
-				f.Role, nz(sess), nz(f.AgentID), f.Dev, f.Inode, f.Size,
-				f.MTime.Format("2006-01-02T15:04:05.000000000Z07:00"), prevID.Int64); err != nil {
-				return nil, 0, err
+			// 中身が入れ替わった。古い世代は消さずに閉じる（D-001）。
+			if _, err := tx.Exec(
+				`update source_files set superseded_at = ? where id = ?`, now, prevID.Int64); err != nil {
+				return nil, 0, 0, err
 			}
-			ids[f.Path] = prevID.Int64
-			continue
+			incarnation = prevIncarn.Int64 + 1
+			reread++
 		}
 
 		r, err := tx.Exec(`
-			insert into source_files(host_id, path, role, session_id, agent_id,
+			insert into source_files(host_id, path, incarnation, role, session_id, agent_id,
 				dev, inode, size, mtime, ingested_offset, first_seen_at)
-			values(?,?,?,?,?,?,?,?,?,0,?)`,
-			hostID, f.Path, f.Role, nz(sess), nz(f.AgentID),
-			f.Dev, f.Inode, f.Size,
-			f.MTime.Format("2006-01-02T15:04:05.000000000Z07:00"),
-			f.MTime.Format("2006-01-02T15:04:05.000000000Z07:00"))
+			values(?,?,?,?,?,?,?,?,?,?,0,?)`,
+			hostID, f.Path, incarnation, f.Role, nz(sess), nz(f.AgentID),
+			f.Dev, f.Inode, f.Size, mtime, mtime)
 		if err != nil {
-			return nil, 0, fmt.Errorf("source_file %s: %w", f.Rel, err)
+			return nil, 0, 0, fmt.Errorf("source_file %s: %w", f.Rel, err)
 		}
 		id, err := r.LastInsertId()
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		ids[f.Path] = id
 	}
-	return ids, reread, nil
+
+	missing, err = markMissing(tx, hostID, c, now)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return ids, reread, missing, nil
+}
+
+// markMissing は今回の走査で見えなかったファイルに印を付ける。
+// **行は消さない。** 消えた事実だけを記録するのが「独立して保持」の核心（D-001）。
+func markMissing(tx *sql.Tx, hostID int64, c *Corpus, now string) (int, error) {
+	if _, err := tx.Exec(`create temp table if not exists seen_paths(path text primary key)`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`delete from seen_paths`); err != nil {
+		return 0, err
+	}
+	stmt, err := tx.Prepare(`insert or ignore into seen_paths(path) values(?)`)
+	if err != nil {
+		return 0, err
+	}
+	for _, f := range c.Files {
+		if _, err := stmt.Exec(f.Path); err != nil {
+			stmt.Close()
+			return 0, err
+		}
+	}
+	stmt.Close()
+
+	r, err := tx.Exec(`
+		update source_files set missing_at = ?
+		 where host_id = ? and superseded_at is null and missing_at is null
+		   and path not in (select path from seen_paths)`, now, hostID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := r.RowsAffected()
+	return int(n), err
 }
 
 // writeRuns は行に現れた session_id を実行（run）として登録し、
@@ -498,7 +588,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	if err := db.QueryRow(`select ingested_offset from source_files where id = ?`, fileID).Scan(&offset); err != nil {
 		return 0, err
 	}
-	if offset >= f.EndOffset {
+	if offset >= f.EndOffset && offset > 0 {
 		return 0, nil // 新しいバイトは無い
 	}
 
@@ -538,10 +628,9 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 
 	n := 0
 	var end int64
-	res, walkErr := WalkFile(f.Path, func(l *Line) error {
-		if l.Offset < offset {
-			return nil
-		}
+	// 前回の位置から読む。ファイル全体を読み直して古い行を捨てる書き方だと、
+	// 2行の追記のために165MBを走査することになる。
+	res, walkErr := WalkFileFrom(f.Path, offset, func(l *Line) error {
 		runID := ownRun
 		if l.RunID != "" {
 			runID = l.RunID
@@ -583,9 +672,14 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	if len(res.Pending) > 0 {
 		pending = res.Pending
 	}
-	if _, err := tx.Exec(
-		`update source_files set ingested_offset = ?, pending_tail = ? where id = ?`,
-		end, pending, fileID); err != nil {
+	summary, err := json.Marshal(f)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`
+		update source_files set ingested_offset = ?, pending_tail = ?,
+			summary_json = ?, summary_version = ?, resume_sha = ?
+		 where id = ?`, end, pending, summary, SummaryVersion, f.ResumeSHA, fileID); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -628,11 +722,17 @@ func refreshCounts(db *store.DB) error {
 		return err
 	}
 	// run の生存期間。/clear をまたいだ実行がどこまで続いたかがここで見える。
+	// 相関サブクエリを2本書くと ix_msg_run_ts を2回走査するので、
+	// 1回の集計に畳んでから join する。
 	_, err := db.Exec(`
+		with span as (
+			select run_id, min(timestamp) as lo, max(timestamp) as hi
+			  from messages
+			 where run_id is not null and timestamp is not null
+			 group by run_id)
 		update runs set
-			started_at = (select min(m.timestamp) from messages m
-			               where m.run_id = runs.id and m.timestamp is not null),
-			ended_at   = (select max(m.timestamp) from messages m
-			               where m.run_id = runs.id and m.timestamp is not null)`)
+			started_at = (select lo from span where span.run_id = runs.id),
+			ended_at   = (select hi from span where span.run_id = runs.id)
+		 where exists (select 1 from span where span.run_id = runs.id)`)
 	return err
 }

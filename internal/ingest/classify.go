@@ -1,7 +1,11 @@
 package ingest
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -72,6 +76,52 @@ type FileSummary struct {
 	EndOffset int64
 	Pending   []byte
 	Broken    int
+
+	// ResumeSHA は EndOffset 直前256バイトのハッシュ。次回の再開点の検証に使う。
+	ResumeSHA string
+	// Rotated は前回の状態が使えず先頭から読み直したことを示す。
+	// source_files の世代を進めるかどうかの唯一の判断材料。
+	Rotated bool `json:"-"`
+}
+
+// resumeWindow は再開点の検証に使う窓の大きさ。
+const resumeWindow = 256
+
+// resumeSHA は offset 直前の resumeWindow バイトのハッシュを返す。
+// 追記専用ならこの範囲は不変なので、変わっていたら書き直されている。
+func resumeSHA(path string, offset int64) string {
+	if offset <= 0 {
+		return ""
+	}
+	start := offset - resumeWindow
+	if start < 0 {
+		start = 0
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, offset-start)
+	if _, err := f.ReadAt(buf, start); err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:])
+}
+
+// SummaryVersion は要約キャッシュの世代。パーサを直したら上げる。
+// 上げると保存済みの要約が捨てられ、全ファイルが先頭から読み直される。
+const SummaryVersion = 1
+
+// Prior は前回の走査で保存した状態。差分だけ読むために使う。
+type Prior struct {
+	Offset    int64
+	Dev       int64
+	Inode     int64
+	Version   int
+	ResumeSHA string
+	Summary   []byte // FileSummary の JSON
 }
 
 // Corpus は1回のスキャンで見えたファイル全体。
@@ -92,7 +142,7 @@ type Corpus struct {
 // 分類は全ファイルを見終わるまで確定できない。「参照されているか」が
 // 他ファイルの中身に依存するので、1ファイルずつ完結させられない。
 // そのため取り込みは2パスになる（ここで分類 → 別パスで messages を書く）。
-func Survey(root string) (*Corpus, error) {
+func Survey(root string, prior map[string]*Prior) (*Corpus, error) {
 	c := &Corpus{
 		Root:         root,
 		runOwner:     map[string]string{},
@@ -106,7 +156,7 @@ func Survey(root string) (*Corpus, error) {
 		if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
 			return nil
 		}
-		fsum, err := summarize(root, path, d)
+		fsum, err := summarize(root, path, d, prior[path])
 		if err != nil {
 			return err
 		}
@@ -178,23 +228,51 @@ func (c *Corpus) ParentSession(f *FileSummary) string {
 func (c *Corpus) SessionFile(key string) *FileSummary { return c.bySessionKey[key] }
 
 // summarize は1ファイルを読み切って要約する。
-func summarize(root, path string, d fs.DirEntry) (*FileSummary, error) {
+func summarize(root, path string, d fs.DirEntry, prior *Prior) (*FileSummary, error) {
 	info, err := d.Info()
 	if err != nil {
 		return nil, err
 	}
 	rel, _ := filepath.Rel(root, path)
 
-	f := &FileSummary{
-		Path:  path,
-		Rel:   rel,
-		Size:  info.Size(),
-		MTime: info.ModTime().UTC(),
-	}
+	f := &FileSummary{}
+	start := int64(0)
+
+	// 前回の要約が使えるなら、そこから追記分だけ読む。
+	// (dev, inode) が変わっていたら別の実体なので先頭から。
+	// size が前回位置より小さければ切り詰められているので先頭から。
+	var dev, inode int64
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		f.Dev = int64(st.Dev)
-		f.Inode = int64(st.Ino)
+		dev, inode = int64(st.Dev), int64(st.Ino)
 	}
+	rotated := false
+	if prior != nil && prior.Offset > 0 {
+		switch {
+		case prior.Dev != dev || prior.Inode != inode:
+			rotated = true // 別の実体になった
+		case info.Size() < prior.Offset:
+			rotated = true // 切り詰められた
+		case resumeSHA(path, prior.Offset) != prior.ResumeSHA:
+			// 同じ inode のまま、前より長く書き直された。
+			// size と inode だけ見ていると気づけない。
+			rotated = true
+		}
+		if !rotated && prior.Version == SummaryVersion && len(prior.Summary) > 0 {
+			if err := json.Unmarshal(prior.Summary, f); err == nil {
+				start = prior.Offset
+			} else {
+				f = &FileSummary{}
+			}
+		}
+	}
+	f.Rotated = rotated
+
+	f.Path = path
+	f.Rel = rel
+	f.Size = info.Size()
+	f.MTime = info.ModTime().UTC()
+	f.Dev, f.Inode = dev, inode
+	f.Broken = 0
 
 	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	if strings.Contains(filepath.ToSlash(filepath.Dir(path)), "/subagents") {
@@ -205,9 +283,17 @@ func summarize(root, path string, d fs.DirEntry) (*FileSummary, error) {
 	if f.Size == 0 {
 		return f, nil
 	}
+	if start > 0 && start == f.Size {
+		f.EndOffset = start
+		f.ResumeSHA = resumeSHA(path, start)
+		return f, nil // 追記なし
+	}
 
 	seenRun := map[string]struct{}{}
-	res, walkErr := WalkFile(path, func(l *Line) error {
+	for _, r := range f.RunIDs {
+		seenRun[r] = struct{}{}
+	}
+	res, walkErr := WalkFileFrom(path, start, func(l *Line) error {
 		f.Lines++
 		f.absorb(l, seenRun)
 		return nil
@@ -218,6 +304,7 @@ func summarize(root, path string, d fs.DirEntry) (*FileSummary, error) {
 	f.Broken = len(res.Broken)
 	f.EndOffset = res.EndOffset
 	f.Pending = res.Pending
+	f.ResumeSHA = resumeSHA(path, res.EndOffset)
 
 	if f.SessionID == "" {
 		f.SessionID = base // sessionId が1行も無い subagent への保険

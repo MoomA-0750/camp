@@ -159,8 +159,12 @@ func cmdIngest(args []string) error {
 	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\n",
 		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages)
 	if res.Reread > 0 {
-		fmt.Printf("先頭から取り直し %d\n", res.Reread)
+		fmt.Printf("世代を進めた   %d\n", res.Reread)
 	}
+	if res.Missing > 0 {
+		fmt.Printf("消えていた     %d（行は残す）\n", res.Missing)
+	}
+	fmt.Printf("読み飛ばし      %d ファイル（追記なし）\n", res.Unchanged)
 	fmt.Printf("所要            %s\n", time.Since(started).Round(time.Millisecond))
 	return nil
 }

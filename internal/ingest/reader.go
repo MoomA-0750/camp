@@ -108,18 +108,33 @@ type WalkResult struct {
 }
 
 // WalkFile はファイルを先頭から読み、各行に fn を適用する。
+func WalkFile(path string, fn func(*Line) error) (WalkResult, error) {
+	return WalkFileFrom(path, 0, fn)
+}
+
+// WalkFileFrom は start バイト目から読む。差分追尾で使う。
+//
+// start は「完了した行だけを消費した後の位置」なので、前回の走査で
+// 未完了だった末尾は自然に読み直される。pending_tail は診断用であって
+// 再開に必須ではない。
 //
 // 1行が壊れていてもファイル全体の読み取りは止めない。壊れた行は
 // Broken に積んで先へ進む。fn がエラーを返した場合だけ中断する。
-func WalkFile(path string, fn func(*Line) error) (WalkResult, error) {
+func WalkFileFrom(path string, start int64, fn func(*Line) error) (WalkResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return WalkResult{}, err
 	}
 	defer f.Close()
 
+	if start > 0 {
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			return WalkResult{}, err
+		}
+	}
+
 	var res WalkResult
-	rd := NewReader(f, 0)
+	rd := NewReader(f, start)
 	for {
 		raw, off, err := rd.Next()
 		if err == io.EOF {

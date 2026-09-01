@@ -8,19 +8,20 @@ Claude Codeのセッションと会話履歴をCLI側の都合から独立して
 
 ## ステータス
 
-Phase 0 実装中（M0〜M3 完了）。2026-09-01にリポジトリ作成。
+Phase 0 実装中（M0〜M4 完了）。2026-09-01にリポジトリ作成。
 
 2026-09-01に4方向の評価（取り込み層の実証・プロトコルの実証・Obsidian置き換えの実現可能性・codexによる独立レビュー）を経てフェーズを再構成した。進捗と受け入れ条件は `dev/active/phase0-plan.md`。
 
 ```
 $ campd ingest
 main 46 / resume-sidecar 14 / stub 9 / subagent 3 / empty 10
-projects 21（cwd 35個から）  sessions 58  runs 33  session_runs 42  messages 32,073
+projects 21（cwd 35個から）  sessions 58  runs 33  session_runs 42  messages 32,198
+初回 6.2秒 / 追記なしの2回目 66ms
 ```
 
 | Phase | 内容 | 状態 |
 |---|---|---|
-| 0 | 取り込み・SQLite・**日本語対応**全文検索・最小UI | M0〜M3 完了（M4以降 実装中） |
+| 0 | 取り込み・SQLite・**日本語対応**全文検索・最小UI | M0〜M4 完了（M5以降 実装中） |
 | 1 | Vault読み取り＋ノート↔セッション相互リンク | 未着手 |
 | 2 | ビュー機構の読み取り側＋LLM文脈コンパイラ＋**MCPサーバー公開** | 未着手 |
 | 3 | セッション駆動（`claude -p` 双方向stream-json＋承認UI） | 未着手 |

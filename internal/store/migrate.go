@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
@@ -92,23 +93,76 @@ func (db *DB) appliedSet() (map[string]bool, error) {
 	return done, rows.Err()
 }
 
+// noFKDirective が先頭付近にあるマイグレーションは、外部キーを切って適用する。
+//
+// FK参照を持つテーブルを作り直すには SQLite 公式手順どおり foreign_keys を
+// 切る必要がある。PRAGMA foreign_keys はトランザクション内では効かず、
+// defer_foreign_keys も「親テーブルを DROP して同名で作り直す」場合には
+// 遅延カウンタが戻らずコミットに失敗する（実際にこれで 787 に当たった）。
+//
+// 切りっぱなしにはしない。コミット前に foreign_key_check を必ず走らせ、
+// 1件でも違反があればロールバックする。
+const noFKDirective = "-- camp:no-foreign-keys"
+
+func (m Migration) needsFKOff() bool {
+	head := m.SQL
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	return strings.Contains(head, noFKDirective)
+}
+
 func (db *DB) applyOne(m Migration) error {
-	tx, err := db.Begin()
+	ctx := context.Background()
+
+	// 接続を固定する。PRAGMA は接続単位なので、プールに任せると
+	// 切ったつもりの設定が別の接続に当たらない。
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("conn %s: %w", m.Name, err)
+	}
+	defer conn.Close()
+
+	if m.needsFKOff() {
+		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+			return fmt.Errorf("%s: 外部キーを切れない: %w", m.Name, err)
+		}
+		defer conn.ExecContext(ctx, "PRAGMA foreign_keys = ON")
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin %s: %w", m.Name, err)
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(m.SQL); err != nil {
+	if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
 		return fmt.Errorf("apply %s: %w", m.Name, err)
 	}
-	if _, err := tx.Exec(
+
+	if m.needsFKOff() {
+		bad, err := fkViolations(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("%s: foreign_key_check: %w", m.Name, err)
+		}
+		if bad > 0 {
+			return fmt.Errorf("%s: 外部キー違反が %d 件。適用を取り消した", m.Name, bad)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO schema_migrations(name, applied_at) VALUES(?, ?)",
 		m.Name, time.Now().UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		return fmt.Errorf("record %s: %w", m.Name, err)
 	}
 	return tx.Commit()
+}
+
+func fkViolations(ctx context.Context, tx *sql.Tx) (int, error) {
+	var n int
+	err := tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_foreign_key_check").Scan(&n)
+	return n, err
 }
 
 // AppliedMigrations は適用済みのマイグレーション名を古い順に返す。

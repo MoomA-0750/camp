@@ -59,22 +59,27 @@ CREATE TABLE projects (
 CREATE INDEX ix_projects_parent ON projects(parent_project_id);
 
 -- ── ファイル層をセッション層から分離（事実1・4への対処）────────────────────
-CREATE TABLE source_files (
+CREATE TABLE source_files (      -- 1パス複数世代。現行世代だけが一意（部分索引 ux_sf_current）
   id              INTEGER PRIMARY KEY,
   host_id         INTEGER NOT NULL REFERENCES hosts(id),
   path            TEXT NOT NULL,
-  role            TEXT NOT NULL,          -- main | resume-sidecar | subagent | codex-rollout
+  incarnation     INTEGER NOT NULL DEFAULT 0,  -- 書き直されるたびに進む世代
+  role            TEXT NOT NULL,          -- main | resume-sidecar | subagent | stub | empty
   session_id      TEXT REFERENCES sessions(id),
   agent_id        TEXT,                   -- subagent: ファイル名 agent-<id>.jsonl から
-  dev             INTEGER, inode INTEGER, -- ローテーション/切り詰めのガード
+  dev             INTEGER, inode INTEGER, -- 別の実体になっていないかのガード
   size            INTEGER NOT NULL DEFAULT 0,
   mtime           TEXT,
   ingested_offset INTEGER NOT NULL DEFAULT 0,  -- 必ず \n 境界に着地させる
-  pending_tail    BLOB,                        -- 最後の \n 以降のバイト
+  pending_tail    BLOB,                        -- 最後の \n 以降のバイト（診断用）
+  resume_sha      TEXT,                        -- offset 直前256バイト。書き直しの検出
+  summary_json    BLOB,                        -- 分類に要る要約。差分だけ吸い上げる
+  summary_version INTEGER NOT NULL DEFAULT 0,
   first_seen_at   TEXT NOT NULL,
   missing_at      TEXT,                        -- ★独立保持: 行は決して消さない
-  UNIQUE(host_id, path)
+  superseded_at   TEXT                         -- 世代が進んだ古い行。これも消さない
 );
+CREATE UNIQUE INDEX ux_sf_current ON source_files(host_id, path) WHERE superseded_at IS NULL;
 CREATE INDEX ix_sf_session ON source_files(session_id);
 CREATE INDEX ix_sf_scan    ON source_files(host_id, missing_at, mtime DESC);
 
@@ -284,7 +289,19 @@ CREATE TABLE usage_windows (
 3. **`<sessionId>/subagents/agent-*.jsonl` はパスで親セッションに結び付ける。** subagent 行の `sessionId` は**親の値**なので、そのままでは主キーにできない。`sessions.id` は `<親sessionId>.<agentId>` を合成する。`is_sidechain` と `agent_id` を立て、`parent_session_id` で親を指す
 3b. **run の照合はセッション横断で行う。** `/clear` で生まれたセッションの行が別セッション由来の run を指すのは正しい。セッション単位で絞ると実測で7,173件の `run_id` を落とす
 4. **usage は `INSERT … ON CONFLICT(api_message_id) DO NOTHING`。** `messages` に対して `SUM` しない
-5. **最後の `\n` までしかコミットしない。** 残りは `pending_tail` に退避。`size < ingested_offset` または `(dev,inode)` が変わったら、新しい `source_files` 行としてオフセット0から取り直す
+5. **最後の `\n` までしかコミットしない。** 残りは `pending_tail` に退避（診断用。再開点は `ingested_offset` なので未完了の末尾は自然に読み直される）。
+
+   **世代が変わったと判定する条件は3つ**（1つでも当たれば `incarnation` を進めた**別の行**を作り、古い行は `superseded_at` を立てて残す）:
+
+   1. `(dev, inode)` が変わった — 別の実体になった
+   2. `size < ingested_offset` — 切り詰められた
+   3. `ingested_offset` 直前256バイトのハッシュ（`resume_sha`）が変わった — **同じ inode のまま前より長く書き直された**
+
+   3が無いと1と2をすり抜ける書き直しを見逃し、新しい中身の途中から読み始めて黙って壊れる。
+
+   **同じ行のオフセットを0に戻してはいけない。** 新しい中身が古い中身と同じバイト位置に現れ、`messages` の `UNIQUE(source_file_id, byte_offset)` に当たって `ON CONFLICT DO NOTHING` が新しい行を捨てる。
+5b. **走査で見えなかったファイルは `missing_at` を立てるだけ。行は消さない**（D-001）。既に立っている `missing_at` は上書きしない
+5c. **要約は `summary_json` に永続化して差分だけ吸い上げる。** 役割の分類に `RunIDs` と会話行の有無が要るので、保存しないと追記2行のために165MBを読み直すことになる（実測 6.2秒 → 66ms）。`summary_version` を上げると全ファイルが読み直される
 6. **オフセット更新とレコード挿入は1トランザクション**
 7. **`sessions.updated_at = max(メッセージのtimestamp, ファイルのmtime)`**。5種類の行にタイムスタンプが無い
 8. **表示順は `(source_file_id, byte_offset)`。** タイムスタンプでソートしない（69ファイル中44本で逆順が発生）
