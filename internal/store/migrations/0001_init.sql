@@ -50,6 +50,10 @@ CREATE TABLE sessions (
   started_at           TEXT NOT NULL,
   updated_at           TEXT NOT NULL,
   message_count        INTEGER NOT NULL DEFAULT 0,
+  -- message_count は attachment / mode / bridge-session のような制御行も数える。
+  -- 起動しただけで何も話していないセッション（role=stub、実測9件）は
+  -- message_count が4〜8になるので、それだけでは一覧から外せない。
+  conversation_count   INTEGER NOT NULL DEFAULT 0,
   total_cost_usd       REAL,
   archived             INTEGER NOT NULL DEFAULT 0
 );
@@ -57,6 +61,7 @@ CREATE INDEX ix_sessions_recent  ON sessions(host_id, updated_at DESC);
 CREATE INDEX ix_sessions_project ON sessions(project_id, updated_at DESC);
 CREATE INDEX ix_sessions_agent   ON sessions(agent, updated_at DESC);
 CREATE INDEX ix_sessions_parent  ON sessions(parent_session_id);
+CREATE INDEX ix_sessions_conv    ON sessions(conversation_count, updated_at DESC);
 
 -- 物理ファイル層。main / resume-sidecar / subagent / codex-rollout をすべてここで持つ。
 -- missing_at が「独立保持」の核心。元が消えても行は削除しない。
@@ -80,21 +85,37 @@ CREATE TABLE source_files (
 CREATE INDEX ix_sf_session ON source_files(session_id);
 CREATE INDEX ix_sf_scan    ON source_files(host_id, missing_at, mtime DESC);
 
--- --resume ごとに1行。claude の session_id（snake_case）がここに入る。
+-- runs = CLI の1実行。claude の session_id（snake_case）がここに入る。
+--
+-- run と session は多対多である。片方向だと思うと必ず壊れる。
+--   1セッション : 多run  … --resume。元ファイルに追記しつつサイドカーを作る
+--   1run : 多セッション  … /clear。同じ実行のまま新しい .jsonl へ移る
+--
+-- 実測（unibridge、2026-09-02確認）: run bf4ff50f は 2026-08-02T11:59 から
+-- 08-08T10:09 まで生き続け、/clear のたびに新しい会話ファイルを作って
+-- 計8セッションを生んだ。隣り合うファイルの末尾と先頭のタイムスタンプは
+-- 25ms 以内で連なる。しかも bf4ff50f という名前のファイルは存在しない。
+-- 逆に session 9182f0fd は4つの run を持つが、そのどれも自分の id ではない。
 CREATE TABLE runs (
   id              TEXT PRIMARY KEY,
-  session_id      TEXT NOT NULL REFERENCES sessions(id),
-  seq             INTEGER NOT NULL,
   sidecar_file_id INTEGER REFERENCES source_files(id),
   cli_version     TEXT,
   cwd             TEXT,
   mode            TEXT,
   permission_mode TEXT,
   started_at      TEXT,
-  ended_at        TEXT,
-  UNIQUE(session_id, seq)
+  ended_at        TEXT
 );
-CREATE INDEX ix_runs_session ON runs(session_id, seq);
+
+-- seq はそのセッションの中での実行の順番（0 = 最初、以降 --resume）。
+-- run 側から見れば「この実行が生んだ会話たち」を辿る索引になる。
+CREATE TABLE session_runs (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  run_id     TEXT NOT NULL REFERENCES runs(id),
+  seq        INTEGER NOT NULL,
+  PRIMARY KEY(session_id, run_id)
+);
+CREATE INDEX ix_srun_run ON session_runs(run_id);
 
 -- 主キーは (source_file_id, byte_offset)。uuid ではない。
 -- --fork-session は親の履歴を uuid ごと新しいファイルへ複製するため、

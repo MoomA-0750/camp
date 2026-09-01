@@ -2,7 +2,7 @@
 
 2026-09-01の実証（`dev/active/review-ingest.md`）を反映した確定版。**当初案は複数の点で壊れていた**ので、根拠は必ずそちらを参照すること。
 
-## 設計を決めた5つの事実
+## 設計を決めた10の事実
 
 | # | 事実 | 帰結 |
 |---|---|---|
@@ -14,6 +14,8 @@
 | 6 | **`uuid` はファイルを跨ぐと重複する。** `--fork-session` が親の履歴を uuid ごと新ファイルへ複製する（実測26件） | `messages` の主キーは `uuid` ではなく **`(source_file_id, byte_offset)`** |
 | 7 | **行タイプは15種。** 当初14種としていたが `frame-link` を見落としていた | パーサは未知の型で落ちてはいけない |
 | 8 | **`toolUseResult` と `attachment` は形が一定しない。** オブジェクト・文字列・配列のいずれもある（厳密な型で受けると実コーパスで26行が落ちた） | `json.RawMessage` で受けて遅延デコードする |
+| 9 | **run とセッションは多対多。** `--resume` は1セッションに多runを、`/clear` は1runに多セッションを作る（実測: run `bf4ff50f` が6日間で8セッションを生成） | `runs.session_id` を持たせず `session_runs` で対応を張る（D-012） |
+| 10 | **会話行が無いファイルは2種類ある。** 他ファイルから run として参照されるサイドカー（14件）と、参照もされない「起動しただけ」（9件）。後者は remote-control を開いて何も送らなかった痕跡 | `role` を5種にし、`sessions.conversation_count` で一覧から外せるようにする |
 
 ## 全文検索は日本語で無言に失敗する（重要）
 
@@ -100,6 +102,7 @@ CREATE TABLE sessions (
   started_at           TEXT NOT NULL,
   updated_at           TEXT NOT NULL,     -- max(msg ts, file mtime)。5種類の行にtsが無い
   message_count        INTEGER NOT NULL DEFAULT 0,
+  conversation_count   INTEGER NOT NULL DEFAULT 0,  -- user/assistant だけ。stub を一覧から外すのに使う
   total_cost_usd       REAL,              -- cost-state 行がタダでくれる
   archived             INTEGER NOT NULL DEFAULT 0
 );
@@ -109,14 +112,22 @@ CREATE INDEX ix_sessions_agent   ON sessions(agent, updated_at DESC);
 CREATE INDEX ix_sessions_parent  ON sessions(parent_session_id);
 
 -- ── runs: --resume ごとに1行。当初案に欠けていたテーブル ────────────────────
-CREATE TABLE runs (
-  id              TEXT PRIMARY KEY,       -- claude の session_id（snake_case）
-  session_id      TEXT NOT NULL REFERENCES sessions(id),
-  seq             INTEGER NOT NULL,
+CREATE TABLE runs (              -- CLI の1実行。session とは多対多（D-012）
+  id              TEXT PRIMARY KEY,
   sidecar_file_id INTEGER REFERENCES source_files(id),
-  cli_version     TEXT, cwd TEXT, mode TEXT, permission_mode TEXT,
-  started_at      TEXT, ended_at TEXT,
-  UNIQUE(session_id, seq)
+  cli_version     TEXT,
+  cwd             TEXT,
+  mode            TEXT,
+  permission_mode TEXT,
+  started_at      TEXT,
+  ended_at        TEXT
+);
+
+CREATE TABLE session_runs (      -- seq = そのセッション内での実行順（0 = 初回）
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  run_id     TEXT NOT NULL REFERENCES runs(id),
+  seq        INTEGER NOT NULL,
+  PRIMARY KEY(session_id, run_id)
 );
 CREATE INDEX ix_runs_session ON runs(session_id, seq);
 
@@ -249,8 +260,21 @@ CREATE TABLE usage_windows (
 ## 取り込み規則
 
 1. **プロジェクトは行ごとの `cwd` から導く。** マングルされたディレクトリ名を絶対にパースしない。`/.claude/worktrees/` で分割し左半分を親リポジトリとする。**結果を永続化する**（worktreeは消える）。`git rev-parse --git-common-dir` は worktree が生きている間だけ日和見的に併用する
-2. **`{mode, permission-mode, bridge-session, system}` しか含まず、他ファイルの `session_id` として現れるファイルは resume サイドカー。** `sessions` ではなく `runs` を作る
-3. **`<sessionId>/subagents/agent-*.jsonl` はパスで親セッションに結び付ける。** `is_sidechain` と `agent_id` を立て、トップレベルのセッションを作らない
+2. **役割は中身から毎回決め直す。** 一度決めて固定してはいけない。稼働中のセッションは生まれた直後 `stub` と見分けが付かず、最初のプロンプトが書かれた瞬間 `main` に変わる
+
+   | role | 判定 | 実測 | sessions を作るか |
+   |---|---|---|---|
+   | `subagent` | `<sessionId>/subagents/agent-*.jsonl` | 3 | 作る（親に紐付け、`is_sidechain`） |
+   | `empty` | 0バイト、または1行も無い | 10 | 作らない |
+   | `main` | `user`/`assistant` 行がある | 46 | 作る |
+   | `resume-sidecar` | 会話行が無く、**他ファイルの `session_id` として参照されている** | 14 | **作らない**（`runs` になる） |
+   | `stub` | 会話行が無く、参照もされていない | 9 | 作る（`conversation_count = 0`） |
+
+   当初の規則は「`{mode, permission-mode, bridge-session, system}` しか含まないもの」としていたが、**サイドカーには `cost-state` や `last-prompt` も混じる**ので型の集合では判定できない。会話行の有無と参照の有無で決める。
+
+   分類は全ファイルを見終わるまで確定しない（「参照されているか」が他ファイルの中身に依存する）。したがって取り込みは必ず2パスになる。
+3. **`<sessionId>/subagents/agent-*.jsonl` はパスで親セッションに結び付ける。** subagent 行の `sessionId` は**親の値**なので、そのままでは主キーにできない。`sessions.id` は `<親sessionId>.<agentId>` を合成する。`is_sidechain` と `agent_id` を立て、`parent_session_id` で親を指す
+3b. **run の照合はセッション横断で行う。** `/clear` で生まれたセッションの行が別セッション由来の run を指すのは正しい。セッション単位で絞ると実測で7,173件の `run_id` を落とす
 4. **usage は `INSERT … ON CONFLICT(api_message_id) DO NOTHING`。** `messages` に対して `SUM` しない
 5. **最後の `\n` までしかコミットしない。** 残りは `pending_tail` に退避。`size < ingested_offset` または `(dev,inode)` が変わったら、新しい `source_files` 行としてオフセット0から取り直す
 6. **オフセット更新とレコード挿入は1トランザクション**

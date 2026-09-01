@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/store"
@@ -39,6 +40,8 @@ func run(args []string) error {
 		return cmdDoctor(rest)
 	case "scan":
 		return cmdScan(rest)
+	case "ingest":
+		return cmdIngest(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -56,6 +59,7 @@ usage:
   campd migrate [-db P]   スキーマを最新まで適用する（冪等）
   campd doctor  [-db P]   DB の状態を点検する
   campd scan    [-root D] 会話記録を読んで実測レポートを出す（DBには書かない）
+  campd ingest  [-root D] 会話記録を DB に取り込む（再実行しても重複しない）
 `)
 }
 
@@ -115,6 +119,61 @@ func cmdScan(args []string) error {
 		return fmt.Errorf("%d ファイルでパースに失敗", len(rep.ParseErrors))
 	}
 	return nil
+}
+
+func cmdIngest(args []string) error {
+	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	root := fs.String("root", defaultClaudeProjects(), "~/.claude/projects 相当のディレクトリ")
+	host := fs.String("host", defaultHost(), "このコーパスを持つホスト名")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if _, err := db.Migrate(); err != nil {
+		return err
+	}
+
+	started := time.Now()
+	res, err := ingest.Ingest(db, *host, *root)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("host            %s\nroot            %s\n\n", res.Host, res.Root)
+	roles := make([]string, 0, len(res.RoleCounts))
+	for r := range res.RoleCounts {
+		roles = append(roles, r)
+	}
+	sort.Strings(roles)
+	fmt.Println("ファイルの役割:")
+	for _, r := range roles {
+		fmt.Printf("  %-16s %d\n", r, res.RoleCounts[r])
+	}
+	fmt.Printf("\nprojects        %d\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\n",
+		res.Projects, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages)
+	if res.Reread > 0 {
+		fmt.Printf("先頭から取り直し %d\n", res.Reread)
+	}
+	fmt.Printf("所要            %s\n", time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func defaultHost() string {
+	if h := os.Getenv("CAMP_HOST"); h != "" {
+		return h
+	}
+	h, err := os.Hostname()
+	if err != nil {
+		return "localhost"
+	}
+	return h
 }
 
 func defaultClaudeProjects() string {
