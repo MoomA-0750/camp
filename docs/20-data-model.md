@@ -333,7 +333,12 @@ CREATE TABLE usage_windows (
 5c. **要約は `summary_json` に永続化して差分だけ吸い上げる。** 役割の分類に `RunIDs` と会話行の有無が要るので、保存しないと追記2行のために165MBを読み直すことになる（実測 6.2秒 → 66ms）。`summary_version` を上げると全ファイルが読み直される
 6. **オフセット更新とレコード挿入は1トランザクション**
 7. **`sessions.updated_at = max(メッセージのtimestamp, ファイルのmtime)`**。5種類の行にタイムスタンプが無い
-8. **表示順は `(source_file_id, byte_offset)`。** タイムスタンプでソートしない（69ファイル中44本で逆順が発生）
+8. **表示順は `(source_file_id, byte_offset)`。** タイムスタンプでソートしない（実測: 72ファイル中**47本**、計**681箇所**で時刻が逆行する。最も多いセッションで105箇所）
+8b. **木に参加するのは15種のうち4種だけ**（`user` `assistant` `attachment` `system`）。残り11種は uuid も parentUuid も持たない付帯記録で、木の外にある。**実効の親 = `logicalParentUuid` があればそれ、無ければ `parentUuid`**。`logicalParentUuid` は `system/compact_boundary` にしか付かず（実測15件全部）、その行は `parentUuid` を持たない
+
+   **親の照合は必ず `session_id` で絞る。** uuid はセッション内では一意（重複0件）だが、セッションを跨ぐと fork で重複する。絞らないと他人の履歴に繋がる。
+
+   **根が1つになるとは限らない。それが正常。** 親を持たない `system/bridge_status` 行40件は**すべてそのファイルの先頭行**で、`/remote-control is active` の案内である。resume のサイドカーはほぼ空なので案内行だけが根として残る。会話の本数を数えるときは「子孫に user/assistant を含む根」だけを数える（実測: 49セッションすべてが1本）
 9. **`~/.claude/file-history/<sessionId>/` のバックアップ実体も捕獲対象**（現在18セッション/18MB）。ノートの編集前の中身そのもので、CLIがいずれGCする
 10. **`<synthetic>` は `usage` に入れない。** CLIがローカルで作る擬似アシスタント行で、`usage` は常にゼロ、課金も発生していない。入れておいて集計のたびに除外するより、最初から入れないほうが「除外を忘れる」経路が消える。`messages` には残す（レート制限履歴として有用。実測16行）
 11. **Vaultの索引は `.claude/` `.git/` `.trash/` を必ず除外する。** `.claude/worktrees/` に本体の11倍（45,125ファイル/442MB）の古いコピーがある

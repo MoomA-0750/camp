@@ -13,6 +13,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/store"
+	"github.com/MoomA-0750/camp/internal/thread"
 )
 
 // Version はビルド時に -ldflags で埋める。
@@ -48,6 +49,8 @@ func run(args []string) error {
 		return cmdBackfill(rest)
 	case "search":
 		return cmdSearch(rest)
+	case "thread":
+		return cmdThread(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -68,6 +71,7 @@ usage:
   campd ingest  [-root D] 会話記録を DB に取り込む（再実行しても重複しない）
   campd backfill [-db P]  messages から派生テーブル（usage・索引）を作り直す
   campd search  QUERY     全文検索（日本語は2文字から引ける）
+  campd thread  SESSION   会話を木に組み立てて形を見る
 `)
 }
 
@@ -252,6 +256,92 @@ func cmdSearch(args []string) error {
 			shortTime(h.Timestamp), label, title, h.Snippet, h.SessionID[:8], h.Score)
 	}
 	fmt.Printf("%d 件 / %s\n", len(hits), time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func cmdThread(args []string) error {
+	fs := flag.NewFlagSet("thread", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	show := fs.Int("show", 0, "先頭から何行ぶん中身を出すか")
+	all := fs.Bool("all", false, "全セッションの形を一覧する")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var ids []string
+	if *all {
+		rows, err := db.Query(`
+			select id from sessions where conversation_count > 0
+			 order by conversation_count desc`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+	} else {
+		if fs.NArg() == 0 {
+			return fmt.Errorf("セッションIDを指定する（前方一致でよい）。一覧は -all")
+		}
+		rows, err := db.Query(`select id from sessions where id like ?`, fs.Arg(0)+"%")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if len(ids) == 0 {
+			return fmt.Errorf("%q に当たるセッションが無い", fs.Arg(0))
+		}
+	}
+
+	totalRepaired, fragmented := 0, 0
+	for _, id := range ids {
+		t, err := thread.Build(db, id)
+		if err != nil {
+			return err
+		}
+		totalRepaired += t.Repaired
+		if t.Repaired > 0 {
+			fragmented++
+		}
+		fmt.Printf("%s  %s\n", id[:8], t.Describe())
+		for i, n := range t.Order {
+			if i >= *show {
+				break
+			}
+			label := n.Type
+			if n.Subtype != "" {
+				label += "/" + n.Subtype
+			}
+			via := ""
+			if n.ViaLogical {
+				via = " ←logical"
+			}
+			fmt.Printf("  %*s%s %s%s\n", n.Depth*2, "", shortTime(n.Timestamp), label, via)
+		}
+	}
+	if len(ids) > 1 {
+		fmt.Printf("\n%d セッション / 繋ぎ直し %d 箇所 / 要約で切れていたのは %d セッション\n",
+			len(ids), totalRepaired, fragmented)
+	}
 	return nil
 }
 
