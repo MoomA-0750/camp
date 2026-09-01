@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/store"
 )
 
@@ -36,6 +37,8 @@ func run(args []string) error {
 		return cmdMigrate(rest)
 	case "doctor":
 		return cmdDoctor(rest)
+	case "scan":
+		return cmdScan(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -52,6 +55,7 @@ usage:
   campd version           バージョンを表示する
   campd migrate [-db P]   スキーマを最新まで適用する（冪等）
   campd doctor  [-db P]   DB の状態を点検する
+  campd scan    [-root D] 会話記録を読んで実測レポートを出す（DBには書かない）
 `)
 }
 
@@ -91,6 +95,37 @@ func cmdMigrate(args []string) error {
 		fmt.Println("applied", name)
 	}
 	return nil
+}
+
+func cmdScan(args []string) error {
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	root := fs.String("root", defaultClaudeProjects(), "~/.claude/projects 相当のディレクトリ")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	rep, err := ingest.ScanDir(*root)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("root            %s\n", *root)
+	rep.Print(os.Stdout)
+
+	if len(rep.ParseErrors) > 0 {
+		return fmt.Errorf("%d ファイルでパースに失敗", len(rep.ParseErrors))
+	}
+	return nil
+}
+
+func defaultClaudeProjects() string {
+	if p := os.Getenv("CAMP_CLAUDE_PROJECTS"); p != "" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".claude/projects"
+	}
+	return filepath.Join(home, ".claude", "projects")
 }
 
 func cmdDoctor(args []string) error {

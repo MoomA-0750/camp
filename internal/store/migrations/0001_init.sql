@@ -96,8 +96,13 @@ CREATE TABLE runs (
 );
 CREATE INDEX ix_runs_session ON runs(session_id, seq);
 
+-- 主キーは (source_file_id, byte_offset)。uuid ではない。
+-- --fork-session は親の履歴を uuid ごと新しいファイルへ複製するため、
+-- uuid はファイルを跨ぐと重複しうる（実コーパスで26件確認）。
+-- ファイルが保管の単位なので、ファイル内の位置で同一性を決める。
 CREATE TABLE messages (
-  uuid                TEXT PRIMARY KEY,
+  id                  INTEGER PRIMARY KEY,
+  uuid                TEXT,
   session_id          TEXT NOT NULL REFERENCES sessions(id),
   run_id              TEXT REFERENCES runs(id),
   source_file_id      INTEGER NOT NULL REFERENCES source_files(id),
@@ -120,8 +125,11 @@ CREATE TABLE messages (
   model               TEXT,
   service_tier        TEXT,
   effort              TEXT,
-  raw_json            BLOB NOT NULL
+  degraded            INTEGER NOT NULL DEFAULT 0,
+  raw_json            BLOB NOT NULL,
+  UNIQUE(source_file_id, byte_offset)
 );
+CREATE INDEX ix_msg_uuid    ON messages(uuid);
 CREATE INDEX ix_msg_thread  ON messages(session_id, source_file_id, byte_offset);
 CREATE INDEX ix_msg_parent  ON messages(parent_uuid);
 CREATE INDEX ix_msg_logical ON messages(logical_parent_uuid);
@@ -132,7 +140,7 @@ CREATE INDEX ix_msg_time    ON messages(timestamp);
 -- idx は bigram 分かち書き済みの列。FTS5 はこちらを索引する。
 CREATE TABLE message_blocks (
   id           INTEGER PRIMARY KEY,
-  message_uuid TEXT NOT NULL REFERENCES messages(uuid),
+  message_id   INTEGER NOT NULL REFERENCES messages(id),
   idx          INTEGER NOT NULL,
   kind         TEXT NOT NULL,
   tool_name    TEXT,
@@ -140,7 +148,7 @@ CREATE TABLE message_blocks (
   text         TEXT,
   bigrams      TEXT
 );
-CREATE INDEX ix_blk_msg  ON message_blocks(message_uuid, idx);
+CREATE INDEX ix_blk_msg  ON message_blocks(message_id, idx);
 CREATE INDEX ix_blk_tool ON message_blocks(tool_use_id);
 
 -- external-content。本文の3重複製を避ける。
@@ -184,7 +192,7 @@ CREATE INDEX ix_usage_project ON usage(project_id, day);
 CREATE TABLE session_files (
   id             INTEGER PRIMARY KEY,
   session_id     TEXT NOT NULL REFERENCES sessions(id),
-  message_uuid   TEXT REFERENCES messages(uuid),
+  message_id     INTEGER REFERENCES messages(id),
   abs_path       TEXT NOT NULL,
   rel_path       TEXT,
   op             TEXT NOT NULL,
@@ -243,7 +251,7 @@ CREATE TABLE live_sessions (
 -- 非破壊の検出器（D-010）。記録するだけで raw_json は変更しない。
 CREATE TABLE sensitive_findings (
   id           INTEGER PRIMARY KEY,
-  message_uuid TEXT NOT NULL REFERENCES messages(uuid),
+  message_id   INTEGER NOT NULL REFERENCES messages(id),
   block_id     INTEGER REFERENCES message_blocks(id),
   pattern      TEXT NOT NULL,
   byte_offset  INTEGER,
@@ -252,5 +260,5 @@ CREATE TABLE sensitive_findings (
   verdict      TEXT,
   found_at     TEXT NOT NULL
 );
-CREATE INDEX ix_findings_msg ON sensitive_findings(message_uuid);
+CREATE INDEX ix_findings_msg ON sensitive_findings(message_id);
 CREATE INDEX ix_findings_new ON sensitive_findings(reviewed, found_at DESC);
