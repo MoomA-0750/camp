@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/MoomA-0750/camp/internal/ingest"
+	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/store"
 )
 
@@ -44,6 +46,8 @@ func run(args []string) error {
 		return cmdIngest(rest)
 	case "backfill":
 		return cmdBackfill(rest)
+	case "search":
+		return cmdSearch(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -62,7 +66,8 @@ usage:
   campd doctor  [-db P]   DB の状態を点検する
   campd scan    [-root D] 会話記録を読んで実測レポートを出す（DBには書かない）
   campd ingest  [-root D] 会話記録を DB に取り込む（再実行しても重複しない）
-  campd backfill [-db P]  messages から派生テーブル（usage 等）を作り直す
+  campd backfill [-db P]  messages から派生テーブル（usage・索引）を作り直す
+  campd search  QUERY     全文検索（日本語は2文字から引ける）
 `)
 }
 
@@ -159,8 +164,8 @@ func cmdIngest(args []string) error {
 	for _, r := range roles {
 		fmt.Printf("  %-16s %d\n", r, res.RoleCounts[r])
 	}
-	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\nusage 計上      %d\n",
-		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages, res.Usage)
+	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\nblocks 追加     %d\nusage 計上      %d\n",
+		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages, res.Blocks, res.Usage)
 	if res.Reread > 0 {
 		fmt.Printf("世代を進めた   %d\n", res.Reread)
 	}
@@ -192,9 +197,69 @@ func cmdBackfill(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("usage 再構築    %d 行を走査\ntotal_cost_usd  %d セッション\n所要            %s\n",
-		rows, sessions, time.Since(started).Round(time.Millisecond))
+	fmt.Printf("usage 再構築    %d 行を走査\ntotal_cost_usd  %d セッション\n", rows, sessions)
+
+	blocks, msgs, err := ingest.BackfillBlocks(db)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("索引 再構築     %d ブロック（%d メッセージから）\n所要            %s\n",
+		blocks, msgs, time.Since(started).Round(time.Millisecond))
 	return nil
+}
+
+func cmdSearch(args []string) error {
+	fs := flag.NewFlagSet("search", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	kind := fs.String("kind", "", "ブロック種別で絞る（text / thinking / tool_use / tool_result）")
+	sess := fs.String("session", "", "セッションIDで絞る")
+	limit := fs.Int("n", 20, "件数")
+	explain := fs.Bool("explain", false, "組み立てた MATCH 式も表示する")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	q := strings.Join(fs.Args(), " ")
+	if strings.TrimSpace(q) == "" {
+		return fmt.Errorf("検索語がない")
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if *explain {
+		expr, _ := search.BuildMatch(q)
+		fmt.Printf("MATCH %s\n\n", expr)
+	}
+
+	started := time.Now()
+	hits, err := search.Query(db, q, search.Opts{Kind: *kind, Session: *sess, Limit: *limit})
+	if err != nil {
+		return err
+	}
+	for _, h := range hits {
+		title := h.Title
+		if len([]rune(title)) > 40 {
+			title = string([]rune(title)[:40]) + "…"
+		}
+		label := h.Kind
+		if h.ToolName != "" {
+			label += ":" + h.ToolName
+		}
+		fmt.Printf("%s  %-22s %s\n  %s\n  session %s  score %.1f\n\n",
+			shortTime(h.Timestamp), label, title, h.Snippet, h.SessionID[:8], h.Score)
+	}
+	fmt.Printf("%d 件 / %s\n", len(hits), time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func shortTime(ts string) string {
+	if len(ts) >= 16 {
+		return ts[:16]
+	}
+	return ts
 }
 
 func defaultHost() string {

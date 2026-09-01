@@ -95,3 +95,85 @@ func BackfillUsage(db *store.DB) (rows int, sessions int, err error) {
 	}
 	return rows, sessions, nil
 }
+
+// backfillChunk は1回のトランザクションで扱うメッセージ数。
+// 接続が1本しかないので Rows を開いたまま Exec できない。読み切ってから書く。
+// raw_json は1行が数MBになることがあるので、まとめて全部は載せられない。
+const backfillChunk = 500
+
+// BackfillBlocks は messages.raw_json から message_blocks と messages_fts を作り直す。
+//
+// 索引の作り方（ブロックの切り方、bigram の刻み方）を変えたら必ずここを回す。
+// ディスクを読み直さない理由は BackfillUsage と同じ（D-014）。
+func BackfillBlocks(db *store.DB) (blocks int, msgs int, err error) {
+	if _, err := db.Exec(`delete from message_blocks`); err != nil {
+		return 0, 0, err
+	}
+	// external-content の索引は content 表を消しても残る。明示的に空にする。
+	if _, err := db.Exec(`insert into messages_fts(messages_fts) values('delete-all')`); err != nil {
+		return 0, 0, err
+	}
+
+	var lastID int64
+	for {
+		type row struct {
+			id  int64
+			raw []byte
+		}
+		var batch []row
+
+		q, err := db.Query(`
+			select id, raw_json from messages
+			 where id > ? order by id limit ?`, lastID, backfillChunk)
+		if err != nil {
+			return 0, 0, err
+		}
+		for q.Next() {
+			var r row
+			if err := q.Scan(&r.id, &r.raw); err != nil {
+				q.Close()
+				return 0, 0, err
+			}
+			batch = append(batch, r)
+		}
+		err = q.Err()
+		q.Close()
+		if err != nil {
+			return 0, 0, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return 0, 0, err
+		}
+		bw, err := newBlockWriter(tx)
+		if err != nil {
+			tx.Rollback()
+			return 0, 0, err
+		}
+		for _, r := range batch {
+			var l Line
+			if err := json.Unmarshal(r.raw, &l); err != nil {
+				continue // 壊れた行。messages には残る
+			}
+			n, err := bw.write(r.id, &l)
+			if err != nil {
+				bw.Close()
+				tx.Rollback()
+				return 0, 0, err
+			}
+			blocks += n
+			msgs++
+			lastID = r.id
+		}
+		bw.Close()
+		if err := tx.Commit(); err != nil {
+			return 0, 0, err
+		}
+		lastID = batch[len(batch)-1].id
+	}
+	return blocks, msgs, nil
+}
