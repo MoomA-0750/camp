@@ -42,6 +42,8 @@ func run(args []string) error {
 		return cmdScan(rest)
 	case "ingest":
 		return cmdIngest(rest)
+	case "backfill":
+		return cmdBackfill(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -60,6 +62,7 @@ usage:
   campd doctor  [-db P]   DB の状態を点検する
   campd scan    [-root D] 会話記録を読んで実測レポートを出す（DBには書かない）
   campd ingest  [-root D] 会話記録を DB に取り込む（再実行しても重複しない）
+  campd backfill [-db P]  messages から派生テーブル（usage 等）を作り直す
 `)
 }
 
@@ -156,8 +159,8 @@ func cmdIngest(args []string) error {
 	for _, r := range roles {
 		fmt.Printf("  %-16s %d\n", r, res.RoleCounts[r])
 	}
-	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\n",
-		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages)
+	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\nusage 計上      %d\n",
+		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages, res.Usage)
 	if res.Reread > 0 {
 		fmt.Printf("世代を進めた   %d\n", res.Reread)
 	}
@@ -166,6 +169,31 @@ func cmdIngest(args []string) error {
 	}
 	fmt.Printf("読み飛ばし      %d ファイル（追記なし）\n", res.Unchanged)
 	fmt.Printf("所要            %s\n", time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func cmdBackfill(args []string) error {
+	fs := flag.NewFlagSet("backfill", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Migrate(); err != nil {
+		return err
+	}
+
+	started := time.Now()
+	rows, sessions, err := ingest.BackfillUsage(db)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("usage 再構築    %d 行を走査\ntotal_cost_usd  %d セッション\n所要            %s\n",
+		rows, sessions, time.Since(started).Round(time.Millisecond))
 	return nil
 }
 

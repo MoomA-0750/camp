@@ -194,6 +194,8 @@ CREATE TABLE usage (
   service_tier                TEXT,
   speed                       TEXT,
   effort                      TEXT,
+  -- iterations は整数ではなく usage と同じ形のオブジェクトの配列だった。
+  -- ここには本数だけ入れる。実コーパスでは常に1（D-013）。
   iterations                  INTEGER,
   input_tokens                INTEGER NOT NULL DEFAULT 0,
   output_tokens               INTEGER NOT NULL DEFAULT 0,

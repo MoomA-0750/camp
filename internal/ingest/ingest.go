@@ -23,6 +23,7 @@ type Result struct {
 	SessionRuns int
 	SourceFiles int
 	Messages    int
+	Usage       int      // 計上した usage 行（重複除去後の実挿入＋更新回数ではなく、走査で作った行数）
 	Reread      int      // (dev,inode,size) の食い違いで世代を進めたファイル
 	Missing     int      // 今回の走査で消えていたファイル（行は残す）
 	Unchanged   int      // 追記が無く、要約を再利用して読み飛ばしたファイル
@@ -106,11 +107,12 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	// messages はファイル単位のトランザクションにする。オフセットの前進と
 	// レコードの挿入が同じ tx に入るので、途中で落ちても取りこぼさない。
 	for _, f := range corpus.Files {
-		n, err := writeMessages(db, corpus, f, fileIDs, knownRuns)
+		n, nu, err := writeMessages(db, corpus, f, fileIDs, knownRuns)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", f.Rel, err)
 		}
 		res.Messages += n
+		res.Usage += nu
 	}
 
 	// 追記が1行も無ければ集計は変わらない。ポーリングで回すので、
@@ -578,18 +580,18 @@ func writeRuns(tx *sql.Tx, c *Corpus, fileIDs map[string]int64) (runs, links int
 
 // writeMessages は1ファイルぶんのレコードを書き、オフセットを進める。
 // 挿入とオフセット更新を同じトランザクションに入れるのが肝。
-func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}) (int, error) {
+func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}) (int, int, error) {
 	if f.Role == RoleEmpty {
-		return 0, nil
+		return 0, 0, nil
 	}
 	fileID := fileIDs[f.Path]
 
 	var offset int64
 	if err := db.QueryRow(`select ingested_offset from source_files where id = ?`, fileID).Scan(&offset); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if offset >= f.EndOffset && offset > 0 {
-		return 0, nil // 新しいバイトは無い
+		return 0, 0, nil // 新しいバイトは無い
 	}
 
 	sessID := f.SessionKey
@@ -597,7 +599,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		sessID = c.ParentSession(f)
 	}
 	if sessID == "" {
-		return 0, fmt.Errorf("セッションが決まらない（role=%s）", f.Role)
+		return 0, 0, fmt.Errorf("セッションが決まらない（role=%s）", f.Role)
 	}
 
 	// このファイルに対応する run。サイドカーは自分自身が run。
@@ -608,7 +610,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer tx.Rollback()
 
@@ -622,11 +624,25 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(source_file_id, byte_offset) do nothing`)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer stmt.Close()
 
+	// usage は列ごとに max を取る。ストリーミングの途中経過で先に小さい値が
+	// 入っても、確定値の行が来たら伸びる。fork の複製では数値が同じなので動かない。
+	// 詳しくは usage.go の usageRow のコメント。
+	ustmt, err := tx.Prepare(usageUpsertSQL)
+
+	if err != nil {
+		return 0, 0, err
+	}
+	defer ustmt.Close()
+
 	n := 0
+	nUsage := 0
+	// cost-state はセッションの累計コストを丸ごとくれる。タイムスタンプが
+	// 無いので順序では選べない。累計なので最大値を採る。
+	var maxCost *float64
 	var end int64
 	// 前回の位置から読む。ファイル全体を読み直して古い行を捨てる書き方だと、
 	// 2行の追記のために165MBを走査することになる。
@@ -661,10 +677,23 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 			return err
 		}
 		n++
+
+		if u := newUsageRow(l, sessID, runID); u != nil {
+			if err := u.exec(ustmt); err != nil {
+				return err
+			}
+			nUsage++
+		}
+		if l.Type == "cost-state" && l.TotalCostUSD != nil {
+			if maxCost == nil || *l.TotalCostUSD > *maxCost {
+				v := *l.TotalCostUSD
+				maxCost = &v
+			}
+		}
 		return nil
 	})
 	if walkErr != nil {
-		return 0, walkErr
+		return 0, 0, walkErr
 	}
 	end = res.EndOffset
 
@@ -674,18 +703,25 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	}
 	summary, err := json.Marshal(f)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if _, err := tx.Exec(`
 		update source_files set ingested_offset = ?, pending_tail = ?,
 			summary_json = ?, summary_version = ?, resume_sha = ?
 		 where id = ?`, end, pending, summary, SummaryVersion, f.ResumeSHA, fileID); err != nil {
-		return 0, err
+		return 0, 0, err
+	}
+	if maxCost != nil {
+		if _, err := tx.Exec(`
+			update sessions set total_cost_usd = max(coalesce(total_cost_usd, 0), ?)
+			 where id = ?`, *maxCost, sessID); err != nil {
+			return 0, 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return n, nil
+	return n, nUsage, nil
 }
 
 func allRunIDs(db *store.DB) (map[string]struct{}, error) {
