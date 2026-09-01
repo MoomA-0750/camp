@@ -4,6 +4,42 @@
 
 ---
 
+## D-008: 権限確認UIは作れる。D-006の「妥協点」を撤回（2026-09-01）
+
+`--permission-prompt-tool` は**存在する**。`.hideHelp()` で登録されているため `--help` に出ないだけだった。
+
+```
+$ claude --permission-prompt-tool
+error: option '--permission-prompt-tool <tool>' argument missing   ← 受理されている
+$ claude --this-flag-does-not-exist
+error: unknown option '--this-flag-does-not-exist'                 ← 比較対象
+```
+
+リテラル `stdio` を渡すと `can_use_tool` 制御リクエストが stdin/stdout に流れ、**ホストが答えるまでターンがブロックされる**。Agent SDK の `canUseTool` と同じ経路。実フレームの捕捉と allow 後のファイル生成まで確認済み。
+
+**→ プロジェクトごとの permission-mode プリセットに逃げる必要はない。承認UIを作る。**
+
+注意: 既定のパーク期限5分（`CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS`）。読み取り専用コマンドは安全fastpathで承認なしに走るので、**どの呼び出しが承認を出すかは予測できない**。UIは「来たら出す」設計にする。
+
+詳細は `30-session-protocol.md`。
+
+---
+
+## D-007: プラン上限は制御プロトコルで取る。D-005を覆す（2026-09-01）
+
+statusLine は「唯一の現実的な公式ルート」ではなかった。
+
+- `rate_limit_event` が**要求なしにストリームへ届く**（`unifiedWindows.five_hour` / `seven_day`）
+- `get_usage` 制御リクエストは statusLine より豊富（`utilization`、ISO `resets_at`、`severity`、拘束中の窓を示す `is_active`）
+- `get_context_usage` はカテゴリ別のコンテキスト内訳
+- **これらの制御フレームはトークンを消費しない**
+
+さらに **Codex はレート制限を会話記録に直接埋め込んでいる**（`primary.window_minutes: 300` = 5時間枠、`secondary: 10080` = 7日枠、`plan_type`）。
+
+**→ どちらのエージェントも statusLine を必要としない。** D-005 の「Admin APIは使えない」という部分だけは有効なまま。
+
+---
+
 ## D-006: セッション駆動は `claude` CLI のヘッドレス双方向JSONモード（2026-09-01）
 
 **却下: Claude Agent SDK。** Proサブスクの範囲に収める制約と両立しない。公式ドキュメントの明記:
@@ -23,7 +59,7 @@ claude -p --input-format stream-json --output-format stream-json \
 - 構造化NDJSONが直接来るので、TUIをパースしない
 - `--bare` を付けなければOAuth（claude.aiログイン）を使う。根拠: ドキュメントが `--bare` について "bare mode doesn't use your subscription login" / "In bare mode, Claude Code never reads OAuth credentials or the system keychain" と書いている
 
-**妥協点:** `canUseTool` 相当の対話的権限確認は無い。v2.1.252の `--help` に `--permission-prompt-tool` は存在しない。`--permission-mode`（acceptEdits / auto / bypassPermissions / manual / dontAsk / plan）と `--allowedTools` / `--disallowedTools` による**事前指定**になる。プロジェクトごとにプリセットを持たせる。
+**~~妥協点: 対話的権限確認は無い~~ → D-008 で撤回。** `--permission-prompt-tool` は隠しフラグとして実在し、承認UIは作れる。この節を書いた時点では `--help` にないことをもって「存在しない」と誤って結論していた。
 
 **却下: node-pty でTUIをラップ。** ANSI再描画を画面として扱うとメッセージ単位の構造が取れない。
 
@@ -31,7 +67,7 @@ claude -p --input-format stream-json --output-format stream-json \
 
 ---
 
-## D-005: プラン上限はstatusLineのstdin JSONから取る（2026-09-01）
+## D-005: プラン上限はstatusLineのstdin JSONから取る（2026-09-01）— **D-007で覆した**
 
 statusLineコマンドがstdinで受け取るJSONに実数で入っている:
 
