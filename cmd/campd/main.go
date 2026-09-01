@@ -156,8 +156,8 @@ func cmdIngest(args []string) error {
 	for _, r := range roles {
 		fmt.Printf("  %-16s %d\n", r, res.RoleCounts[r])
 	}
-	fmt.Printf("\nprojects        %d\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\n",
-		res.Projects, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages)
+	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\n",
+		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages)
 	if res.Reread > 0 {
 		fmt.Printf("先頭から取り直し %d\n", res.Reread)
 	}

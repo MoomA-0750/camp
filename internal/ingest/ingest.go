@@ -3,7 +3,6 @@ package ingest
 import (
 	"database/sql"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -16,6 +15,7 @@ type Result struct {
 	Root        string
 	RoleCounts  map[string]int
 	Projects    int
+	CWDs        int
 	Sessions    int
 	Runs        int
 	SessionRuns int
@@ -50,11 +50,12 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	}
 	defer tx.Rollback()
 
-	projectIDs, err := writeProjects(tx, hostID, corpus)
+	projectIDs, nProjects, err := writeProjects(tx, hostID, corpus)
 	if err != nil {
 		return nil, err
 	}
-	res.Projects = len(projectIDs)
+	res.Projects = nProjects
+	res.CWDs = len(projectIDs)
 
 	sessions := groupBySession(corpus)
 	if err := writeSessions(tx, hostID, projectIDs, corpus, sessions); err != nil {
@@ -112,37 +113,75 @@ func upsertHost(db *store.DB, name string) (int64, error) {
 	return id, err
 }
 
-// writeProjects は行に現れた cwd をすべて projects にする。
-// マングルされたディレクトリ名はパースしない（復元できないため）。
-func writeProjects(tx *sql.Tx, hostID int64, c *Corpus) (map[string]int64, error) {
-	cwds := map[string]struct{}{}
+// writeProjects は行に現れた cwd をプロジェクトのルートへ畳んで登録する。
+// マングルされたディレクトリ名はパースしない（4方向に曖昧で復元できない）。
+//
+// 返り値は cwd -> project_id。cwd はルートでないことのほうが多いので、
+// セッションに割り当てるときは必ずこの表を通す。
+func writeProjects(tx *sql.Tx, hostID int64, c *Corpus) (map[string]int64, int, error) {
+	set := map[string]struct{}{}
 	for _, f := range c.Files {
 		for _, p := range f.CWDs {
-			cwds[p] = struct{}{}
+			set[p] = struct{}{}
 		}
 	}
-	paths := make([]string, 0, len(cwds))
-	for p := range cwds {
+	cwds := make([]string, 0, len(set))
+	for p := range set {
+		cwds = append(cwds, p)
+	}
+	sort.Strings(cwds)
+
+	assign, roots := ResolveProjects(cwds)
+
+	// 親を先に入れる。parent_project_id が外部キーなので順序が要る。
+	paths := make([]string, 0, len(roots))
+	for p := range roots {
 		paths = append(paths, p)
 	}
-	sort.Strings(paths)
+	sort.Slice(paths, func(i, j int) bool {
+		a, b := roots[paths[i]], roots[paths[j]]
+		if a.IsWorktree != b.IsWorktree {
+			return !a.IsWorktree
+		}
+		return paths[i] < paths[j]
+	})
 
 	ids := map[string]int64{}
 	for _, p := range paths {
-		if _, err := tx.Exec(
-			`insert into projects(host_id, repo_path, name) values(?,?,?)
-			 on conflict(host_id, repo_path) do nothing`,
-			hostID, p, filepath.Base(p)); err != nil {
-			return nil, err
+		ref := roots[p]
+		var parentID any
+		if ref.ParentPath != "" {
+			if id, ok := ids[ref.ParentPath]; ok {
+				parentID = id
+			}
+		}
+		if _, err := tx.Exec(`
+			insert into projects(host_id, repo_path, name, git_origin, is_worktree, worktree_name, parent_project_id, is_repo)
+			values(?,?,?,?,?,?,?,?)
+			on conflict(host_id, repo_path) do update set
+				name=excluded.name,
+				git_origin=coalesce(excluded.git_origin, projects.git_origin),
+				is_worktree=excluded.is_worktree,
+				worktree_name=excluded.worktree_name,
+				parent_project_id=coalesce(excluded.parent_project_id, projects.parent_project_id),
+				is_repo=excluded.is_repo`,
+			hostID, ref.Path, ref.Name, nz(ref.GitOrigin), b2i(ref.IsWorktree),
+			nz(ref.WorktreeName), parentID, b2i(ref.IsRepo)); err != nil {
+			return nil, 0, err
 		}
 		var id int64
 		if err := tx.QueryRow(
-			`select id from projects where host_id = ? and repo_path = ?`, hostID, p).Scan(&id); err != nil {
-			return nil, err
+			`select id from projects where host_id = ? and repo_path = ?`, hostID, ref.Path).Scan(&id); err != nil {
+			return nil, 0, err
 		}
-		ids[p] = id
+		ids[ref.Path] = id
 	}
-	return ids, nil
+
+	byCWD := map[string]int64{}
+	for cwd, root := range assign {
+		byCWD[cwd] = ids[root]
+	}
+	return byCWD, len(ids), nil
 }
 
 // groupBySession は sessions.id ごとに関係するファイルを集める。
