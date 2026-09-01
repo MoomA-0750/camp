@@ -33,6 +33,9 @@ Phase 0 着手前。2026-09-01にリポジトリ作成。
 
 - **Claude Proサブスクの範囲内に収める。** APIクレジットは使わない。これがClaude Agent SDKを採れない理由（Agent SDKはAPIキー前提）
 - セッション駆動は `claude` CLI のヘッドレス双方向JSONモードで行う
+- **バックエンドはGo、フロントはVite + React SPA**（`docs/40-layout.md`）。Next.jsは使わない
+- 履歴は生のまま保存し、リダクトしない。破壊しない検出器で記録だけ残す（`docs/10-decisions.md` D-010）
+- Tailscale内に閉じたうえで**アプリ認証を最初から入れる**（D-011）
 - プラン上限は `claude -p` の制御プロトコルから取る（`rate_limit_event` / `get_usage`。トークン消費ゼロ）
 - 権限確認UIは `--permission-prompt-tool stdio` で作れる（`--help` に出ない隠しフラグだが実在する）
 

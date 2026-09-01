@@ -1,7 +1,11 @@
+# Go
+/campd
+/dist/
+*.test
+
+# フロント
 node_modules/
-dist/
-build/
-.next/
+web/dist/
 *.tsbuildinfo
 
 # ローカルデータ（DBは複製先であり成果物ではない）
