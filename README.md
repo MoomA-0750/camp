@@ -8,7 +8,7 @@ Claude Codeのセッションと会話履歴をCLI側の都合から独立して
 
 ## ステータス
 
-**Phase 0 完了（M0〜M12）＋プラン残量の記録（D-022）。**2026-09-01にリポジトリ作成。
+**Phase 1 完了（M13〜M16）。**Phase 0（M0〜M12）＋プラン残量の記録（D-022）は済み。2026-09-01にリポジトリ作成。
 
 2026-09-01に4方向の評価（取り込み層の実証・プロトコルの実証・Obsidian置き換えの実現可能性・codexによる独立レビュー）を経てフェーズを再構成した。受け入れ条件と、実装して初めて分かったことは `dev/done/phase0-plan.md`。
 
@@ -79,6 +79,18 @@ $ campd backfill   # 派生テーブルを messages から作り直す（ディ�
 ## 動かす場所
 
 `general-console`（mooma-lpve上のVM 200、Fedora 44、4コア/16GB/128GB）に常設し、Tailscale内に閉じる。**実質「認証付き任意コード実行エンドポイント」なので公開しない。**
+
+## Vault の索引
+
+```
+$ campd vault scan  ~/Documents/git-cloned/Obsidian-Vault   # 内訳だけ見る
+$ campd vault index ~/Documents/git-cloned/Obsidian-Vault   # 索引する
+$ campd vault ghosts                                        # 実体の無い触り跡
+```
+
+**Camp は Vault に一切書かない。** 索引は 4,170ファイル（markdown 4,121）・15.4MiB、走査18ms・索引2.4秒（2回目645ms）。ドット始まりのディレクトリは降りる前に切る（`.claude/worktrees/` にこの Vault の11倍のファイルがある）。
+
+ノートの中身は `blobs` に寄せてあるので、**Vault から消えたノートも Camp からは読める**。
 
 ## リポジトリの外に置いた設定
 
