@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MoomA-0750/camp/internal/store"
 )
 
 // realVault は実在の Vault があればそのパスを返す。無ければテストを飛ばす。
@@ -90,4 +92,79 @@ func TestPassthroughKeysSurvive(t *testing.T) {
 	if !found {
 		t.Error("life-tracker の設定（timeFrame・columnConfigs 等）を落としている")
 	}
+}
+
+// 実在の30ビューが全部、実データで回る。
+// **列の反転が効いていることを実測値で確かめる。**
+func TestEveryRealViewRunsWithAllColumns(t *testing.T) {
+	root := realVault(t)
+	db := openRealDB(t)
+	if db == nil {
+		t.Skip("実 DB が無い")
+	}
+	bases, err := LoadBases(db, 1, func(rel string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(root, rel))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, err := LoadRecords(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	views := 0
+	var health *Result
+	for _, b := range bases {
+		for i := range b.Views {
+			r, err := Run(b, &b.Views[i], recs)
+			if err != nil {
+				t.Fatalf("%s/%s: %v", b.Name, b.Views[i].Name, err)
+			}
+			views++
+			if b.Name == "Health" && b.Views[i].Kind == KindTable {
+				health = r
+			}
+		}
+	}
+	if views != 30 {
+		t.Fatalf("30ビュー回るはずが %d", views)
+	}
+
+	if health == nil {
+		t.Fatal("Health のテーブルが見つからない")
+	}
+	// Bases の許可リストだと11列。反転すると実在する102列が出る。
+	if len(health.Columns) < 100 {
+		t.Fatalf("Health の列が %d 列しかない（許可リストとして読んでいる）", len(health.Columns))
+	}
+	pinned := 0
+	for _, c := range health.Columns {
+		if c.Pinned {
+			pinned++
+		}
+	}
+	if pinned >= len(health.Columns) {
+		t.Fatal("全部が pinned＝order: 以外が出ていない")
+	}
+	t.Logf("Health: %d 列（定義が挙げたのは %d、自動が %d）",
+		len(health.Columns), pinned, len(health.Columns)-pinned)
+}
+
+// openRealDB は実 DB を開く。無ければ nil。
+func openRealDB(t *testing.T) *store.DB {
+	t.Helper()
+	p := os.Getenv("CAMP_DB")
+	if p == "" {
+		p = filepath.Join(os.Getenv("HOME"), "Documents/git-cloned/camp/data/camp.sqlite")
+	}
+	if _, err := os.Stat(p); err != nil {
+		return nil
+	}
+	db, err := store.Open(p)
+	if err != nil {
+		return nil
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
 }

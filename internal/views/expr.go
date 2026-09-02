@@ -396,6 +396,11 @@ func resolve(name string, r Row) Value {
 		return Str(r.Name())
 	case "file.path":
 		return Str(r.Path())
+	case "file.mtime":
+		if m, ok := r.(interface{ Mtime() string }); ok {
+			return Str(m.Mtime())
+		}
+		return Null()
 	}
 	return r.Get(name)
 }

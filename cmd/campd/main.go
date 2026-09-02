@@ -26,6 +26,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/store"
 	"github.com/MoomA-0750/camp/internal/thread"
 	"github.com/MoomA-0750/camp/internal/vault"
+	"github.com/MoomA-0750/camp/internal/views"
 )
 
 // Version はビルド時に -ldflags で埋める。
@@ -77,6 +78,8 @@ func run(args []string) error {
 		return cmdPasswd(rest)
 	case "vault":
 		return cmdVault(rest)
+	case "views":
+		return cmdViews(rest)
 	case "limits":
 		return cmdLimits(rest)
 	case "login-url":
@@ -112,6 +115,7 @@ usage:
   campd vault scan  [DIR] Vault を歩いて内訳を出す（DBには書かない）
   campd vault index [DIR] Vault を索引する（Vault側には一切書かない）
   campd vault ghosts      触った記録はあるが実体が無いパスを並べる
+  campd views [NAME]      .base のビューを一覧・実行する
   campd limits record     statusLine の JSON を stdin から読んで残量を記録する
   campd limits show       記録済みの窓を新しい順に並べる（-current で現在ぶんだけ）
 `)
@@ -1214,4 +1218,113 @@ func cmdVaultGhosts(args []string) error {
 		}
 	}
 	return nil
+}
+
+func cmdViews(args []string) error {
+	fs := flag.NewFlagSet("views", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	vaultID := fs.Int64("vault", 1, "Vault の id")
+	limit := fs.Int("n", 5, "出す行数")
+	cols := fs.Int("c", 8, "出す列数")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	want := strings.Join(fs.Args(), " ")
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var root string
+	if err := db.QueryRow(`select root from vaults where id = ?`, *vaultID).Scan(&root); err != nil {
+		return err
+	}
+	bases, err := views.LoadBases(db, *vaultID, func(rel string) ([]byte, error) {
+		return vault.Read(root, rel)
+	})
+	if err != nil {
+		return err
+	}
+	recs, err := views.LoadRecords(db, *vaultID)
+	if err != nil {
+		return err
+	}
+
+	if want == "" {
+		fmt.Printf("%-18s %-28s %-14s %6s\n", "base", "ビュー", "種別", "行")
+		for _, b := range bases {
+			for i := range b.Views {
+				r, err := views.Run(b, &b.Views[i], recs)
+				n := "—"
+				if err == nil {
+					n = fmt.Sprint(r.Total)
+				}
+				fmt.Printf("%-18s %-28s %-14s %6s\n", b.Name, b.Views[i].Name, b.Views[i].Kind, n)
+			}
+		}
+		return nil
+	}
+
+	for _, b := range bases {
+		for i := range b.Views {
+			v := &b.Views[i]
+			if !strings.Contains(b.Name+"/"+v.Name, want) {
+				continue
+			}
+			r, err := views.Run(b, v, recs)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("== %s / %s（%s）\n", b.Name, v.Name, v.Kind)
+			fmt.Printf("行 %d / 列 %d", r.Total, len(r.Columns))
+			pinned := 0
+			for _, c := range r.Columns {
+				if c.Pinned {
+					pinned++
+				}
+			}
+			fmt.Printf("（定義が挙げたのは %d、残り %d は自動で出た）\n", pinned, len(r.Columns)-pinned)
+			for _, w := range r.Warnings {
+				fmt.Printf("  警告: %s\n", w)
+			}
+			show := min(*cols, len(r.Columns))
+			hdr := make([]string, 0, show)
+			for _, c := range r.Columns[:show] {
+				hdr = append(hdr, c.Label)
+			}
+			fmt.Println("  " + strings.Join(hdr, " | "))
+			shown := 0
+			for _, g := range r.Groups {
+				for _, row := range g.Rows {
+					if shown >= *limit {
+						break
+					}
+					cells := make([]string, 0, show)
+					for _, c := range r.Columns[:show] {
+						cells = append(cells, clipCell(row.Cells[c.Key]))
+					}
+					fmt.Println("  " + strings.Join(cells, " | "))
+					shown++
+				}
+			}
+			if len(r.Summary) > 0 {
+				fmt.Printf("  集計: %v\n", r.Summary)
+			}
+			fmt.Println()
+		}
+	}
+	return nil
+}
+
+func clipCell(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len([]rune(s)) > 16 {
+		return string([]rune(s)[:16]) + "…"
+	}
+	if s == "" {
+		return "·"
+	}
+	return s
 }
