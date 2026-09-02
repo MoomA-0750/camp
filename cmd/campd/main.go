@@ -25,6 +25,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/secrets"
 	"github.com/MoomA-0750/camp/internal/store"
 	"github.com/MoomA-0750/camp/internal/thread"
+	"github.com/MoomA-0750/camp/internal/vault"
 )
 
 // Version はビルド時に -ldflags で埋める。
@@ -74,6 +75,8 @@ func run(args []string) error {
 		return cmdServe(rest)
 	case "passwd":
 		return cmdPasswd(rest)
+	case "vault":
+		return cmdVault(rest)
 	case "limits":
 		return cmdLimits(rest)
 	case "login-url":
@@ -106,6 +109,8 @@ usage:
   campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
   campd login-url         使い捨てのログインURLを1本出す（開発中の入口）
+  campd vault scan  [DIR] Vault を歩いて内訳を出す（DBには書かない）
+  campd vault index [DIR] Vault を索引する（Vault側には一切書かない）
   campd limits record     statusLine の JSON を stdin から読んで残量を記録する
   campd limits show       記録済みの窓を新しい順に並べる（-current で現在ぶんだけ）
 `)
@@ -1050,4 +1055,111 @@ func cmdLimitsShow(args []string) error {
 			w.Kind, w.UsedPct, w.PeakPct, w.Samples, w.EndsAt, now)
 	}
 	return nil
+}
+
+func cmdVault(args []string) error {
+	sub := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[0], args[1:]
+	}
+	switch sub {
+	case "scan":
+		return cmdVaultScan(args)
+	case "index":
+		return cmdVaultIndex(args)
+	default:
+		return fmt.Errorf("vault の使い方: campd vault scan | campd vault index")
+	}
+}
+
+// defaultVaultRoot は CAMP_VAULT があればそれを、無ければカレント。
+func defaultVaultRoot() string {
+	if p := os.Getenv("CAMP_VAULT"); p != "" {
+		return p
+	}
+	return "."
+}
+
+func cmdVaultScan(args []string) error {
+	fs := flag.NewFlagSet("vault scan", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	root := defaultVaultRoot()
+	if fs.NArg() > 0 {
+		root = fs.Arg(0)
+	}
+
+	started := time.Now()
+	res, err := vault.Scan(root)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("root      %s\n", res.Root)
+	fmt.Printf("ファイル  %d（%s）\n", len(res.Files), humanBytes(res.Bytes))
+	kinds := make([]string, 0, len(res.ByKind))
+	for k := range res.ByKind {
+		kinds = append(kinds, k)
+	}
+	sort.Strings(kinds)
+	for _, k := range kinds {
+		fmt.Printf("  %-9s %d\n", k, res.ByKind[k])
+	}
+	if len(res.Pruned) > 0 {
+		fmt.Printf("切った    %d ディレクトリ（降りていない）: %s\n",
+			len(res.Pruned), strings.Join(clipList(res.Pruned, 6), " "))
+	}
+	if res.Skipped > 0 {
+		fmt.Printf("飛ばした  %d（シンボリックリンク・読めないもの）\n", res.Skipped)
+	}
+	fmt.Printf("所要      %s\n", time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func cmdVaultIndex(args []string) error {
+	fs := flag.NewFlagSet("vault index", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	host := fs.String("host", defaultHost(), "ホスト名")
+	name := fs.String("name", "", "Vault の名前（既定はディレクトリ名）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	root := defaultVaultRoot()
+	if fs.NArg() > 0 {
+		root = fs.Arg(0)
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	res, err := vault.Index(db, *host, root, *name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("vault     #%d %s\n", res.VaultID, res.Root)
+	fmt.Printf("走査      %d ファイル（%s）\n", res.Scanned, humanBytes(res.Bytes))
+	fmt.Printf("索引      新規 %d / 変化 %d / 同じ %d\n", res.Added, res.Changed, res.Same)
+	if res.Restored > 0 {
+		fmt.Printf("          戻ってきた %d\n", res.Restored)
+	}
+	if res.Missing > 0 {
+		fmt.Printf("消えた    %d（行は残す。中身も blobs に残っている）\n", res.Missing)
+	}
+	fmt.Printf("中身      blobs に %d 個追加\n", res.Stored)
+	if len(res.Pruned) > 0 {
+		fmt.Printf("切った    %d ディレクトリ: %s\n",
+			len(res.Pruned), strings.Join(clipList(res.Pruned, 6), " "))
+	}
+	fmt.Printf("所要      %s\n", res.Took.Round(time.Millisecond))
+	return nil
+}
+
+func clipList(xs []string, n int) []string {
+	if len(xs) <= n {
+		return xs
+	}
+	return append(append([]string{}, xs[:n]...), fmt.Sprintf("…他%d", len(xs)-n))
 }

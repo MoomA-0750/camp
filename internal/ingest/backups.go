@@ -497,3 +497,6 @@ func BackfillBackupMeta(db *store.DB) (updated int, err error) {
 	}
 	return updated, tx.Commit()
 }
+
+// PackBlob は packBlob の公開版。Vault索引も同じ置き場（blobs）を使う。
+func PackBlob(body []byte) (codec string, out []byte) { return packBlob(body) }
