@@ -177,3 +177,82 @@ func BackfillBlocks(db *store.DB) (blocks int, msgs int, err error) {
 	}
 	return blocks, msgs, nil
 }
+
+// BackfillSessionFiles は messages.raw_json から session_files を作り直す。
+//
+// ディスクを読み直さない理由は BackfillUsage と同じ（D-014）。
+//
+// file-history 行は自分が属するセッションを名乗らないので、
+// messages.session_id（取り込み時にファイルから決めたもの）を使う。
+func BackfillSessionFiles(db *store.DB) (links int, msgs int, err error) {
+	if _, err := db.Exec(`delete from session_files`); err != nil {
+		return 0, 0, err
+	}
+
+	var lastID int64
+	for {
+		type row struct {
+			id     int64
+			sess   string
+			fileID int64
+			raw    []byte
+		}
+		var batch []row
+
+		q, err := db.Query(`
+			select id, session_id, source_file_id, raw_json from messages
+			 where id > ? order by id limit ?`, lastID, backfillChunk)
+		if err != nil {
+			return 0, 0, err
+		}
+		for q.Next() {
+			var r row
+			if err := q.Scan(&r.id, &r.sess, &r.fileID, &r.raw); err != nil {
+				q.Close()
+				return 0, 0, err
+			}
+			batch = append(batch, r)
+		}
+		err = q.Err()
+		q.Close()
+		if err != nil {
+			return 0, 0, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return 0, 0, err
+		}
+		fw, err := newFileWriter(tx)
+		if err != nil {
+			tx.Rollback()
+			return 0, 0, err
+		}
+		for _, r := range batch {
+			var l Line
+			if err := json.Unmarshal(r.raw, &l); err != nil {
+				continue // 壊れた行。messages には残る
+			}
+			n, err := fw.write(r.id, r.sess, &l)
+			if err != nil {
+				fw.Close()
+				tx.Rollback()
+				return 0, 0, err
+			}
+			links += n
+			msgs++
+		}
+		fw.Close()
+		if err := tx.Commit(); err != nil {
+			return 0, 0, err
+		}
+		lastID = batch[len(batch)-1].id
+	}
+	if _, err := LinkFileHistory(db); err != nil {
+		return 0, 0, err
+	}
+	return links, msgs, nil
+}

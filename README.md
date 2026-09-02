@@ -8,7 +8,7 @@ Claude Codeのセッションと会話履歴をCLI側の都合から独立して
 
 ## ステータス
 
-Phase 0 実装中（M0〜M7 完了）。2026-09-01にリポジトリ作成。
+Phase 0 実装中（M0〜M8 完了）。2026-09-01にリポジトリ作成。
 
 2026-09-01に4方向の評価（取り込み層の実証・プロトコルの実証・Obsidian置き換えの実現可能性・codexによる独立レビュー）を経てフェーズを再構成した。進捗と受け入れ条件は `dev/active/phase0-plan.md`。
 
@@ -27,12 +27,19 @@ $ campd search 認証
 $ campd thread 9182f0fd
 4639行 / 会話1本（繋ぎ直さなければ7本） / 根5 / 繋ぎ直し6 / 迷子0 / 時刻の逆行37
 
+$ campd files Human/Projects/ExampleProject.md -summary -n 2
+ 52回 / 6 セッション  …/Obsidian-vault/Human/Projects/ExampleProject.md
+      2026-08-02 11:59 .. 2026-08-06 12:55  [edit backup read]
+ 10回 / 2 セッション  …/Obsidian-Vault/Human/Projects/ExampleProject.md
+      2026-08-11 05:29 .. 2026-08-12 06:46  [mention edit read backup]
+370パス / 2,414件。大文字小文字は畳まない（改名の前後で別物として残る）
+
 $ campd backfill   # 派生テーブルを messages から作り直す（ディスクは読まない）
 ```
 
 | Phase | 内容 | 状態 |
 |---|---|---|
-| 0 | 取り込み・SQLite・**日本語対応**全文検索・最小UI | M0〜M7 完了（M8以降 実装中） |
+| 0 | 取り込み・SQLite・**日本語対応**全文検索・最小UI | M0〜M8 完了（M9以降 実装中） |
 | 1 | Vault読み取り＋ノート↔セッション相互リンク | 未着手 |
 | 2 | ビュー機構の読み取り側＋LLM文脈コンパイラ＋**MCPサーバー公開** | 未着手 |
 | 3 | セッション駆動（`claude -p` 双方向stream-json＋承認UI） | 未着手 |

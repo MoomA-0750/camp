@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoomA-0750/camp/internal/files"
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/store"
@@ -51,6 +52,8 @@ func run(args []string) error {
 		return cmdSearch(rest)
 	case "thread":
 		return cmdThread(rest)
+	case "files":
+		return cmdFiles(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -69,9 +72,10 @@ usage:
   campd doctor  [-db P]   DB の状態を点検する
   campd scan    [-root D] 会話記録を読んで実測レポートを出す（DBには書かない）
   campd ingest  [-root D] 会話記録を DB に取り込む（再実行しても重複しない）
-  campd backfill [-db P]  messages から派生テーブル（usage・索引）を作り直す
+  campd backfill [-db P]  messages から派生テーブル（usage・索引・ファイル結合）を作り直す
   campd search  QUERY     全文検索（日本語は2文字から引ける）
   campd thread  SESSION   会話を木に組み立てて形を見る
+  campd files   [PATH]    ノートを触ったターンを引く（-session でセッション側から）
 `)
 }
 
@@ -168,8 +172,8 @@ func cmdIngest(args []string) error {
 	for _, r := range roles {
 		fmt.Printf("  %-16s %d\n", r, res.RoleCounts[r])
 	}
-	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\nblocks 追加     %d\nusage 計上      %d\n",
-		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages, res.Blocks, res.Usage)
+	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\nblocks 追加     %d\nusage 計上      %d\nファイル結合    %d（うち %d 件を発行元のターンに繋ぎ直した）\n",
+		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages, res.Blocks, res.Usage, res.Files, res.Relinked)
 	if res.Reread > 0 {
 		fmt.Printf("世代を進めた   %d\n", res.Reread)
 	}
@@ -207,8 +211,14 @@ func cmdBackfill(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("索引 再構築     %d ブロック（%d メッセージから）\n所要            %s\n",
-		blocks, msgs, time.Since(started).Round(time.Millisecond))
+	fmt.Printf("索引 再構築     %d ブロック（%d メッセージから）\n", blocks, msgs)
+
+	links, _, err := ingest.BackfillSessionFiles(db)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ファイル結合    %d 件\n所要            %s\n",
+		links, time.Since(started).Round(time.Millisecond))
 	return nil
 }
 
@@ -431,4 +441,100 @@ func defaultDBPath() string {
 		return p
 	}
 	return filepath.Join("data", "camp.sqlite")
+}
+
+func cmdFiles(args []string) error {
+	fs := flag.NewFlagSet("files", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	session := fs.String("session", "", "セッションID（前方一致）で絞る")
+	op := fs.String("op", "", "read / edit / write / backup / external-edit / attach / mention")
+	n := fs.Int("n", 20, "最大件数")
+	summary := fs.Bool("summary", false, "1行1ターンではなくパスごとに畳む")
+	rest, err := parseAround(fs, args)
+	if err != nil {
+		return err
+	}
+	path := ""
+	if len(rest) > 0 {
+		path = rest[0]
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	o := files.Opts{Path: path, Session: *session, Op: *op, Limit: *n}
+
+	if *summary {
+		rows, err := files.Summarize(db, o)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			fmt.Println("該当なし")
+			return nil
+		}
+		for _, r := range rows {
+			fmt.Printf("%3d回 / %d セッション  %s\n      %s .. %s  [%s]\n",
+				r.Touches, r.Sessions, r.AbsPath, short(r.First), short(r.Last), r.Ops)
+		}
+		return nil
+	}
+
+	rows, err := files.Touches(db, o)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("該当なし")
+		return nil
+	}
+	for _, r := range rows {
+		name := r.RelPath
+		if name == "" {
+			name = r.AbsPath
+		}
+		fmt.Printf("%s  %-13s %-12s %s\n", short(r.At), r.Op, r.Origin, name)
+		fmt.Printf("    session %s  turn %s", r.SessionID[:8], firstN(r.MessageUUID, 8))
+		if r.Title != "" {
+			fmt.Printf("  %s", r.Title)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// short は RFC3339 を「日付 時刻」に詰める。秒より下は見ない。
+func short(ts string) string {
+	if len(ts) >= 16 {
+		return ts[:10] + " " + ts[11:16]
+	}
+	return ts
+}
+
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// parseAround は位置引数のうしろに書かれたフラグも拾う。
+//
+// flag は最初の非フラグで解釈をやめる。campd files PATH -n 5 のように
+// 後ろに付けるのが自然な形なので、位置引数を1つ食べては解釈し直す。
+func parseAround(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			return positional, nil
+		}
+		positional = append(positional, args[0])
+		args = args[1:]
+	}
 }

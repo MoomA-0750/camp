@@ -132,16 +132,50 @@ type Snapshot struct {
 // ToolResultFilePath は toolUseResult がオブジェクトで filePath を持つときだけ返す。
 // 文字列・配列・欠落のいずれでも空文字を返す。
 func (l *Line) ToolResultFilePath() string {
+	w, _ := l.ToolResultPaths()
+	return w
+}
+
+// ToolResultPaths は toolUseResult から触ったファイルの絶対パスを読み取る。
+//
+// 置き場所がツールで違う。Edit と Write は filePath 直下に置くが、
+// Read だけは file.filePath と1段深い。filePath だけを見ると、
+// 読んだだけのファイル（実測 617件・180パス）が丸ごと落ちる。
+func (l *Line) ToolResultPaths() (written, read string) {
 	if len(l.ToolUseResult) == 0 {
-		return ""
+		return "", ""
 	}
 	var v struct {
 		FilePath string `json:"filePath"`
+		File     *struct {
+			FilePath string `json:"filePath"`
+		} `json:"file"`
 	}
 	if err := json.Unmarshal(l.ToolUseResult, &v); err != nil {
+		return "", ""
+	}
+	if v.File != nil {
+		read = v.File.FilePath
+	}
+	return v.FilePath, read
+}
+
+// ToolResultUseID は message.content の tool_result が指す tool_use の id を返す。
+// これを辿らないと、その結果を生んだツールの名前が分からない。
+func (l *Line) ToolResultUseID() string {
+	if l.Message == nil {
 		return ""
 	}
-	return v.FilePath
+	blocks, err := l.Message.Blocks()
+	if err != nil {
+		return ""
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_result" && b.ToolUseID != "" {
+			return b.ToolUseID
+		}
+	}
+	return ""
 }
 
 // AttachmentInfo は attachment の type と filename を返す。形が違えば空。

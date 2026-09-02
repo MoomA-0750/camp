@@ -25,6 +25,8 @@ type Result struct {
 	Messages    int
 	Blocks      int      // 検索対象として切り出したブロック
 	Usage       int      // 計上した usage 行（重複除去後の実挿入＋更新回数ではなく、走査で作った行数）
+	Files       int      // ノートに繋いだ「触った」記録
+	Relinked    int      // file-history を発行元のターンに繋ぎ直した件数
 	Reread      int      // (dev,inode,size) の食い違いで世代を進めたファイル
 	Missing     int      // 今回の走査で消えていたファイル（行は残す）
 	Unchanged   int      // 追記が無く、要約を再利用して読み飛ばしたファイル
@@ -108,13 +110,22 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	// messages はファイル単位のトランザクションにする。オフセットの前進と
 	// レコードの挿入が同じ tx に入るので、途中で落ちても取りこぼさない。
 	for _, f := range corpus.Files {
-		n, nu, nb, err := writeMessages(db, corpus, f, fileIDs, knownRuns)
+		c, err := writeMessages(db, corpus, f, fileIDs, knownRuns)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", f.Rel, err)
 		}
-		res.Messages += n
-		res.Usage += nu
-		res.Blocks += nb
+		res.Messages += c.Messages
+		res.Usage += c.Usage
+		res.Blocks += c.Blocks
+		res.Files += c.Files
+	}
+
+	// file-history はアシスタント行より先に書かれることが多いので、
+	// 全ファイルを読み終えてから繋ぎ直す。
+	if n, err := LinkFileHistory(db); err != nil {
+		return nil, err
+	} else {
+		res.Relinked = int(n)
 	}
 
 	// 追記が1行も無ければ集計は変わらない。ポーリングで回すので、
@@ -582,18 +593,27 @@ func writeRuns(tx *sql.Tx, c *Corpus, fileIDs map[string]int64) (runs, links int
 
 // writeMessages は1ファイルぶんのレコードを書き、オフセットを進める。
 // 挿入とオフセット更新を同じトランザクションに入れるのが肝。
-func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}) (int, int, int, error) {
+// writeCounts は writeMessages が書いた派生レコードの数。
+// 派生表を足すたびに戻り値が増えるので、束ねておく。
+type writeCounts struct {
+	Messages int
+	Usage    int
+	Blocks   int
+	Files    int
+}
+
+func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}) (writeCounts, error) {
 	if f.Role == RoleEmpty {
-		return 0, 0, 0, nil
+		return writeCounts{}, nil
 	}
 	fileID := fileIDs[f.Path]
 
 	var offset int64
 	if err := db.QueryRow(`select ingested_offset from source_files where id = ?`, fileID).Scan(&offset); err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
 	if offset >= f.EndOffset && offset > 0 {
-		return 0, 0, 0, nil // 新しいバイトは無い
+		return writeCounts{}, nil // 新しいバイトは無い
 	}
 
 	sessID := f.SessionKey
@@ -601,7 +621,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		sessID = c.ParentSession(f)
 	}
 	if sessID == "" {
-		return 0, 0, 0, fmt.Errorf("セッションが決まらない（role=%s）", f.Role)
+		return writeCounts{}, fmt.Errorf("セッションが決まらない（role=%s）", f.Role)
 	}
 
 	// このファイルに対応する run。サイドカーは自分自身が run。
@@ -612,7 +632,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
 	defer tx.Rollback()
 
@@ -626,7 +646,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(source_file_id, byte_offset) do nothing`)
 	if err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
 	defer stmt.Close()
 
@@ -636,19 +656,23 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	ustmt, err := tx.Prepare(usageUpsertSQL)
 
 	if err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
 	defer ustmt.Close()
 
 	bw, err := newBlockWriter(tx)
 	if err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
 	defer bw.Close()
 
-	n := 0
-	nUsage := 0
-	nBlocks := 0
+	fw, err := newFileWriter(tx)
+	if err != nil {
+		return writeCounts{}, err
+	}
+	defer fw.Close()
+
+	var cnt writeCounts
 	// cost-state はセッションの累計コストを丸ごとくれる。タイムスタンプが
 	// 無いので順序では選べない。累計なので最大値を採る。
 	var maxCost *float64
@@ -685,7 +709,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		if err != nil {
 			return err
 		}
-		n++
+		cnt.Messages++
 
 		// 同じバイト位置の行が既にあれば挿入は起きない。そのときは
 		// ブロックも作らない（作ると message_blocks が二重になる）。
@@ -698,14 +722,20 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 			if err != nil {
 				return err
 			}
-			nBlocks += nb
+			cnt.Blocks += nb
+
+			nf, err := fw.write(mid, sessID, l)
+			if err != nil {
+				return err
+			}
+			cnt.Files += nf
 		}
 
 		if u := newUsageRow(l, sessID, runID); u != nil {
 			if err := u.exec(ustmt); err != nil {
 				return err
 			}
-			nUsage++
+			cnt.Usage++
 		}
 		if l.Type == "cost-state" && l.TotalCostUSD != nil {
 			if maxCost == nil || *l.TotalCostUSD > *maxCost {
@@ -716,7 +746,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		return nil
 	})
 	if walkErr != nil {
-		return 0, 0, 0, walkErr
+		return writeCounts{}, walkErr
 	}
 	end = res.EndOffset
 
@@ -726,25 +756,25 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	}
 	summary, err := json.Marshal(f)
 	if err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
 	if _, err := tx.Exec(`
 		update source_files set ingested_offset = ?, pending_tail = ?,
 			summary_json = ?, summary_version = ?, resume_sha = ?
 		 where id = ?`, end, pending, summary, SummaryVersion, f.ResumeSHA, fileID); err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
 	if maxCost != nil {
 		if _, err := tx.Exec(`
 			update sessions set total_cost_usd = max(coalesce(total_cost_usd, 0), ?)
 			 where id = ?`, *maxCost, sessID); err != nil {
-			return 0, 0, 0, err
+			return writeCounts{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, 0, 0, err
+		return writeCounts{}, err
 	}
-	return n, nUsage, nBlocks, nil
+	return cnt, nil
 }
 
 func allRunIDs(db *store.DB) (map[string]struct{}, error) {
