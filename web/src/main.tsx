@@ -9,6 +9,8 @@ import Usage from './pages/Usage'
 import Notes from './pages/Notes'
 import NoteDetail from './pages/NoteDetail'
 import VaultHealth from './pages/VaultHealth'
+import Views from './pages/Views'
+import ViewDetail from './pages/ViewDetail'
 import './styles.css'
 
 // ルーティングは本物のURLに乗せる（BrowserRouter）。
@@ -31,6 +33,9 @@ function App() {
         <NavLink to="/notes" className={({ isActive }) => (isActive ? 'on' : '')}>
           ノート
         </NavLink>
+        <NavLink to="/views" className={({ isActive }) => (isActive ? 'on' : '')}>
+          ビュー
+        </NavLink>
         <NavLink to="/vault" className={({ isActive }) => (isActive ? 'on' : '')}>
           Vault の点検
         </NavLink>
@@ -46,6 +51,8 @@ function App() {
           <Route path="/usage" element={<Usage />} />
           <Route path="/notes" element={<Notes />} />
           <Route path="/notes/:id" element={<NoteDetail />} />
+          <Route path="/views" element={<Views />} />
+          <Route path="/views/*" element={<ViewDetail />} />
           <Route path="/vault" element={<VaultHealth />} />
           <Route path="*" element={<NotFound />} />
         </Routes>

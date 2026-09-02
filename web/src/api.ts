@@ -76,6 +76,26 @@ export type Ghost = {
   versions?: GhostVersion[]
 }
 
+export type ViewInfo = {
+  base: string; name: string; kind: string; id: string
+  rows: number; columns: number; pinned: number; error?: string
+}
+
+export type ViewColumn = {
+  key: string; label: string; formula?: boolean; pinned?: boolean
+  numeric?: boolean; filled: number
+}
+
+export type ViewRow = { note_id: number; path: string; name: string; cells: Record<string, string> }
+
+export type ViewGroup = { key: string; rows: ViewRow[]; summary?: Record<string, number> }
+
+export type ViewResult = {
+  view: string; kind: string
+  columns: ViewColumn[]; groups: ViewGroup[]
+  total: number; summary?: Record<string, number>; warnings?: string[]
+}
+
 export type Touch = {
   abs_path: string; rel_path?: string; op: string; origin: string; at: string
   session_id: string; message_uuid?: string; title?: string; backup_name?: string
@@ -145,6 +165,10 @@ export const api = {
     fetchJSON<Backup[]>('/api/backups' + qs(o)),
 
   vaults: () => fetchJSON<VaultInfo[]>('/api/vaults'),
+
+  views: () => fetchJSON<ViewInfo[]>('/api/views'),
+  view: (id: string) =>
+    fetchJSON<ViewResult>('/api/views/' + id.split('/').map(encodeURIComponent).join('/')),
 
   // 本文は blobs から返る。ノートが Vault から消えていても読める。
   noteBody: async (id: number) => {

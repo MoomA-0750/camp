@@ -46,6 +46,7 @@ type Server struct {
 	secureCookie bool
 	throttle     throttle
 	log          *slog.Logger
+	views        viewCache
 }
 
 // New はハンドラを組み立てる。

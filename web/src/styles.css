@@ -133,3 +133,14 @@ button.linkish {
   padding: 0; cursor: pointer;
 }
 button.linkish:hover { text-decoration: underline; }
+
+/* --- 広い表（107列）は自分のなかで横スクロールする。body は横に伸ばさない --- */
+.wide { overflow-x: auto; max-width: 100%; }
+table.grid { font-size: .88em; }
+table.grid th, table.grid td {
+  white-space: nowrap; max-width: 18rem; overflow: hidden; text-overflow: ellipsis;
+}
+table.grid th.pin { position: sticky; left: 0; background: var(--bg); z-index: 1; }
+table.grid th.pin ~ th.pin { position: static; }
+tr.grouphead th { background: var(--soft); }
+label { display: inline-flex; align-items: center; gap: .3rem; }

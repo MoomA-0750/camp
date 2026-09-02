@@ -424,3 +424,18 @@ func TestVaultRoutesRequireAuth(t *testing.T) {
 		}
 	}
 }
+
+// ビューの経路も認証の内側。
+func TestViewRoutesRequireAuth(t *testing.T) {
+	srv, _ := newServer(t)
+	for _, p := range []string{"/api/views", "/api/views/Health/x"} {
+		res, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: %d（401 のはず）", p, res.StatusCode)
+		}
+	}
+}

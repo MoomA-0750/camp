@@ -44,6 +44,8 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/notes/{id}/sessions", s.handleNoteSessions)
 	m.HandleFunc("GET /api/vault/ghosts", s.handleGhosts)
 	m.HandleFunc("GET /api/vault/issues", s.handleIssues)
+	m.HandleFunc("GET /api/views", s.handleViews)
+	m.HandleFunc("GET /api/views/{id...}", s.handleView)
 }
 
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
