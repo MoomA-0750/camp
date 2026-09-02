@@ -3,13 +3,19 @@ package vault
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 // mkVault は最小の Vault を作る。
 func mkVault(t *testing.T, files map[string]string) string {
 	t.Helper()
-	root := t.TempDir()
+	// 末尾に文字を含む名前にする。t.TempDir() の末尾は "002" のような数字で、
+	// 小文字化しても同じパスになってしまい、表記違いの検査が成り立たない。
+	root := filepath.Join(t.TempDir(), "Obsidian-Vault")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for rel, body := range files {
 		p := filepath.Join(root, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -117,4 +123,14 @@ func TestSymlinksAreNotFollowed(t *testing.T) {
 			t.Errorf("リンクの先まで拾っている: %s", f.Rel)
 		}
 	}
+}
+
+// lowerLast は最後のパス要素だけ小文字にする（Obsidian-Vault → Obsidian-vault 相当）。
+func lowerLast(p string) string {
+	d, b := filepath.Split(p)
+	return filepath.Join(d, strings.ToLower(b))
+}
+
+func removeFile(root, rel string) error {
+	return os.Remove(filepath.Join(root, filepath.FromSlash(rel)))
 }

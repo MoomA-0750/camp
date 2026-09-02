@@ -111,6 +111,7 @@ usage:
   campd login-url         使い捨てのログインURLを1本出す（開発中の入口）
   campd vault scan  [DIR] Vault を歩いて内訳を出す（DBには書かない）
   campd vault index [DIR] Vault を索引する（Vault側には一切書かない）
+  campd vault ghosts      触った記録はあるが実体が無いパスを並べる
   campd limits record     statusLine の JSON を stdin から読んで残量を記録する
   campd limits show       記録済みの窓を新しい順に並べる（-current で現在ぶんだけ）
 `)
@@ -1067,6 +1068,8 @@ func cmdVault(args []string) error {
 		return cmdVaultScan(args)
 	case "index":
 		return cmdVaultIndex(args)
+	case "ghosts":
+		return cmdVaultGhosts(args)
 	default:
 		return fmt.Errorf("vault の使い方: campd vault scan | campd vault index")
 	}
@@ -1165,4 +1168,49 @@ func clipList(xs []string, n int) []string {
 		return xs
 	}
 	return append(append([]string{}, xs[:n]...), fmt.Sprintf("…他%d", len(xs)-n))
+}
+
+func cmdVaultGhosts(args []string) error {
+	fs := flag.NewFlagSet("vault ghosts", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	vaultID := fs.Int64("vault", 1, "Vault の id")
+	only := fs.String("reason", "", "分類で絞る（gone / worktree / hidden / other-case）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	gs, err := vault.Ghosts(db, *vaultID)
+	if err != nil {
+		return err
+	}
+	byReason := map[string]int{}
+	shown := 0
+	for _, g := range gs {
+		byReason[g.Reason]++
+		if *only != "" && g.Reason != *only {
+			continue
+		}
+		body := ""
+		if g.Backups > 0 {
+			body = fmt.Sprintf("  中身 %d版", g.Backups)
+		}
+		fmt.Printf("%-10s %-16s %s%s\n", g.Reason, shortTime(g.Last), g.Path, body)
+		shown++
+	}
+	if shown == 0 {
+		fmt.Println("該当なし")
+	}
+	fmt.Println()
+	for _, r := range []string{vault.GhostGone, vault.GhostOtherCase, vault.GhostWorktree, vault.GhostHidden} {
+		if byReason[r] > 0 {
+			fmt.Printf("%-10s %d\n", r, byReason[r])
+		}
+	}
+	return nil
 }
