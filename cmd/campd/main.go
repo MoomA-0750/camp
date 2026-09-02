@@ -1149,6 +1149,9 @@ func cmdVaultIndex(args []string) error {
 		fmt.Printf("消えた    %d（行は残す。中身も blobs に残っている）\n", res.Missing)
 	}
 	fmt.Printf("中身      blobs に %d 個追加\n", res.Stored)
+	fmt.Printf("リンク    延べ %d 本 → %d 行（同じ先へは1本に畳む）\n", res.Links, res.LinkRows)
+	fmt.Printf("          解決 %d / 宙吊り %d / うち曖昧 %d\n",
+		res.Resolved, res.Dangling, res.Ambiguous)
 	if len(res.Pruned) > 0 {
 		fmt.Printf("切った    %d ディレクトリ: %s\n",
 			len(res.Pruned), strings.Join(clipList(res.Pruned, 6), " "))

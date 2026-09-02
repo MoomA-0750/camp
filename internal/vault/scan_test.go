@@ -34,10 +34,10 @@ func rels(r *Result) map[string]File {
 // この Vault の11倍のファイルがある。降りてから捨てる形にすると索引が実用にならない。
 func TestDotDirsArePrunedNotFiltered(t *testing.T) {
 	root := mkVault(t, map[string]string{
-		"Human/Logs/2026-09-02.md":   "本文",
-		".claude/worktrees/a/big.md": "ノイズ",
-		".git/objects/x/y.md":        "ノイズ",
-		".trash/消したもの.md":            "ノイズ",
+		"Human/Logs/2026-09-02.md":      "本文",
+		".claude/worktrees/a/big.md":    "ノイズ",
+		".git/objects/x/y.md":           "ノイズ",
+		".trash/消したもの.md":               "ノイズ",
 		".obsidian/plugins/p/README.md": "ノイズ",
 	})
 	res, err := Scan(root)
