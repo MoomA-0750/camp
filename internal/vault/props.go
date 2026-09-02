@@ -3,6 +3,7 @@ package vault
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,7 +34,15 @@ func ExtractProps(body []byte) []Prop {
 	}
 	var out []Prop
 	for k, v := range doc {
-		out = append(out, flattenProp(k, v)...)
+		ps := flattenProp(k, v)
+		// **seq は畳んだ後の通し番号にする。** 子の添字を外側の添字で
+		// 上書きすると、入れ子の配列（`k: [[a,b],[c,d]]`）が同じ
+		// (note_id,key,seq) を2行作り、note_props の主キーに当たって
+		// **Vault索引のトランザクション全体がロールバックする。**
+		for i := range ps {
+			ps[i].Seq = i
+		}
+		out = append(out, ps...)
 	}
 	return out
 }
@@ -44,11 +53,8 @@ func flattenProp(key string, v any) []Prop {
 		return nil
 	case []any:
 		var out []Prop
-		for i, e := range t {
-			for _, p := range flattenProp(key, e) {
-				p.Seq = i
-				out = append(out, p)
-			}
+		for _, e := range t {
+			out = append(out, flattenProp(key, e)...)
 		}
 		return out
 	case map[string]any:
@@ -68,6 +74,15 @@ func scalarText(v any) string {
 	switch t := v.(type) {
 	case string:
 		return t
+	case time.Time:
+		// **YAMLは引用符の無い `date: 2026-08-19` を時刻として解決する。**
+		// そのまま Marshal すると `2026-08-19T00:00:00Z` になり、Obsidian が
+		// 見せている `2026-08-19` と違う値が列に出る。実測で Health の
+		// 2,687件すべてがこれに当たっていた。書かれたとおりに戻す。
+		if t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {
+			return t.Format("2006-01-02")
+		}
+		return t.Format(time.RFC3339)
 	case bool:
 		if t {
 			return "true"
@@ -83,23 +98,21 @@ func scalarText(v any) string {
 	return strings.TrimSpace(strings.Trim(strings.TrimSpace(sprint(v)), "\n"))
 }
 
+// scalarNum は **YAMLが数として書いたものだけ** を数にする。
+//
+// 引用符付きの文字列や真偽値まで拾うと、ゼロ埋めのID（`"007"`）や
+// `complete: true` が数値ソートと Sum の対象に化ける。書き手が引用符を
+// 付けたのは「数ではない」という意思表示なので、それを尊重する。
 func scalarNum(v any) (float64, bool) {
 	switch t := v.(type) {
 	case int:
 		return float64(t), true
 	case int64:
 		return float64(t), true
+	case uint64:
+		return float64(t), true
 	case float64:
 		return t, true
-	case bool:
-		if t {
-			return 1, true
-		}
-		return 0, true
-	case string:
-		if n, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
-			return n, true
-		}
 	}
 	return 0, false
 }
