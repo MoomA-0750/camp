@@ -160,7 +160,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mux.ServeHTTP(w, r)
+	withGzip(s.mux.ServeHTTP)(w, r)
 }
 
 // securityHeaders は返すもの全部に付ける。

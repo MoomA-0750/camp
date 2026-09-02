@@ -110,14 +110,35 @@ func (s *Server) builtinTools() []Tool {
 			Run: func(a map[string]any) (any, error) {
 				id := int64(num(a, "id", 0))
 				if p := str(a, "path"); p != "" {
-					ns, err := vault.Notes(s.db, vault.NoteOpts{Q: p, Limit: 2})
+					// **黙って1つ選ばない。** パスの部分一致なので候補が
+					// 複数出うる。Phase 1 で曖昧な wikilink について
+					// 決めたのと同じ扱いにする。完全一致があればそれを採る。
+					ns, err := vault.Notes(s.db, vault.NoteOpts{Q: p, Limit: 10})
 					if err != nil {
 						return nil, err
 					}
 					if len(ns) == 0 {
 						return nil, fmt.Errorf("%q に当たるノートが無い", p)
 					}
-					id = ns[0].ID
+					id = 0
+					for _, n := range ns {
+						if n.Path == p {
+							id = n.ID
+							break
+						}
+					}
+					if id == 0 {
+						if len(ns) > 1 {
+							paths := make([]string, 0, len(ns))
+							for _, n := range ns {
+								paths = append(paths, n.Path)
+							}
+							return nil, fmt.Errorf(
+								"%q に当たるノートが %d 件ある。パスを絞るか id を渡す: %s",
+								p, len(ns), strings.Join(paths, " / "))
+						}
+						id = ns[0].ID
+					}
 				}
 				if id == 0 {
 					return nil, fmt.Errorf("path か id が要る")
@@ -148,6 +169,13 @@ func (s *Server) builtinTools() []Tool {
 				}
 				out := []map[string]any{}
 				for _, b := range bases {
+					if b.ParseError != "" {
+						out = append(out, map[string]any{
+							"id": b.Name + "/", "base": b.Name,
+							"name": "(読めない)", "error": b.ParseError,
+						})
+						continue
+					}
 					for i := range b.Views {
 						v := &b.Views[i]
 						row := map[string]any{

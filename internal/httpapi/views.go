@@ -76,6 +76,13 @@ func (s *Server) handleViews(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []ViewInfo{}
 	for _, b := range bases {
+		// 読めなかった `.base` も1行として出す。黙って消えると
+		// 「ビューが減った」ことに気付けない。
+		if b.ParseError != "" {
+			out = append(out, ViewInfo{Base: b.Name, Name: "(読めない)",
+				ID: viewID(b.Name, ""), Error: b.ParseError})
+			continue
+		}
 		for i := range b.Views {
 			v := &b.Views[i]
 			info := ViewInfo{Base: b.Name, Name: v.Name, Kind: v.Kind,

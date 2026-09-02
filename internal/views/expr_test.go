@@ -191,7 +191,7 @@ func TestExprAcceptsOrdinarySyntax(t *testing.T) {
 		{`price * 2`, "10"},
 		{`amount - price`, "5"},
 		{`amount / price`, "2"},
-		{`amount / 0`, ""},           // 0除算は null。行ごと落とさない
+		{`amount / 0`, ""}, // 0除算は null。行ごと落とさない
 		{`-price + amount`, "5"},
 		{`file.hasTag("bank") && amount > 5`, "true"},
 		{`file.hasTag("x") || amount > 5`, "true"},
