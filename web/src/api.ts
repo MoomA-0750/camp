@@ -66,9 +66,14 @@ export type NoteTouch = {
   at: string; note_path: string; note_id?: number; backup_id?: number
 }
 
+export type GhostVersion = {
+  backup_id: number; version: number; at?: string; size: number; session_id?: string
+}
+
 export type Ghost = {
   path: string; abs_path: string; reason: string
   touches: number; sessions: number; last_at: string; backups: number
+  versions?: GhostVersion[]
 }
 
 export type Touch = {
@@ -161,6 +166,14 @@ export const api = {
   noteSessions: (id: number) => fetchJSON<NoteTouch[]>(`/api/notes/${id}/sessions`),
 
   ghosts: () => fetchJSON<Ghost[]>('/api/vault/ghosts'),
+
+  // 消えたパスの中身。file-history から捕獲した実体を blobs から返す。
+  backupContent: async (id: number) => {
+    const res = await fetch(`/api/backups/${id}/content`)
+    if (res.status === 401) { location.href = '/login'; throw new Error('未認証') }
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+    return res.text()
+  },
 
   vaultIssues: () =>
     fetchJSON<{ ambiguous: Ref[]; dangling: Ref[] }>('/api/vault/issues'),

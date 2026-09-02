@@ -105,6 +105,18 @@ type Ghost struct {
 	Sessions int    `json:"sessions"`
 	Last     string `json:"last_at"`
 	Backups  int    `json:"backups"` // 中身が blobs に残っている版数
+
+	// Versions は読める版。Camp にしか残っていない中身への入口。
+	Versions []GhostVersion `json:"versions,omitempty"`
+}
+
+// GhostVersion は消えたパスの、ある時点の中身。
+type GhostVersion struct {
+	BackupID int64  `json:"backup_id"`
+	Version  int    `json:"version"`
+	At       string `json:"at,omitempty"`
+	Size     int64  `json:"size"`
+	Session  string `json:"session_id,omitempty"`
 }
 
 const (
@@ -127,11 +139,20 @@ func Ghosts(db *store.DB, vaultID int64) ([]Ghost, error) {
 	if err != nil {
 		return nil, err
 	}
+	versions, err := backupVersions(db)
+	if err != nil {
+		return nil, err
+	}
 
+	// 中身の版数は file_backups.abs_path から直に数える。
+	//
+	// session_files 側の (session_id, backup_name) 経由で数えてはいけない:
+	// backup_name が入っているのは file-history 由来の行だけで、実測 2,418行中
+	// 2,246行が NULL。GROUP BY abs_path が任意の1行を拾うので、ほぼ全部
+	// 空振りして「中身なし」に見える（実際は Obsidian-Vault 配下に91版ある）。
 	rows, err := db.Query(`
 		select sf.abs_path, count(*), count(distinct sf.session_id), max(sf.at),
-		       (select count(*) from file_backups fb
-		         where fb.session_id = sf.session_id and fb.backup_name = sf.backup_name)
+		       (select count(*) from file_backups fb where fb.abs_path = sf.abs_path)
 		  from session_files sf
 		 group by sf.abs_path
 		 order by max(sf.at) desc`)
@@ -172,6 +193,7 @@ func Ghosts(db *store.DB, vaultID int64) ([]Ghost, error) {
 		} else {
 			g.Path = g.AbsPath
 		}
+		g.Versions = versions[g.AbsPath]
 		out = append(out, g)
 	}
 	return out, rows.Err()
@@ -190,6 +212,36 @@ func indexedAbs(db *store.DB, vaultID int64, root string) (map[string]struct{}, 
 			return nil, err
 		}
 		out[root+"/"+p] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
+// backupVersions は絶対パスごとの、読める版の一覧を返す。
+// 中身は file_backups → blobs にあるので、ノートが消えていても取り出せる。
+//
+// 並びは**版番号ではなく時刻**。版番号はセッションの中でしか意味を持たず
+// （同じパスを別セッションが触ると 1 から振り直される）、版順に並べると
+// 「v3(08-11) v2(08-17) v2(08-11) v1(08-17)」のように時系列が壊れる。
+func backupVersions(db *store.DB) (map[string][]GhostVersion, error) {
+	rows, err := db.Query(`
+		select fb.abs_path, fb.id, fb.version, coalesce(fb.backup_time, ''),
+		       coalesce(b.size, 0), fb.session_id
+		  from file_backups fb
+		  left join blobs b on b.sha256 = fb.sha256
+		 where fb.abs_path is not null
+		 order by fb.abs_path, fb.backup_time desc, fb.version desc`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]GhostVersion{}
+	for rows.Next() {
+		var p string
+		var v GhostVersion
+		if err := rows.Scan(&p, &v.BackupID, &v.Version, &v.At, &v.Size, &v.Session); err != nil {
+			return nil, err
+		}
+		out[p] = append(out[p], v)
 	}
 	return out, rows.Err()
 }

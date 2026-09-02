@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -145,5 +146,25 @@ func TestAssetsGetARowButNoBody(t *testing.T) {
 	}
 	if hash != "" {
 		t.Error("画像の中身まで blobs に入れている")
+	}
+}
+
+// 上限を超える要求は切り詰める。既定値に戻すと一覧が黙って打ち切られ、
+// 「多めに要求したら少なく返ってきた」ことに画面側から気付けない。
+func TestLimitOverMaxIsClampedNotReset(t *testing.T) {
+	db := newDB(t)
+	files := map[string]string{}
+	for i := 0; i < 300; i++ {
+		files[fmt.Sprintf("n%03d.md", i)] = "本文"
+	}
+	root := mkVault(t, files)
+	index(t, db, root)
+
+	got, err := Notes(db, NoteOpts{Limit: 99999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 300 {
+		t.Fatalf("300件返るはずが %d（既定の200に落ちていないか）", len(got))
 	}
 }

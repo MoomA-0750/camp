@@ -96,3 +96,21 @@ test('本文が無い種別は理由を出す', async () => {
     </MemoryRouter>)
   await waitFor(() => expect(screen.getByText(/本文を保存していない/)).toBeTruthy())
 })
+
+// 一覧は上限で切らない。件数は常に本当の全件で、描くのは見えている分だけ。
+// 500件で頭打ちにすると「500件」が全件か打ち切りか読み手に分からない。
+test('全件を数え、描くのは一部', async () => {
+  const many = Array.from({ length: 3000 }, (_, i) => ({
+    ...note, id: i + 1, path: `Data/N/${i}.md`, title: `n${i}`,
+  }))
+  stub(() => many)
+  render(
+    <MemoryRouter initialEntries={['/notes']}>
+      <Routes><Route path="/notes" element={<Notes />} /></Routes>
+    </MemoryRouter>)
+  await waitFor(() => expect(screen.getByText('3,000 件')).toBeTruthy())
+  // 先頭は出ている
+  expect(screen.getByText('n0')).toBeTruthy()
+  // 遥か下はDOMに無い（全部描いていたら重い）
+  expect(screen.queryByText('n2999')).toBeNull()
+})

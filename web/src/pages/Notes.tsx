@@ -1,6 +1,7 @@
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { Empty, Failed, Loading, num, short, useAsync } from '../ui'
+import { VirtualList } from '../VirtualList'
 
 const KINDS = [
   ['', 'すべての種別'], ['markdown', 'ノート'], ['base', 'Bases'],
@@ -17,7 +18,7 @@ export default function Notes() {
 
   const vaults = useAsync(() => api.vaults(), [])
   const list = useAsync(
-    () => api.notes({ q, folder, kind, missing, n: 500 }),
+    () => api.notes({ q, folder, kind, missing, n: 5000 }),
     [q, folder, kind, missing],
   )
 
@@ -67,9 +68,11 @@ export default function Notes() {
       {list.data && list.data.length > 0 && (
         <>
           <p className="muted">{num(list.data.length)} 件</p>
-          <ul className="rows">
-            {list.data.map((n) => (
-              <li key={n.id}>
+          <VirtualList
+            items={list.data}
+            rowHeight={64}
+            render={(n) => (
+              <div className="vrow">
                 <Link to={`/notes/${n.id}`}>{n.title || n.path}</Link>
                 {n.missing_at && <span className="tag gone">消えている</span>}
                 <div className="row-meta">
@@ -78,9 +81,9 @@ export default function Notes() {
                   {n.links > 0 && <span>リンク {num(n.links)}</span>}
                   {n.touches > 0 && <span>セッションが触った {num(n.touches)}</span>}
                 </div>
-              </li>
-            ))}
-          </ul>
+              </div>
+            )}
+          />
         </>
       )}
     </>

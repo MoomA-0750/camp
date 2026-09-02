@@ -1,5 +1,6 @@
+import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api } from '../api'
+import { api, type Ghost } from '../api'
 import { Empty, Failed, Loading, num, short, useAsync } from '../ui'
 
 const REASON: Record<string, { label: string; why: string }> = {
@@ -105,17 +106,7 @@ export default function VaultHealth() {
                     <h3>{meta.label}（{num(rows.length)}）</h3>
                     <p className="muted">{meta.why}</p>
                     <ul className="rows">
-                      {rows.map((g, i) => (
-                        <li key={i}>
-                          <span className="mono">{g.path}</span>
-                          <div className="row-meta">
-                            <span>{num(g.touches)} 回</span>
-                            <span>{num(g.sessions)} セッション</span>
-                            <span>最後 {short(g.last_at)}</span>
-                            {g.backups > 0 && <span>中身 {num(g.backups)} 版が Camp に残っている</span>}
-                          </div>
-                        </li>
-                      ))}
+                      {rows.map((g, i) => <GhostRow key={i} g={g} />)}
                     </ul>
                   </div>
                 )
@@ -125,5 +116,64 @@ export default function VaultHealth() {
         </>
       )}
     </>
+  )
+}
+
+
+/**
+ * 中身の残っている ghost は、その場で開けるようにする。
+ *
+ * ここが Camp の存在理由がいちばん露骨に出る場所で、**Vault にも git にも
+ * もう無いものが読める**。だから「何版あるか」で終わらせず、実際に開ける
+ * ところまで繋ぐ。中身が無い ghost は触った記録しかないので、そう書く。
+ */
+function GhostRow({ g }: { g: Ghost }) {
+  const [open, setOpen] = useState(0)
+  const [body, setBody] = useState<string | null>(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const show = (id: number) => {
+    if (open === id) { setOpen(0); setBody(null); return }
+    setOpen(id); setBody(null); setErr(''); setBusy(true)
+    api.backupContent(id).then(
+      (t) => { setBody(t); setBusy(false) },
+      (e: Error) => { setErr(e.message); setBusy(false) },
+    )
+  }
+
+  return (
+    <li>
+      <span className="mono">{g.path}</span>
+      <div className="row-meta">
+        <span>{num(g.touches)} 回</span>
+        <span>{num(g.sessions)} セッション</span>
+        <span>最後 {short(g.last_at)}</span>
+      </div>
+      {g.versions && g.versions.length > 0 ? (
+        <div className="row-meta">
+          <span>Camp に残っている中身:</span>
+          {g.versions.map((v) => (
+            <button
+              key={v.backup_id} type="button" className="linkish"
+              onClick={() => show(v.backup_id)}
+            >
+              v{v.version}
+              {v.at ? `（${short(v.at)}）` : ''}
+              {open === v.backup_id ? ' ▲' : ' ▼'}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="row-meta muted">触った記録だけ。中身は残っていない。</div>
+      )}
+      {open > 0 && (
+        <>
+          {busy && <Loading />}
+          {err && <Failed error={err} />}
+          {body !== null && <pre className="note-body">{body}</pre>}
+        </>
+      )}
+    </li>
   )
 }

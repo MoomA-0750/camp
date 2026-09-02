@@ -135,3 +135,93 @@ func TestTouchesSurviveNoteDeletion(t *testing.T) {
 		t.Fatalf("消えたあとも触り跡は残るはず: %+v", ts)
 	}
 }
+
+// 中身の版数は file_backups.abs_path から数える。
+// session_files の backup_name は file-history 由来の行にしか入っておらず
+// （実測 2,418行中 2,246行が NULL）、そちら経由で数えると空振りする。
+func TestGhostVersionsComeFromBackupPath(t *testing.T) {
+	db := newDB(t)
+	root := mkVault(t, map[string]string{"生きてる.md": "本文"})
+	index(t, db, root)
+
+	gone := root + "/Human/Learning/消えた.md"
+	// backup_name の無い触り跡（実データの大半がこの形）
+	seedSession(t, db, gone)
+
+	if _, err := db.Exec(`
+		insert into blobs(sha256, size, codec, content, stored_at)
+		values('aa', 5, 'raw', x'68656c6c6f', 't');
+		insert into file_backups(session_id, backup_name, version, abs_path, rel_path,
+		                         backup_time, sha256, origin, captured_at)
+		values('s1', 'h@v1', 1, ?, 'Human/Learning/消えた.md', 't', 'aa', 'delta', 't'),
+		      ('s1', 'h@v2', 2, ?, 'Human/Learning/消えた.md', 't', 'aa', 'delta', 't')`,
+		gone, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	gs, err := Ghosts(db, vaultID(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var g *Ghost
+	for i := range gs {
+		if gs[i].Reason == GhostGone {
+			g = &gs[i]
+		}
+	}
+	if g == nil {
+		t.Fatalf("gone が出ていない: %+v", gs)
+	}
+	if g.Backups != 2 {
+		t.Errorf("版数=%d、2 のはず（backup_name 経由で数えると 0 になる）", g.Backups)
+	}
+	if len(g.Versions) != 2 {
+		t.Fatalf("読める版を2つ返すはず: %+v", g.Versions)
+	}
+	if g.Versions[0].Version != 2 {
+		t.Errorf("新しい版が先頭のはず: %+v", g.Versions)
+	}
+	if g.Versions[0].BackupID == 0 {
+		t.Error("中身を引く id が入っていない")
+	}
+}
+
+// 版の並びは時刻順。版番号はセッション内でしか意味を持たないので、
+// 版順に並べると複数セッションの記録が混ざって時系列が壊れる。
+func TestGhostVersionsAreOrderedByTime(t *testing.T) {
+	db := newDB(t)
+	root := mkVault(t, map[string]string{"生きてる.md": "本文"})
+	index(t, db, root)
+	gone := root + "/Human/Learning/消えた.md"
+	seedSession(t, db, gone)
+
+	if _, err := db.Exec(`
+		insert into blobs(sha256, size, codec, content, stored_at)
+		values('aa', 5, 'raw', x'68656c6c6f', 't');
+		insert into sessions(id, host_id, project_id, agent, started_at, updated_at)
+		values('s2', 1, 1, 'claude', 't', 't');
+		insert into file_backups(session_id, backup_name, version, abs_path, rel_path,
+		                         backup_time, sha256, origin, captured_at)
+		values('s1', 'h@v3', 3, ?, 'r', '2026-08-11T12:04:00Z', 'aa', 'delta', 't'),
+		      ('s2', 'h@v1', 1, ?, 'r', '2026-08-17T03:12:00Z', 'aa', 'delta', 't')`,
+		gone, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	gs, err := Ghosts(db, vaultID(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range gs {
+		if g.Reason != GhostGone {
+			continue
+		}
+		if len(g.Versions) != 2 {
+			t.Fatalf("2版のはず: %+v", g.Versions)
+		}
+		// 版番号だと v3 が先に来るが、時刻では 08-17 の v1 が新しい。
+		if g.Versions[0].Version != 1 {
+			t.Errorf("時刻順になっていない（版順に並べている）: %+v", g.Versions)
+		}
+	}
+}

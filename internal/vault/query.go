@@ -56,6 +56,10 @@ type Note struct {
 	Touches   int    `json:"touches"`   // セッションが触った回数
 }
 
+// maxNotes は1回に返すノートの上限。Vault 全件（実測4,171）を
+// 一度に返せる大きさにしてある。画面側は仮想スクロールで描く。
+const maxNotes = 20000
+
 // NoteOpts は一覧の絞り込み。
 type NoteOpts struct {
 	VaultID int64
@@ -72,8 +76,14 @@ type NoteOpts struct {
 // 大文字小文字を区別しない**ので、LIKE で書くと `Obsidian-Vault` と
 // `Obsidian-vault` が同じものとして当たってしまう。
 func Notes(db *store.DB, o NoteOpts) ([]Note, error) {
-	if o.Limit <= 0 || o.Limit > 2000 {
+	// 上限を超えたら**切り詰める**。既定値に戻してはいけない。
+	// 「多めに要求したら少なく返ってきた」は画面側から見えず、
+	// 一覧が黙って打ち切られる（実際に 5000 要求で 200 件になった）。
+	if o.Limit <= 0 {
 		o.Limit = 200
+	}
+	if o.Limit > maxNotes {
+		o.Limit = maxNotes
 	}
 	missing := ""
 	switch o.Missing {

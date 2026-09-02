@@ -118,3 +118,18 @@ h3:first-of-type { margin-top: .8rem; }
   white-space: pre-wrap; overflow-wrap: anywhere;
   font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .88em;
 }
+
+/* --- 仮想スクロールの行（高さ固定。ul.rows と見た目を揃える） --- */
+.vrow {
+  border-top: 1px solid var(--line); padding: .7rem 0;
+  height: 100%; overflow: hidden;
+}
+.vrow .row-meta { margin-top: .15rem; flex-wrap: nowrap; }
+.vrow .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 行内の「開く」ボタン。リンクと同じ見た目で、実体はボタン。 */
+button.linkish {
+  font: inherit; color: var(--accent); background: none; border: 0;
+  padding: 0; cursor: pointer;
+}
+button.linkish:hover { text-decoration: underline; }
