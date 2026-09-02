@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
 
 	"github.com/MoomA-0750/camp/internal/files"
@@ -9,6 +10,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/query"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
+	"github.com/MoomA-0750/camp/internal/vault"
 )
 
 // routes は認証を通ったあとの振り分け。
@@ -34,6 +36,14 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/backups", s.handleBackups)
 	m.HandleFunc("GET /api/backups/{id}/content", s.handleBackupContent)
 	m.HandleFunc("GET /api/findings", s.handleFindings)
+	m.HandleFunc("GET /api/vaults", s.handleVaults)
+	m.HandleFunc("GET /api/notes", s.handleNotes)
+	m.HandleFunc("GET /api/notes/{id}", s.handleNote)
+	m.HandleFunc("GET /api/notes/{id}/body", s.handleNoteBody)
+	m.HandleFunc("GET /api/notes/{id}/links", s.handleNoteLinks)
+	m.HandleFunc("GET /api/notes/{id}/sessions", s.handleNoteSessions)
+	m.HandleFunc("GET /api/vault/ghosts", s.handleGhosts)
+	m.HandleFunc("GET /api/vault/issues", s.handleIssues)
 }
 
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
@@ -196,4 +206,95 @@ func (s *Server) handleWindows(w http.ResponseWriter, r *http.Request) {
 		Limit: atoi(q.Get("n")),
 	})
 	s.respond(w, r, rows, err)
+}
+
+func (s *Server) handleVaults(w http.ResponseWriter, r *http.Request) {
+	rows, err := vault.Vaults(s.db)
+	s.respond(w, r, rows, err)
+}
+
+func (s *Server) handleNotes(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rows, err := vault.Notes(s.db, vault.NoteOpts{
+		VaultID: int64(atoi(q.Get("vault"))),
+		Folder:  q.Get("folder"),
+		Kind:    q.Get("kind"),
+		Q:       q.Get("q"),
+		Missing: q.Get("missing"),
+		Limit:   atoi(q.Get("n")),
+	})
+	s.respond(w, r, rows, err)
+}
+
+func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
+	n, err := vault.OneNote(s.db, int64(atoi(r.PathValue("id"))))
+	if err == nil && n == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "そのノートは無い"})
+		return
+	}
+	s.respond(w, r, n, err)
+}
+
+// handleNoteBody は blobs から本文を返す。Vault のファイルは読まない。
+// ノートが消えていても中身が返る。
+func (s *Server) handleNoteBody(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoi(r.PathValue("id")))
+	n, err := vault.OneNote(s.db, id)
+	if err != nil {
+		s.respond(w, r, nil, err)
+		return
+	}
+	if n == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "そのノートは無い"})
+		return
+	}
+	body, err := vault.NoteBody(s.db, id)
+	if err != nil {
+		s.respond(w, r, nil, err)
+		return
+	}
+	if body == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "本文を保存していない種別"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Camp-Path", url.PathEscape(n.Path))
+	w.Write(body)
+}
+
+func (s *Server) handleNoteLinks(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoi(r.PathValue("id")))
+	out, err := vault.OutLinks(s.db, id)
+	if err != nil {
+		s.respond(w, r, nil, err)
+		return
+	}
+	back, err := vault.Backlinks(s.db, id)
+	s.respond(w, r, map[string]any{"out": out, "back": back}, err)
+}
+
+func (s *Server) handleNoteSessions(w http.ResponseWriter, r *http.Request) {
+	rows, err := vault.NoteTouches(s.db, int64(atoi(r.PathValue("id"))), atoi(r.URL.Query().Get("n")))
+	s.respond(w, r, rows, err)
+}
+
+func (s *Server) handleGhosts(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoi(r.URL.Query().Get("vault")))
+	if id == 0 {
+		id = 1
+	}
+	rows, err := vault.Ghosts(s.db, id)
+	s.respond(w, r, rows, err)
+}
+
+// handleIssues は「Obsidian と食い違うかもしれない場所」をまとめて返す。
+func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoi(r.URL.Query().Get("vault")))
+	amb, err := vault.Ambiguous(s.db, id)
+	if err != nil {
+		s.respond(w, r, nil, err)
+		return
+	}
+	dang, err := vault.Dangling(s.db, id)
+	s.respond(w, r, map[string]any{"ambiguous": amb, "dangling": dang}, err)
 }

@@ -405,3 +405,22 @@ func mustJar() http.CookieJar {
 	j, _ := newJar()
 	return j
 }
+
+// Vault の経路も認証の内側。素通りする穴が開いていないこと。
+func TestVaultRoutesRequireAuth(t *testing.T) {
+	srv, _ := newServer(t)
+	for _, p := range []string{
+		"/api/vaults", "/api/notes", "/api/notes/1", "/api/notes/1/body",
+		"/api/notes/1/links", "/api/notes/1/sessions",
+		"/api/vault/ghosts", "/api/vault/issues",
+	} {
+		res, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: %d（401 のはず）", p, res.StatusCode)
+		}
+	}
+}

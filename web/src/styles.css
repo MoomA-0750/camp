@@ -98,3 +98,23 @@ h3:first-of-type { margin-top: .8rem; }
 .bar .cool { background: var(--accent); }
 .bar .warm { background: #d08b2f; }
 .bar .hot  { background: #c0392b; }
+
+/* --- ノート・Vault の点検 --- */
+.tag {
+  display: inline-block; margin-left: .5rem; padding: .05rem .4rem;
+  border: 1px solid var(--line); border-radius: .25rem;
+  font-size: .8em; color: var(--muted); vertical-align: middle;
+}
+.tag.warn { border-color: #d08b2f; color: #d08b2f; }
+.tag.gone { border-color: #c0392b; color: #c0392b; }
+.warn-text { color: #d08b2f; }
+.notice {
+  border: 1px solid #c0392b; border-radius: .4rem;
+  padding: .6rem .8rem; margin: .8rem 0;
+}
+.note-body {
+  border: 1px solid var(--line); border-radius: .4rem;
+  padding: .8rem 1rem; overflow-x: auto; max-height: 32rem;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .88em;
+}

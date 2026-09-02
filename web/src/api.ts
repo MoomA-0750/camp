@@ -42,6 +42,35 @@ export type Window = {
   source: string; fetched_at: string; current: boolean
 }
 
+export type VaultInfo = {
+  id: number; host: string; name: string; root: string
+  notes: number; missing: number; scanned_at?: string
+}
+
+export type Note = {
+  id: number; vault_id: number; path: string; title: string; kind: string
+  size: number; mtime?: string; missing_at?: string
+  links: number; backlinks: number; touches: number
+}
+
+export type Ref = {
+  from_id: number; from_path: string
+  to_id?: number; to_path?: string
+  target: string; alias?: string; frag?: string
+  embed: boolean; resolved: boolean; ambiguous: boolean
+  candidates?: string[]; line?: number
+}
+
+export type NoteTouch = {
+  session_id: string; title?: string; op: string; origin: string
+  at: string; note_path: string; note_id?: number; backup_id?: number
+}
+
+export type Ghost = {
+  path: string; abs_path: string; reason: string
+  touches: number; sessions: number; last_at: string; backups: number
+}
+
 export type Touch = {
   abs_path: string; rel_path?: string; op: string; origin: string; at: string
   session_id: string; message_uuid?: string; title?: string; backup_name?: string
@@ -109,6 +138,32 @@ export const api = {
 
   backups: (o: { path?: string; session?: string; limit?: number }) =>
     fetchJSON<Backup[]>('/api/backups' + qs(o)),
+
+  vaults: () => fetchJSON<VaultInfo[]>('/api/vaults'),
+
+  // 本文は blobs から返る。ノートが Vault から消えていても読める。
+  noteBody: async (id: number) => {
+    const res = await fetch(`/api/notes/${id}/body`)
+    if (res.status === 401) { location.href = '/login'; throw new Error('未認証') }
+    if (res.status === 404) return null
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+    return res.text()
+  },
+
+  notes: (o: { vault?: number; folder?: string; kind?: string; q?: string; missing?: string; n?: number } = {}) =>
+    fetchJSON<Note[]>('/api/notes' + qs(o)),
+
+  note: (id: number) => fetchJSON<Note>(`/api/notes/${id}`),
+
+  noteLinks: (id: number) =>
+    fetchJSON<{ out: Ref[]; back: Ref[] }>(`/api/notes/${id}/links`),
+
+  noteSessions: (id: number) => fetchJSON<NoteTouch[]>(`/api/notes/${id}/sessions`),
+
+  ghosts: () => fetchJSON<Ghost[]>('/api/vault/ghosts'),
+
+  vaultIssues: () =>
+    fetchJSON<{ ambiguous: Ref[]; dangling: Ref[] }>('/api/vault/issues'),
 
   logout: async () => {
     await fetch('/api/logout', { method: 'POST' })
