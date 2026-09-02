@@ -1,0 +1,11 @@
+-- 検出結果の同一性を (message_id, pattern, byte_offset) にする。
+--
+-- 検出器は何度でも回すので、同じ場所を二度記録してはいけない。そして
+-- 人が付けた verdict は消してはいけない。だから「消して作り直す」ではなく
+-- 「無ければ足す」で回す。
+--
+-- 位置を block_id ではなく raw_json のバイト位置で持つのは、
+-- message_blocks.id が backfill のたびに振り直されるため（消して入れ直す）。
+-- findings は人の判断を載せる唯一の派生表なので、振り直される id に
+-- 繋いではいけない。raw_json は無加工で不変（D-010）なので位置が動かない。
+CREATE UNIQUE INDEX ux_findings_spot ON sensitive_findings(message_id, pattern, byte_offset);

@@ -13,6 +13,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/files"
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/search"
+	"github.com/MoomA-0750/camp/internal/secrets"
 	"github.com/MoomA-0750/camp/internal/store"
 	"github.com/MoomA-0750/camp/internal/thread"
 )
@@ -58,6 +59,8 @@ func run(args []string) error {
 		return cmdCapture(rest)
 	case "backup":
 		return cmdBackup(rest)
+	case "secrets":
+		return cmdSecrets(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -82,6 +85,7 @@ usage:
   campd files   [PATH]    ノートを触ったターンを引く（-session でセッション側から）
   campd capture [-dir D]  file-history の実体（編集前の中身）を DB に取り込む
   campd backup  [PATH]    捕獲したバックアップを一覧する（-show ID で中身を出す）
+  campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
 `)
 }
 
@@ -668,4 +672,84 @@ func humanBytes(n int64) string {
 		return fmt.Sprintf("%.1fKiB", float64(n)/(1<<10))
 	}
 	return fmt.Sprintf("%dB", n)
+}
+
+func cmdSecrets(args []string) error {
+	fs := flag.NewFlagSet("secrets", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	list := fs.Bool("list", false, "走査せず、記録済みのものだけ並べる")
+	open := fs.Bool("open", false, "未判定のものだけ並べる")
+	reveal := fs.Bool("reveal", false, "当たった文字列そのものを出す（既定では伏せる）")
+	known := fs.String("known", "", "既知の秘密の一覧（既定は DB と同じディレクトリの known-secrets.txt）")
+	ok := fs.Int64("ok", 0, "この ID に判断を付ける")
+	verdict := fs.String("verdict", "false-positive", "-ok で付ける判断")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Migrate(); err != nil {
+		return err
+	}
+
+	if *ok > 0 {
+		if err := secrets.Review(db, *ok, *verdict); err != nil {
+			return err
+		}
+		fmt.Printf("検出 %d を %s として記録した（行は消さない）\n", *ok, *verdict)
+		return nil
+	}
+
+	if !*list {
+		path := *known
+		if path == "" {
+			path = secrets.DefaultKnownPath(*dbPath)
+		}
+		kn, err := secrets.LoadKnown(path)
+		if err != nil {
+			return err
+		}
+		started := time.Now()
+		r, err := secrets.Scan(db, kn)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("走査            %d メッセージ / %s\n既知の秘密      %d 個（%s）\n",
+			r.Messages, humanBytes(r.Bytes), len(kn), path)
+		fmt.Printf("当たり          %d 箇所（うち新規 %d・既知の突合 %d）\n",
+			r.Found, r.New, r.Known)
+		names := make([]string, 0, len(r.Patterns))
+		for n := range r.Patterns {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			fmt.Printf("  %-20s %d\n", n, r.Patterns[n])
+		}
+		fmt.Printf("所要            %s\n\n", time.Since(started).Round(time.Millisecond))
+	}
+
+	rows, err := secrets.List(db, *open, *reveal)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("記録なし")
+		return nil
+	}
+	for _, f := range rows {
+		mark := "未判定"
+		if f.Reviewed {
+			mark = f.Verdict
+		}
+		fmt.Printf("%4d  %-20s %-14s msg %d  %s  %s\n",
+			f.ID, f.Pattern, mark, f.MessageID, short(f.At), f.SessionID[:8])
+		fmt.Printf("      %s\n", firstN(f.Context, 200))
+	}
+	fmt.Printf("\n%d 件。判定は campd secrets -ok <ID> [-verdict 文字列]\n", len(rows))
+	return nil
 }

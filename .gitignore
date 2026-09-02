@@ -10,6 +10,7 @@ web/dist/
 
 # ローカルデータ（DBは複製先であり成果物ではない）
 data/
+known-secrets.txt
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
