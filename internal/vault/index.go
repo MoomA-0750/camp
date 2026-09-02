@@ -24,6 +24,8 @@ type IndexResult struct {
 	Missing   int // 前回あって今回無かった
 	Restored  int // missing だったものが戻ってきた
 	Stored    int // blobs に新しく入れた数
+	Props     int // 取り出した frontmatter のプロパティ（延べ）
+	PropKeys  int // 相異なるキー
 	Links     int // 本文に現れた wikilink の延べ数
 	LinkRows  int // note_links の行数（同じノートから同じ先へは1本に畳む）
 	Resolved  int
@@ -97,6 +99,7 @@ func Index(db *store.DB, hostName, root, name string) (*IndexResult, error) {
 	now := time.Now().UTC().Format(timeFmt)
 	seen := make(map[string]struct{}, len(sc.Files))
 	links := make(map[string][]Link, len(sc.Files))
+	props := make(map[string][]Prop, len(sc.Files))
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -116,6 +119,7 @@ func Index(db *store.DB, hostName, root, name string) (*IndexResult, error) {
 			}
 			if f.Kind == KindMarkdown {
 				links[f.Rel] = ExtractLinks(body)
+				props[f.Rel] = ExtractProps(body)
 			}
 			sum := sha256.Sum256(body)
 			hash = hex.EncodeToString(sum[:])
@@ -173,6 +177,9 @@ func Index(db *store.DB, hostName, root, name string) (*IndexResult, error) {
 	}
 
 	if err := writeLinks(tx, vaultID, sc, links, res); err != nil {
+		return nil, err
+	}
+	if err := writeProps(tx, vaultID, props, res); err != nil {
 		return nil, err
 	}
 
@@ -323,4 +330,54 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// writeProps は frontmatter を張り直す。リンクと同じく本文の付随物なので、
+// そのノートの分を消して入れ直してよい。
+func writeProps(tx *sql.Tx, vaultID int64, props map[string][]Prop, res *IndexResult) error {
+	ids := map[string]int64{}
+	rows, err := tx.Query(`select id, path from notes where vault_id = ?`, vaultID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id int64
+		var p string
+		if err := rows.Scan(&id, &p); err != nil {
+			rows.Close()
+			return err
+		}
+		ids[p] = id
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	keys := map[string]struct{}{}
+	for path, ps := range props {
+		id, ok := ids[path]
+		if !ok {
+			continue
+		}
+		if _, err := tx.Exec(`delete from note_props where note_id = ?`, id); err != nil {
+			return err
+		}
+		for _, p := range ps {
+			var num any
+			if p.Num != nil {
+				num = *p.Num
+			}
+			if _, err := tx.Exec(`
+				insert into note_props(note_id, key, seq, text, num) values(?,?,?,?,?)
+				on conflict(note_id, key, seq) do nothing`,
+				id, p.Key, p.Seq, nullStr(p.Text), num); err != nil {
+				return fmt.Errorf("prop %s/%s: %w", path, p.Key, err)
+			}
+			res.Props++
+			keys[p.Key] = struct{}{}
+		}
+	}
+	res.PropKeys = len(keys)
+	return nil
 }
