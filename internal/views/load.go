@@ -1,6 +1,7 @@
 package views
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -83,7 +84,8 @@ func LoadRecords(db *store.DB, vaultID int64) ([]*Record, error) {
 		return nil, err
 	}
 
-	// 複数値のキーは表示用に結合し直す。
+	// 複数値のキーは表示用に結合し直す。**1件しか無いキーは触らない**
+	// （数値として持っているものを文字列に落とさない）。
 	for id, keys := range multi {
 		r := byID[id]
 		for k, vals := range keys {
@@ -123,15 +125,24 @@ func LoadBases(db *store.DB, vaultID int64, read func(rel string) ([]byte, error
 		return nil, err
 	}
 
+	// **1ファイルが読めないだけで全部を落とさない。**
+	// 旧実装は ParseBase のエラーをそのまま返していたので、`.base` の
+	// どれか1つに Camp の知らない構文（`not:` など）が入った瞬間に
+	// `/views`・`campd views`・MCP の view 系が全部使えなくなっていた。
+	// しかも引き金は Obsidian 側のUI操作なので、原因が見えない。
 	var out []*Base
 	for _, p := range paths {
 		body, err := read(p)
 		if err != nil {
+			out = append(out, &Base{Path: p, Name: baseName(p),
+				ParseError: fmt.Sprintf("読めない: %v", err)})
 			continue
 		}
 		b, err := ParseBase(p, body)
 		if err != nil {
-			return nil, err
+			out = append(out, &Base{Path: p, Name: baseName(p),
+				ParseError: err.Error()})
+			continue
 		}
 		out = append(out, b)
 	}

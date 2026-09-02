@@ -176,3 +176,58 @@ func TestConcatDoesNotSwallowErrors(t *testing.T) {
 		t.Fatalf("エラーにならず %q を返した", v.Str)
 	}
 }
+
+// Bases 側で普通に書ける構文が、Camp だけ読めない状態にしない。
+// filter で落ちるとビュー全体が error になるので、ここは広く受ける。
+func TestExprAcceptsOrdinarySyntax(t *testing.T) {
+	r := rec("Data/A/x.md", []string{"bank"}, map[string]Value{
+		"amount": Num(10), "price": Num(5), "name": Str("あ"),
+	})
+	for _, c := range []struct {
+		src  string
+		want string
+	}{
+		{`amount > -100`, "true"},
+		{`price * 2`, "10"},
+		{`amount - price`, "5"},
+		{`amount / price`, "2"},
+		{`amount / 0`, ""},           // 0除算は null。行ごと落とさない
+		{`-price + amount`, "5"},
+		{`file.hasTag("bank") && amount > 5`, "true"},
+		{`file.hasTag("x") || amount > 5`, "true"},
+		{`file.hasTag("x") and amount > 5`, "false"},
+		{`file.hasTag("x") or amount > 500`, "false"},
+		{`"a\"b"`, `a"b`},
+		{`name + "い"`, "あい"},
+	} {
+		v, err := Eval(c.src, r)
+		if err != nil {
+			t.Errorf("%s: %v", c.src, err)
+			continue
+		}
+		if v.Str != c.want {
+			t.Errorf("%s → %q（%q のはず）", c.src, v.Str, c.want)
+		}
+	}
+}
+
+// **if は選ばれた枝だけ評価する。** 通らない枝に知らない関数が
+// 1つあるだけで式全体が落ちるのは、4段入れ子の Payments で効いてくる。
+func TestIfIsLazy(t *testing.T) {
+	r := rec("Data/A/x.md", []string{"bank"}, map[string]Value{"w": Num(3)})
+	v, err := Eval(`if(file.hasTag("bank"), "銀行", いない関数(1, 2))`, r)
+	if err != nil {
+		t.Fatalf("通らない枝を評価している: %v", err)
+	}
+	if v.Str != "銀行" {
+		t.Errorf("%q", v.Str)
+	}
+	// 逆側も同じ。
+	v2, err := Eval(`if(file.hasTag("card"), いない関数(), "その他")`, r)
+	if err != nil {
+		t.Fatalf("通らない枝を評価している: %v", err)
+	}
+	if v2.Str != "その他" {
+		t.Errorf("%q", v2.Str)
+	}
+}

@@ -93,12 +93,17 @@ func TestFormulaColumns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows[0].Cells["formula.種別"] != "銀行" {
-		t.Fatalf("計算列が出ていない: %v", rows[0].Cells)
+	got := res.Groups[0].Rows[0]
+	if got.Cells["formula.種別"] != "銀行" {
+		t.Fatalf("計算列が出ていない: %v", got.Cells)
 	}
 	// 同名の生プロパティを潰していないこと。
-	if rows[0].Cells["種別"] != "生データ" {
+	if got.Cells["種別"] != "生データ" {
 		t.Error("同名のプロパティを計算列で上書きしている")
+	}
+	// **入力は書き換えない。** 共有キャッシュを踏むため。
+	if rows[0].Cells != nil {
+		t.Errorf("Run が入力の Record を書き換えている: %v", rows[0].Cells)
 	}
 	for _, c := range res.Columns {
 		if c.Key == "formula.種別" && c.Label != "種別" {
@@ -192,13 +197,14 @@ func TestFileFieldsAreCells(t *testing.T) {
 	r := rec("Data/Notes/メモ.md", nil, nil)
 	r.MTime = "2026-09-02T00:00:00Z"
 	res, _ := Run(b, v, []*Record{r})
-	if r.Cells["file.name"] != "メモ.md" {
-		t.Errorf("file.name が空: %v", r.Cells)
+	got := res.Groups[0].Rows[0]
+	if got.Cells["file.name"] != "メモ.md" {
+		t.Errorf("file.name が空: %v", got.Cells)
 	}
-	if r.Cells["file.folder"] != "Data/Notes" {
-		t.Errorf("file.folder が違う: %q", r.Cells["file.folder"])
+	if got.Cells["file.folder"] != "Data/Notes" {
+		t.Errorf("file.folder が違う: %q", got.Cells["file.folder"])
 	}
-	if r.Cells["file.mtime"] == "" {
+	if got.Cells["file.mtime"] == "" {
 		t.Error("file.mtime が空")
 	}
 	if !has(colKeys(res), "file.name") {

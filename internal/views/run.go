@@ -3,6 +3,7 @@ package views
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -84,10 +85,17 @@ type Result struct {
 // なく、許可リストという形が持つ性質——列は増え続けるのに定義は手で書いた
 // ときのまま止まる。だから `order:` は「前に出す列」として読み、残りは
 // その後ろに全部続ける。消したいものだけ `hide:` に書く。
+//
+// **Run は渡された Record を書き換えない。** 材料はキャッシュで使い回して
+// いるので、共有の map へ書き込むと (1) 同時リクエストで Go ランタイムの
+// `fatal error: concurrent map writes` が出てプロセスごと落ち、
+// (2) あるビューの計算列が、後から実行した無関係なビューの「実在する全列」に
+// 残る。だから行ごとに複製を作る。
 func Run(b *Base, v *View, recs []*Record) (*Result, error) {
 	res := &Result{View: v.Name, Kind: v.Kind}
 
 	// 1) 絞り込み。base 全体と、ビュー個別の両方を満たすもの。
+	//    ここで複製する。以降 kept の要素はこの実行だけのもの。
 	var kept []*Record
 	for _, r := range recs {
 		ok, err := match(b.Filters, r)
@@ -102,7 +110,9 @@ func Run(b *Base, v *View, recs []*Record) (*Result, error) {
 			return nil, fmt.Errorf("%s: view の filters: %w", v.Name, err)
 		}
 		if ok {
-			kept = append(kept, r)
+			cp := *r
+			cp.Cells = nil
+			kept = append(kept, &cp)
 		}
 	}
 
@@ -113,9 +123,7 @@ func Run(b *Base, v *View, recs []*Record) (*Result, error) {
 	}
 	sort.Strings(formulaKeys)
 	for _, r := range kept {
-		if r.Cells == nil {
-			r.Cells = map[string]string{}
-		}
+		r.Cells = make(map[string]string, len(r.Props)+len(formulaKeys)+5)
 		// 素性も列として出す。実在の .base は order: に file.name（15箇所）・
 		// file.mtime（2）・file.folder（3）・file.ext（1）を挙げている。
 		// Cells に入れないと、定義が指名しているのに空欄になる。
@@ -154,7 +162,35 @@ func Run(b *Base, v *View, recs []*Record) (*Result, error) {
 	for i := range res.Groups {
 		res.Groups[i].Summary = summarize(res.Groups[i].Rows, v.Summaries)
 	}
+	// 警告は行数ぶん出ても意味がない。同じものは1回だけ。
+	res.Warnings = dedup(res.Warnings)
 	return res, nil
+}
+
+func dedup(xs []string) []string {
+	if len(xs) < 2 {
+		return xs
+	}
+	seen := map[string]bool{}
+	out := xs[:0]
+	for _, x := range xs {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// cellNum はセルの表示値を数として読む。**Props ではなくセルを見る。**
+// `file.mtime` も `formula.金額` も Props には無いので、Props を見に行くと
+// 全行 0 になって並べ替えが壊れる。
+func cellNum(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	return f, err == nil
 }
 
 func formulaKey(k string) string { return "formula." + k }
@@ -182,13 +218,21 @@ func columns(b *Base, v *View, rows []*Record, formulaKeys []string) []Column {
 		isFormula[formulaKey(k)] = true
 	}
 
+	// 数の列は「値のある行が1つ以上あり、値のある行が全部数として読める」もの。
+	//
+	// 旧実装は Props を見ていたので、Props に無い `file.*` と `formula.*` が
+	// 全部 Numeric 扱いになり、`sort: file.mtime` が **比較器の不整合**
+	// （less(i,j) と less(j,i) が両方 true）を起こして並びが壊れていた。
 	numeric := map[string]bool{}
-	for k := range filled {
-		numeric[k] = true
+	for k, n := range filled {
+		numeric[k] = n > 0
 	}
 	for _, r := range rows {
-		for k, v := range r.Props {
-			if !v.IsNum && !v.Null && v.Str != "" {
+		for k, val := range r.Cells {
+			if val == "" || !numeric[k] {
+				continue
+			}
+			if _, ok := cellNum(val); !ok {
 				numeric[k] = false
 			}
 		}
@@ -202,7 +246,7 @@ func columns(b *Base, v *View, rows []*Record, formulaKeys []string) []Column {
 		}
 		seen[k] = true
 		out = append(out, Column{
-			Key: k, Label: label(k), Formula: isFormula[k],
+			Key: k, Label: label(b, k), Formula: isFormula[k],
 			Pinned: pinned, Numeric: numeric[k], Filled: filled[k],
 		})
 	}
@@ -223,8 +267,12 @@ func columns(b *Base, v *View, rows []*Record, formulaKeys []string) []Column {
 	return out
 }
 
-// label は表示名。`formula.金額` は `金額` として出す。
-func label(k string) string {
+// label は表示名。`properties:` の displayName があればそれを使い、
+// 無ければ `formula.金額` を `金額` として出す。
+func label(b *Base, k string) string {
+	if d, ok := b.Display[k]; ok && d != "" {
+		return d
+	}
 	return strings.TrimPrefix(k, "formula.")
 }
 
@@ -243,6 +291,16 @@ func match(f *Filter, r Row) (bool, error) {
 		ok, err := match(c, r)
 		if err != nil || !ok {
 			return false, err
+		}
+	}
+	// not は「どれも真でない」（Obsidian のフィルタUIの none）。
+	for _, c := range f.Not {
+		ok, err := match(c, r)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return false, nil
 		}
 	}
 	if len(f.Or) > 0 {
@@ -280,7 +338,19 @@ func sortRows(rows []*Record, keys []SortKey, cols []Column) {
 			}
 			less := a < b
 			if numeric[k.Property] {
-				less = rows[i].Get(k.Property).Num < rows[j].Get(k.Property).Num
+				// 数として読めなかった側は末尾に寄せる。ここで
+				// 「両方 0」に落とすと比較器が不整合になる。
+				na, oka := cellNum(a)
+				nb, okb := cellNum(b)
+				switch {
+				case oka && okb:
+					if na == nb {
+						continue
+					}
+					less = na < nb
+				case oka != okb:
+					less = oka
+				}
 			}
 			if strings.EqualFold(k.Direction, "DESC") {
 				return !less
@@ -337,6 +407,8 @@ func group(rows []*Record, by *SortKey) []Group {
 }
 
 // summarize は集計。実在するのは Sum だけだが、素直に足せるものは足す。
+//
+// **セルを見る。** Props を見ると `formula.*` を集計できない。
 func summarize(rows []*Record, spec map[string]string) map[string]float64 {
 	if len(spec) == 0 {
 		return nil
@@ -346,9 +418,8 @@ func summarize(rows []*Record, spec map[string]string) map[string]float64 {
 		var sum float64
 		var n int
 		for _, r := range rows {
-			v := r.Get(key)
-			if v.IsNum {
-				sum += v.Num
+			if f, ok := cellNum(cellOf(r, key)); ok {
+				sum += f
 				n++
 			}
 		}

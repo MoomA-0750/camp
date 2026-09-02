@@ -76,7 +76,7 @@ type Row interface {
 // Eval は式を1行に対して評価する。
 func Eval(src string, r Row) (Value, error) {
 	p := &parser{src: src}
-	v, err := p.expr(r)
+	v, err := p.or(r)
 	if err != nil {
 		return Null(), err
 	}
@@ -107,16 +107,93 @@ func (p *parser) accept(s string) bool {
 	return false
 }
 
-// expr は比較まで。優先順位は 比較 < 連結 < 単項。
+// acceptOp は演算子。**より長い演算子の一部を食わないこと。**
+// `+` を取るときに `+=` を、`|` を取るときに `||` を食うと後段が壊れる。
+func (p *parser) acceptOp(op string) bool {
+	p.ws()
+	rest := p.src[p.i:]
+	if !strings.HasPrefix(rest, op) {
+		return false
+	}
+	if next := rest[len(op):]; next != "" && strings.ContainsAny(next[:1], "=&|") {
+		switch op + next[:1] {
+		case "==", "!=", ">=", "<=", "&&", "||":
+			return false // これから読むべきもっと長い演算子
+		}
+	}
+	p.i += len(op)
+	return true
+}
+
+// acceptWord は `and` / `or` のような語の演算子。識別子の頭を食わないよう、
+// 直後が識別子の続きでないことを確かめる。
+func (p *parser) acceptWord(w string) bool {
+	p.ws()
+	rest := p.src[p.i:]
+	if !strings.HasPrefix(rest, w) {
+		return false
+	}
+	if next := rest[len(w):]; next != "" {
+		c := next[0]
+		if c == '_' || c == '-' || (c >= '0' && c <= '9') ||
+			(c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			return false
+		}
+	}
+	p.i += len(w)
+	return true
+}
+
+// 優先順位は低いほうから
+//
+//	or < and < 比較 < 加減（+ は連結も兼ねる）< 乗除 < 単項
+//
+// `||` と `&&` は Bases のフィルタUIでは `or:` / `and:` になるが、
+// 式として手で書けてしまう。読めないと**そのビュー全体が error になる**ので、
+// 素直に実装しておく。`and` / `or` の綴りも受ける。
+
+// or は `||`。短絡する。
+func (p *parser) or(r Row) (Value, error) {
+	left, err := p.and(r)
+	if err != nil {
+		return Null(), err
+	}
+	for p.acceptOp("||") || p.acceptWord("or") {
+		right, err := p.and(r)
+		if err != nil {
+			return Null(), err
+		}
+		left = Bool(left.Truthy() || right.Truthy())
+	}
+	return left, nil
+}
+
+// and は `&&`。
+func (p *parser) and(r Row) (Value, error) {
+	left, err := p.expr(r)
+	if err != nil {
+		return Null(), err
+	}
+	for p.acceptOp("&&") || p.acceptWord("and") {
+		right, err := p.expr(r)
+		if err != nil {
+			return Null(), err
+		}
+		left = Bool(left.Truthy() && right.Truthy())
+	}
+	return left, nil
+}
+
+// expr は比較1段。
 func (p *parser) expr(r Row) (Value, error) {
-	left, err := p.concat(r)
+	left, err := p.additive(r)
 	if err != nil {
 		return Null(), err
 	}
 	p.ws()
 	for _, op := range []string{"==", "!=", ">=", "<=", ">", "<"} {
-		if p.accept(op) {
-			right, err := p.concat(r)
+		if p.acceptOp(op) {
+			right, err := p.additive(r)
 			if err != nil {
 				return Null(), err
 			}
@@ -126,27 +203,73 @@ func (p *parser) expr(r Row) (Value, error) {
 	return left, nil
 }
 
-func (p *parser) concat(r Row) (Value, error) {
+// additive は `+` と `-`。`+` は両方が数のときだけ足し算で、
+// それ以外は連結（Bases も同じ挙動）。
+func (p *parser) additive(r Row) (Value, error) {
+	left, err := p.multiplicative(r)
+	if err != nil {
+		return Null(), err
+	}
+	for {
+		var op string
+		switch {
+		case p.acceptOp("+"):
+			op = "+"
+		case p.acceptOp("-"):
+			op = "-"
+		default:
+			return left, nil
+		}
+		// ここでエラーを握り潰してはいけない。潰すと、読めない式が
+		// 「途中まで読めた値」に化けて、後段の無関係な場所で落ちる。
+		right, err := p.multiplicative(r)
+		if err != nil {
+			return Null(), err
+		}
+		switch {
+		case op == "+" && left.IsNum && right.IsNum:
+			left = Num(left.Num + right.Num)
+		case op == "+":
+			left = Str(left.Str + right.Str)
+		case left.IsNum && right.IsNum:
+			left = Num(left.Num - right.Num)
+		default:
+			return Null(), fmt.Errorf("数でないものを引き算している")
+		}
+	}
+}
+
+// multiplicative は `*` と `/`。
+func (p *parser) multiplicative(r Row) (Value, error) {
 	left, err := p.unary(r)
 	if err != nil {
 		return Null(), err
 	}
 	for {
-		if !p.accept("+") {
+		var op string
+		switch {
+		case p.acceptOp("*"):
+			op = "*"
+		case p.acceptOp("/"):
+			op = "/"
+		default:
 			return left, nil
 		}
-		// ここでエラーを握り潰してはいけない。潰すと、読めない式が
-		// 「途中まで読めた値」に化けて、後段の無関係な場所で落ちる。
 		right, err := p.unary(r)
 		if err != nil {
 			return Null(), err
 		}
-		// 両方が数なら足し算、そうでなければ連結。Bases も同じ挙動。
-		if left.IsNum && right.IsNum {
-			left = Num(left.Num + right.Num)
-		} else {
-			left = Str(left.Str + right.Str)
+		if !left.IsNum || !right.IsNum {
+			return Null(), fmt.Errorf("数でないものを %s している", op)
 		}
+		if op == "/" {
+			if right.Num == 0 {
+				return Null(), nil // 0除算は null。行ごと落とさない
+			}
+			left = Num(left.Num / right.Num)
+			continue
+		}
+		left = Num(left.Num * right.Num)
 	}
 }
 
@@ -167,8 +290,22 @@ func (p *parser) unary(r Row) (Value, error) {
 		}
 		return Bool(!v.Truthy()), nil
 	}
+	// 負の数と単項プラス。`amount > -100` が読めないと式ごと落ちる。
+	if p.accept("-") {
+		v, err := p.unary(r)
+		if err != nil {
+			return Null(), err
+		}
+		if !v.IsNum {
+			return Null(), fmt.Errorf("数でないものに単項マイナスを付けている")
+		}
+		return Num(-v.Num), nil
+	}
+	if p.accept("+") {
+		return p.unary(r)
+	}
 	if p.accept("(") {
-		v, err := p.expr(r)
+		v, err := p.or(r)
 		if err != nil {
 			return Null(), err
 		}
@@ -177,19 +314,32 @@ func (p *parser) unary(r Row) (Value, error) {
 		}
 		return p.postfix(v, r)
 	}
-	// 文字列
+	// 文字列。`\"` と `\\` は畳む。
 	if c := p.src[p.i]; c == '"' || c == '\'' {
 		p.i++
-		start := p.i
+		var b strings.Builder
 		for p.i < len(p.src) && p.src[p.i] != c {
+			if p.src[p.i] == '\\' && p.i+1 < len(p.src) {
+				p.i++
+				switch p.src[p.i] {
+				case 'n':
+					b.WriteByte('\n')
+				case 't':
+					b.WriteByte('\t')
+				default:
+					b.WriteByte(p.src[p.i])
+				}
+				p.i++
+				continue
+			}
+			b.WriteByte(p.src[p.i])
 			p.i++
 		}
 		if p.i >= len(p.src) {
 			return Null(), fmt.Errorf("閉じていない文字列")
 		}
-		s := p.src[start:p.i]
 		p.i++
-		return p.postfix(Str(s), r)
+		return p.postfix(Str(b.String()), r)
 	}
 	// 数
 	if p.src[p.i] >= '0' && p.src[p.i] <= '9' {
@@ -219,6 +369,16 @@ func (p *parser) unary(r Row) (Value, error) {
 	p.ws()
 	if p.i < len(p.src) && p.src[p.i] == '(' {
 		p.i++
+		// **`if` は選ばれた枝だけ評価する。** 全部先に評価すると、
+		// 通らない枝に知らない関数が1つあるだけで式全体が落ちる。
+		// Payments の「金額」は if の4段入れ子なので、ここは効く。
+		if m == "if" {
+			v, err := p.callIf(r)
+			if err != nil {
+				return Null(), err
+			}
+			return p.postfix(v, r)
+		}
 		args, err := p.args(r)
 		if err != nil {
 			return Null(), err
@@ -282,6 +442,81 @@ func (p *parser) postfix(v Value, r Row) (Value, error) {
 	}
 }
 
+// callIf は `if(cond, a, b)` を短絡で読む。**選ばれなかった枝は
+// 「読み飛ばす」だけで評価しない。**
+func (p *parser) callIf(r Row) (Value, error) {
+	cond, err := p.or(r)
+	if err != nil {
+		return Null(), err
+	}
+	if !p.accept(",") {
+		return Null(), fmt.Errorf("if は引数2つ以上")
+	}
+	taken := cond.Truthy()
+	var out Value
+	if taken {
+		if out, err = p.or(r); err != nil {
+			return Null(), err
+		}
+	} else if err := p.skipArg(); err != nil {
+		return Null(), err
+	}
+	if p.accept(")") {
+		if taken {
+			return out, nil
+		}
+		return Null(), nil
+	}
+	if !p.accept(",") {
+		return Null(), fmt.Errorf("引数の区切りが読めない")
+	}
+	if taken {
+		if err := p.skipArg(); err != nil {
+			return Null(), err
+		}
+	} else if out, err = p.or(r); err != nil {
+		return Null(), err
+	}
+	if !p.accept(")") {
+		return Null(), fmt.Errorf("引数の区切りが読めない")
+	}
+	return out, nil
+}
+
+// skipArg は評価せずに引数1つぶんを読み飛ばす。括弧と文字列の中の
+// カンマは区切りではない。
+func (p *parser) skipArg() error {
+	depth := 0
+	for p.i < len(p.src) {
+		c := p.src[p.i]
+		switch {
+		case c == '"' || c == '\'':
+			q := c
+			p.i++
+			for p.i < len(p.src) && p.src[p.i] != q {
+				if p.src[p.i] == '\\' {
+					p.i++
+				}
+				p.i++
+			}
+			if p.i >= len(p.src) {
+				return fmt.Errorf("閉じていない文字列")
+			}
+		case c == '(':
+			depth++
+		case c == ')':
+			if depth == 0 {
+				return nil
+			}
+			depth--
+		case c == ',' && depth == 0:
+			return nil
+		}
+		p.i++
+	}
+	return fmt.Errorf("引数が途中で終わっている")
+}
+
 func (p *parser) args(r Row) ([]Value, error) {
 	var out []Value
 	p.ws()
@@ -289,7 +524,7 @@ func (p *parser) args(r Row) ([]Value, error) {
 		return out, nil
 	}
 	for {
-		v, err := p.expr(r)
+		v, err := p.or(r)
 		if err != nil {
 			return nil, err
 		}
@@ -350,7 +585,7 @@ func compare(op string, a, b Value) (Value, error) {
 
 func call(name string, args []Value, r Row) (Value, error) {
 	switch name {
-	case "if":
+	case "if": // 通常は callIf が短絡で処理する。ここは保険
 		if len(args) < 2 {
 			return Null(), fmt.Errorf("if は引数2つ以上")
 		}
