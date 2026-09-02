@@ -249,3 +249,94 @@ func count(t *testing.T, db *store.DB, q string) int {
 	}
 	return n
 }
+
+// 検出器は blobs も見る。
+//
+// Phase 1 でノート本文が blobs に入った時点で、同じ秘密が「走査されない場所」に
+// もう1つ増えた（実測: Vault の平文パスワードが messages 25件 + blobs 1個）。
+// messages しか見ないと、片方だけ見て「無い」と言うことになる。
+func TestScanCoversBlobs(t *testing.T) {
+	db := newDB(t)
+	seed(t, db, `{"type":"user","message":{"content":"ふつうの本文"}}`)
+
+	// ノート本文を模したブロブ。パターンに当たらない8文字の秘密を入れる。
+	body := []byte("# homelab\n\n- 共通ログイン: PW: hunter22 が使える\n")
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	if _, err := db.Exec(
+		`insert into blobs(sha256, size, codec, content, stored_at) values(?,?,?,?,?)`,
+		hash, len(body), "raw", body, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		insert into vaults(id, host_id, name, root) values(1, 1, 'v', '/v');
+		insert into notes(vault_id, path, title, kind, sha256)
+		values(1, 'Vault のあるノート', 'homelab', 'markdown', ?)`, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Scan(db, []Known{{Label: "vault-login", Value: "hunter22"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Blobs == 0 {
+		t.Fatal("blobs を1つも走査していない")
+	}
+	if res.Known == 0 {
+		t.Fatal("blobs の中の既知の秘密を見つけられていない")
+	}
+
+	fs, err := List(db, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blobFinding *Finding
+	for i := range fs {
+		if fs[i].Blob != "" {
+			blobFinding = &fs[i]
+		}
+	}
+	if blobFinding == nil {
+		t.Fatalf("blob 由来の所見が一覧に出ない: %+v", fs)
+	}
+	// どこの話かが人に分かること。ハッシュだけでは追えない。
+	if blobFinding.Where != "note Vault のあるノート" {
+		t.Errorf("出どころが分からない: %q", blobFinding.Where)
+	}
+	// 既定では当たりそのものを伏せる。
+	if strings.Contains(blobFinding.Context, "hunter22") {
+		t.Error("伏せずに出している")
+	}
+	if !strings.Contains(blobFinding.Context, "伏せた") {
+		t.Errorf("伏せた印が無い: %q", blobFinding.Context)
+	}
+}
+
+// 人が付けた判定は入れ物が増えても消えない。
+func TestBlobFindingsDoNotDisturbVerdicts(t *testing.T) {
+	db := newDB(t)
+	ids := seed(t, db, `{"t":"ghp_`+strings.Repeat("a", 36)+`"}`)
+	_ = ids
+	if _, err := Scan(db, nil); err != nil {
+		t.Fatal(err)
+	}
+	fs, _ := List(db, false, false)
+	if len(fs) == 0 {
+		t.Fatal("下準備の所見が無い")
+	}
+	if err := Review(db, fs[0].ID, "false-positive"); err != nil {
+		t.Fatal(err)
+	}
+	// もう一度走らせても判定は残る。
+	if _, err := Scan(db, nil); err != nil {
+		t.Fatal(err)
+	}
+	var verdict string
+	if err := db.QueryRow(`select coalesce(verdict,'') from sensitive_findings where id = ?`,
+		fs[0].ID).Scan(&verdict); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "false-positive" {
+		t.Fatalf("判定が消えた: %q", verdict)
+	}
+}

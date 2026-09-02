@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/store"
 )
 
@@ -60,6 +62,7 @@ const knownPrefix = "known:"
 // Result は1回の走査の結果。
 type Result struct {
 	Messages int   // 走査したメッセージ
+	Blobs    int   // 走査したブロブ（ノート本文・編集前の中身）
 	Bytes    int64 // 走査したバイト数
 	Found    int   // 見つけた箇所（既知のぶんを含む）
 	New      int   // そのうち今回はじめて記録したもの
@@ -121,6 +124,10 @@ func Scan(db *store.DB, known []Known) (*Result, error) {
 	res := &Result{Patterns: map[string]int{}}
 	var last int64
 
+	if err := scanBlobs(db, known, res); err != nil {
+		return nil, err
+	}
+
 	for {
 		type row struct {
 			id  int64
@@ -156,7 +163,7 @@ func Scan(db *store.DB, known []Known) (*Result, error) {
 		stmt, err := tx.Prepare(`
 			insert into sensitive_findings(message_id, pattern, byte_offset, length, found_at)
 			values(?,?,?,?,?)
-			on conflict(message_id, pattern, byte_offset) do nothing`)
+			on conflict(message_id, pattern, byte_offset) where message_id is not null do nothing`)
 		if err != nil {
 			tx.Rollback()
 			return nil, err
@@ -237,8 +244,12 @@ func prefiltered(raw []byte, prefixes []string) bool {
 
 // Finding は記録済みの1件を、人が判断できる形にしたもの。
 type Finding struct {
-	ID        int64  `json:"id"`
-	MessageID int64  `json:"message_id"`
+	ID        int64 `json:"id"`
+	MessageID int64 `json:"message_id,omitempty"`
+	// Blob は blobs 由来の所見（ノート本文・編集前の中身）。
+	// Where はどちらの入れ物かを人が読める形で持つ。
+	Blob      string `json:"blob_sha256,omitempty"`
+	Where     string `json:"where"`
 	SessionID string `json:"session_id"`
 	Title     string `json:"title,omitempty"`
 	Type      string `json:"type"`
@@ -252,14 +263,21 @@ type Finding struct {
 	Context string `json:"context"`
 }
 
+// listSQL は messages 由来と blobs 由来の所見を1つに並べる。
+// 入れ物が2つあることを呼び出し側に押し付けない。
+//
+// blobs 側の raw は取らない（15MiB 級のものが混ざる）。中身は
+// blobContext が必要なぶんだけ読み直す。
 const listSQL = `
-	select f.id, f.message_id, m.session_id,
+	select f.id, coalesce(f.message_id, 0), coalesce(f.blob_sha256, ''),
+	       coalesce(m.session_id, ''),
 	       coalesce(nullif(s.ai_title, ''), nullif(s.user_title, ''), ''),
-	       m.type, coalesce(m.timestamp, ''), f.pattern, f.byte_offset, f.length,
+	       coalesce(m.type, ''), coalesce(m.timestamp, ''),
+	       f.pattern, f.byte_offset, f.length,
 	       f.reviewed, coalesce(f.verdict, ''), m.raw_json
 	  from sensitive_findings f
-	  join messages m on m.id = f.message_id
-	  join sessions s on s.id = m.session_id
+	  left join messages m on m.id = f.message_id
+	  left join sessions s on s.id = m.session_id
 	 where (? = 0 or f.reviewed = 0)
 	 order by f.pattern, f.id`
 
@@ -280,14 +298,36 @@ func List(db *store.DB, onlyUnreviewed, reveal bool) ([]Finding, error) {
 	for rows.Next() {
 		var f Finding
 		var raw []byte
-		if err := rows.Scan(&f.ID, &f.MessageID, &f.SessionID, &f.Title, &f.Type,
+		if err := rows.Scan(&f.ID, &f.MessageID, &f.Blob, &f.SessionID, &f.Title, &f.Type,
 			&f.At, &f.Pattern, &f.Offset, &f.Length, &f.Reviewed, &f.Verdict, &raw); err != nil {
 			return nil, err
 		}
-		f.Context = contextAround(raw, f.Offset, f.Length, reveal)
+		if f.Blob != "" {
+			f.Where = "blob " + f.Blob[:12]
+		} else {
+			f.Where = "msg " + strconv.FormatInt(f.MessageID, 10)
+			f.Context = contextAround(raw, f.Offset, f.Length, reveal)
+		}
 		out = append(out, f)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// blobs 側の前後は、Rows を閉じてから読む（SetMaxOpenConns(1)）。
+	for i := range out {
+		if out[i].Blob == "" {
+			continue
+		}
+		body, where, err := blobBody(db, out[i].Blob)
+		if err != nil {
+			return nil, err
+		}
+		if where != "" {
+			out[i].Where = where
+		}
+		out[i].Context = contextAround(body, out[i].Offset, out[i].Length, reveal)
+	}
+	return out, nil
 }
 
 // contextAround は当たりの前後を1行に潰して返す。
@@ -332,4 +372,124 @@ func DefaultKnownPath(dbPath string) string {
 		return "known-secrets.txt"
 	}
 	return dbPath[:i+1] + "known-secrets.txt"
+}
+
+// scanBlobs は blobs も走査する。
+//
+// Phase 1 でノート本文が blobs に入った時点で、同じ秘密が「走査されない場所」
+// にもう1つ増えた（実測: Vault の平文パスワードが messages 25件 + blobs 1個）。
+// 入れ物が増えたのに検出器を広げないと、片方だけ見て「無い」と言うことになる。
+//
+// blobs は中身が大きいので1つずつ読む。messages のように一括で持つと、
+// 15.5MiB のバックアップと 15.4MiB のノートを丸ごとメモリに載せることになる。
+func scanBlobs(db *store.DB, known []Known, res *Result) error {
+	var hashes []string
+	rows, err := db.Query(`select sha256 from blobs order by sha256`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			rows.Close()
+			return err
+		}
+		hashes = append(hashes, h)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for i := 0; i < len(hashes); i += scanChunk {
+		end := min(i+scanChunk, len(hashes))
+		if err := scanBlobChunk(db, known, res, hashes[i:end], now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func scanBlobChunk(db *store.DB, known []Known, res *Result, hashes []string, now string) error {
+	type blob struct {
+		hash string
+		body []byte
+	}
+	var batch []blob
+	for _, h := range hashes {
+		var codec string
+		var content []byte
+		if err := db.QueryRow(`select codec, content from blobs where sha256 = ?`, h).
+			Scan(&codec, &content); err != nil {
+			return err
+		}
+		body, err := ingest.UnpackBlob(codec, content)
+		if err != nil {
+			// 展開できないものは飛ばす。1つで走査全体を落とさない。
+			continue
+		}
+		batch = append(batch, blob{hash: h, body: body})
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`
+		insert into sensitive_findings(blob_sha256, pattern, byte_offset, length, found_at)
+		values(?,?,?,?,?)
+		on conflict(blob_sha256, pattern, byte_offset) where blob_sha256 is not null do nothing`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+
+	for _, b := range batch {
+		res.Blobs++
+		res.Bytes += int64(len(b.body))
+		for _, f := range findIn(b.body, known) {
+			res.Found++
+			res.Patterns[f.pattern]++
+			if strings.HasPrefix(f.pattern, knownPrefix) {
+				res.Known++
+			}
+			out, err := stmt.Exec(b.hash, f.pattern, f.offset, f.length, now)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+			if n, _ := out.RowsAffected(); n > 0 {
+				res.New++
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+// blobBody はブロブの中身と、それが何なのか（ノートのパス等）を返す。
+// 同じ中身を複数のノートが共有しうるので、名前は最初に見つかった1つ。
+func blobBody(db *store.DB, hash string) (body []byte, where string, err error) {
+	var codec string
+	var content []byte
+	if err := db.QueryRow(`select codec, content from blobs where sha256 = ?`, hash).
+		Scan(&codec, &content); err != nil {
+		return nil, "", err
+	}
+	body, err = ingest.UnpackBlob(codec, content)
+	if err != nil {
+		return nil, "", err
+	}
+	var p string
+	if err := db.QueryRow(
+		`select path from notes where sha256 = ? limit 1`, hash).Scan(&p); err == nil {
+		return body, "note " + p, nil
+	}
+	if err := db.QueryRow(
+		`select coalesce(rel_path, abs_path) from file_backups where sha256 = ? limit 1`,
+		hash).Scan(&p); err == nil {
+		return body, "backup " + p, nil
+	}
+	return body, "", nil
 }

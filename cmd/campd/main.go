@@ -746,8 +746,8 @@ func cmdSecrets(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("走査            %d メッセージ / %s\n既知の秘密      %d 個（%s）\n",
-			r.Messages, humanBytes(r.Bytes), len(kn), path)
+		fmt.Printf("走査            %d メッセージ + %d ブロブ / %s\n既知の秘密      %d 個（%s）\n",
+			r.Messages, r.Blobs, humanBytes(r.Bytes), len(kn), path)
 		fmt.Printf("当たり          %d 箇所（うち新規 %d・既知の突合 %d）\n",
 			r.Found, r.New, r.Known)
 		names := make([]string, 0, len(r.Patterns))
