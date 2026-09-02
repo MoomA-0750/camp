@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/MoomA-0750/camp/internal/files"
+	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/query"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
@@ -28,6 +29,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/sessions/{id}/messages", s.handleMessages)
 	m.HandleFunc("GET /api/search", s.handleSearch)
 	m.HandleFunc("GET /api/usage/summary", s.handleUsage)
+	m.HandleFunc("GET /api/usage/windows", s.handleWindows)
 	m.HandleFunc("GET /api/files", s.handleFiles)
 	m.HandleFunc("GET /api/backups", s.handleBackups)
 	m.HandleFunc("GET /api/backups/{id}/content", s.handleBackupContent)
@@ -179,4 +181,19 @@ func (s *Server) respond(w http.ResponseWriter, r *http.Request, v any, err erro
 func atoi(s string) int {
 	n, _ := strconv.Atoi(s)
 	return n
+}
+
+// handleWindows はプラン上限の窓を返す。?current=1 で進行中のぶんだけ。
+func (s *Server) handleWindows(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Get("current") == "1" {
+		rows, err := limits.Current(s.db)
+		s.respond(w, r, rows, err)
+		return
+	}
+	rows, err := limits.Windows(s.db, limits.Opts{
+		Kind:  q.Get("kind"),
+		Limit: atoi(q.Get("n")),
+	})
+	s.respond(w, r, rows, err)
 }

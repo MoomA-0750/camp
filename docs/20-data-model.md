@@ -329,10 +329,12 @@ CREATE TABLE usage_windows (
   account    TEXT,
   kind       TEXT NOT NULL,               -- five_hour|seven_day|spend_limit
   started_at TEXT, ends_at TEXT,
-  used_pct   REAL, tokens INTEGER,
+  used_pct   REAL, tokens INTEGER,      -- used_pct は最後に観測した値
+  peak_pct   REAL,                      -- その窓で到達した最大値（7日枠は下がって見える）
+  samples    INTEGER NOT NULL DEFAULT 0, -- 何回観測できたか＝値の信頼度
   source     TEXT NOT NULL,               -- control-protocol|codex-rollout|statusline
   fetched_at TEXT NOT NULL,
-  UNIQUE(agent, kind, ends_at, source)
+  UNIQUE(agent, kind, ends_at, source)   -- source を含むので観測元は共存できる
 );
 ```
 
@@ -413,3 +415,5 @@ CREATE TABLE usage_windows (
 23. **未マッチの GET は殻（`index.html`）を返す。ただし `/api/` は 404 JSON。** 殻が無いと `/sessions/<id>` の直接オープンとリロードが404になる。逆に `/api/` に殻を返すと、JSON を待っている相手が原因の分からない壊れ方をする
 24. **本文の一覧は既定で会話行（`user` / `assistant`）だけを返す。** 実測でこのコーパスは制御行のほうが多い。session `77a524b0` は 2,825行のうち **1,505行**が `mode` / `permission-mode` / `bridge-session` / `last-prompt` / `ai-title` など（`mode` 系は各136行）。全部返すと会話が埋もれて読めない。判定は `sessions.conversation_count` と同じにする（ヘッダの数と中身が食い違うと、どちらが嘘なのか分からなくなる）。`?all=1` で全部出す
 25. **索引に本文が残らない会話行がある。** `assistant` 3,114件・`user` 157件。前者はすべて署名だけの `thinking`（`message_blocks` に入れない）、後者は本文の無い `tool_result`。画面では空行にせず「本文が残っていない行」と書く。黙って空にすると表示の不具合と区別が付かない
+
+26. **プラン残量は「その瞬間しか無い」唯一の素材なので、記録だけ Phase 0 に前倒しした**（D-022）。会話記録も file-history もディスクに残るが、statusLine が受け取る `rate_limits` は整形されて捨てられる。会話記録に残るのは429を踏んだときだけで、83ファイル中1回しか無い。窓ごとに1行へ畳む（毎描画走るので1観測1行にすると1日で数千行）。「現在の窓」は `ends_at` の遠さではなく `fetched_at` の新しさで選ぶ

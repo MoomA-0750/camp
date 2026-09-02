@@ -8,7 +8,7 @@ Claude Codeのセッションと会話履歴をCLI側の都合から独立して
 
 ## ステータス
 
-**Phase 0 完了（M0〜M12）。**2026-09-01にリポジトリ作成。
+**Phase 0 完了（M0〜M12）＋プラン残量の記録（D-022）。**2026-09-01にリポジトリ作成。
 
 2026-09-01に4方向の評価（取り込み層の実証・プロトコルの実証・Obsidian置き換えの実現可能性・codexによる独立レビュー）を経てフェーズを再構成した。受け入れ条件と、実装して初めて分かったことは `dev/done/phase0-plan.md`。
 
@@ -80,6 +80,21 @@ $ campd backfill   # 派生テーブルを messages から作り直す（ディ�
 
 `general-console`（mooma-lpve上のVM 200、Fedora 44、4コア/16GB/128GB）に常設し、Tailscale内に閉じる。**実質「認証付き任意コード実行エンドポイント」なので公開しない。**
 
+## リポジトリの外に置いた設定
+
+**statusLine のフック。** プラン残量はここでしか手に入らないので、記録は `~/.claude/statusline.sh` に1ブロック足して行う（D-022）。新しいマシンで動かすときは同じものを入れる。既存の statusline がある場合は `input="$(cat)"` の直後に置く。
+
+```bash
+CAMPD="${CAMP_BIN:-$HOME/Documents/git-cloned/camp/campd}"
+if [ -x "$CAMPD" ]; then
+  printf '%s' "$input" | CAMP_DB="${CAMP_DB:-$HOME/Documents/git-cloned/camp/data/camp.sqlite}" \
+    "$CAMPD" limits record >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+fi
+```
+
+statusLine を使っていない場合は `campd limits record` に同じ形の JSON を stdin で渡せばよい。確認は `campd limits show`。
+
 ## 制約
 
 - **Claude Proサブスクの範囲内に収める。** APIクレジットは使わない。これがClaude Agent SDKを採れない理由（Agent SDKはAPIキー前提）
@@ -87,7 +102,7 @@ $ campd backfill   # 派生テーブルを messages から作り直す（ディ�
 - **バックエンドはGo、フロントはVite + React SPA**（`docs/40-layout.md`）。Next.jsは使わない
 - 履歴は生のまま保存し、リダクトしない。破壊しない検出器で記録だけ残す（`docs/10-decisions.md` D-010）
 - Tailscale内に閉じたうえで**アプリ認証を最初から入れる**（D-011）
-- プラン上限は `claude -p` の制御プロトコルから取る（`rate_limit_event` / `get_usage`。トークン消費ゼロ）
+- プラン上限はいずれ `claude -p` の制御プロトコルから取る（`rate_limit_event` / `get_usage`。トークン消費ゼロ）。ただし**記録だけは statusLine のフックで先に始めている**——この値は捨てられたら遡れない唯一の素材（D-022）
 - 権限確認UIは `--permission-prompt-tool stdio` で作れる（`--help` に出ない隠しフラグだが実在する）
 
 詳細は `docs/` を参照。

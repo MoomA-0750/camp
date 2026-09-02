@@ -35,6 +35,13 @@ export type UsageRow = {
   cache_creation_tokens: number; cache_read_tokens: number; thinking_tokens: number
 }
 
+export type Window = {
+  id: number; agent: string; kind: string
+  started_at?: string; ends_at?: string
+  used_pct: number; peak_pct: number; samples: number
+  source: string; fetched_at: string; current: boolean
+}
+
 export type Touch = {
   abs_path: string; rel_path?: string; op: string; origin: string; at: string
   session_id: string; message_uuid?: string; title?: string; backup_name?: string
@@ -91,6 +98,11 @@ export const api = {
     fetchJSON<Hit[]>('/api/search' + qs({ q, ...o })),
 
   usage: (by: string, limit = 60) => fetchJSON<UsageRow[]>('/api/usage/summary' + qs({ by, limit })),
+
+  windows: (o: { current?: boolean; kind?: string; n?: number } = {}) =>
+    fetchJSON<Window[]>('/api/usage/windows' + qs({
+      current: o.current ? '1' : '', kind: o.kind, n: o.n,
+    })),
 
   files: (o: { path?: string; session?: string; op?: string; limit?: number }) =>
     fetchJSON<Touch[]>('/api/files' + qs(o)),

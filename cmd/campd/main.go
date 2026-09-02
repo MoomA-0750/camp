@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/files"
 	"github.com/MoomA-0750/camp/internal/httpapi"
 	"github.com/MoomA-0750/camp/internal/ingest"
+	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
 	"github.com/MoomA-0750/camp/internal/store"
@@ -72,6 +74,8 @@ func run(args []string) error {
 		return cmdServe(rest)
 	case "passwd":
 		return cmdPasswd(rest)
+	case "limits":
+		return cmdLimits(rest)
 	case "login-url":
 		return cmdLoginURL(rest)
 	case "help", "--help", "-h":
@@ -102,6 +106,8 @@ usage:
   campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
   campd login-url         使い捨てのログインURLを1本出す（開発中の入口）
+  campd limits record     statusLine の JSON を stdin から読んで残量を記録する
+  campd limits show       記録済みの窓を新しい順に並べる（-current で現在ぶんだけ）
 `)
 }
 
@@ -944,5 +950,104 @@ func cmdLoginURL(args []string) error {
 	fmt.Printf("%s/login?t=%s\n", strings.TrimRight(*base, "/"), tok)
 	fmt.Fprintf(os.Stderr, "1回だけ使える。%s まで（%s）。\n",
 		exp.Local().Format("15:04:05"), *ttl)
+	return nil
+}
+
+func cmdLimits(args []string) error {
+	sub := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[0], args[1:]
+	}
+	switch sub {
+	case "record":
+		return cmdLimitsRecord(args)
+	case "", "show", "list":
+		return cmdLimitsShow(args)
+	default:
+		return fmt.Errorf("limits の使い方: campd limits record | campd limits show")
+	}
+}
+
+// cmdLimitsRecord は statusLine の stdin JSON を受け取る。
+// statusLine のフックから毎描画呼ばれるので、失敗しても静かに 0 で抜ける。
+// プロンプトを壊さないことが最優先。
+func cmdLimitsRecord(args []string) error {
+	fs := flag.NewFlagSet("limits record", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	agent := fs.String("agent", limits.AgentClaudeCode, "エージェント識別子")
+	source := fs.String("source", limits.SourceStatusLine, "観測元")
+	quiet := fs.Bool("quiet", true, "何も出力しない（フックからの既定）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		if *quiet {
+			return nil
+		}
+		return err
+	}
+	defer db.Close()
+
+	got, err := limits.Record(db, os.Stdin, *agent, *source)
+	if err != nil {
+		if *quiet || errors.Is(err, limits.ErrNoWindows) {
+			return nil
+		}
+		return err
+	}
+	if *quiet {
+		return nil
+	}
+	for _, r := range got {
+		mark := "更新"
+		if r.New {
+			mark = "新規"
+		}
+		fmt.Printf("%s  %-10s %5.1f%%  リセット %s\n", mark, r.Kind, r.UsedPct, r.EndsAt)
+	}
+	return nil
+}
+
+func cmdLimitsShow(args []string) error {
+	fs := flag.NewFlagSet("limits show", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	kind := fs.String("kind", "", "窓の種類で絞る（five_hour / seven_day）")
+	limit := fs.Int("n", 20, "件数")
+	current := fs.Bool("current", false, "いま拘束されている窓だけ出す")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var rows []limits.Window
+	if *current {
+		rows, err = limits.Current(db)
+	} else {
+		rows, err = limits.Windows(db, limits.Opts{Kind: *kind, Limit: *limit})
+	}
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("記録がない。statusLine のフックがまだ一度も走っていない可能性がある。")
+		fmt.Println("確認: campd limits record -quiet=false < サンプルJSON")
+		return nil
+	}
+	fmt.Printf("%-10s %7s %7s %6s  %-20s %s\n", "窓", "最新", "ピーク", "観測", "リセット", "")
+	for _, w := range rows {
+		now := ""
+		if w.Current {
+			now = "← 進行中"
+		}
+		fmt.Printf("%-10s %6.1f%% %6.1f%% %6d  %-20s %s\n",
+			w.Kind, w.UsedPct, w.PeakPct, w.Samples, w.EndsAt, now)
+	}
 	return nil
 }

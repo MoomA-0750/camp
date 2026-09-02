@@ -1,5 +1,6 @@
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api'
+import Limits from '../Limits'
 import { Failed, Loading, num, tokens, useAsync } from '../ui'
 
 const AXES = [
@@ -27,6 +28,11 @@ export default function Usage() {
   return (
     <>
       <h2>使用量</h2>
+
+      <h3>プラン残量</h3>
+      <Limits />
+
+      <h3>トークン内訳</h3>
       <p className="sub muted">
         リクエスト単位で数えている。行単位で合計すると出力が約2倍になる。
       </p>
