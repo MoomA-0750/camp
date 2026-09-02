@@ -50,7 +50,7 @@ $ campd secrets    # 認証情報らしい場所を記録する。何も書き�
 当たりは既定で伏せる。14箇所すべて、伏せたまま偽陽性と判別できた
 
 $ make && ./campd passwd && ./campd serve
-addr    http://127.0.0.1:8787
+addr    http://127.0.0.1:8785
 画面    埋め込みの web/dist
 認証    必須（/healthz を除く全経路）
 未認証は /api/* が 401、画面は /login へ 302。画面の殻もバンドルも配らない

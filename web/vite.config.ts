@@ -9,9 +9,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8787', changeOrigin: false },
-      '/login': { target: 'http://127.0.0.1:8787', changeOrigin: false },
-      '/healthz': { target: 'http://127.0.0.1:8787', changeOrigin: false },
+      '/api': { target: 'http://127.0.0.1:8785', changeOrigin: false },
+      '/login': { target: 'http://127.0.0.1:8785', changeOrigin: false },
+      '/healthz': { target: 'http://127.0.0.1:8785', changeOrigin: false },
     },
   },
   // emptyOutDir は使わない。dist/.gitkeep まで消えてしまい、

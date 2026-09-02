@@ -837,7 +837,7 @@ func isTerminal() bool {
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
-	addr := fs.String("addr", "127.0.0.1:8787", "待ち受けアドレス")
+	addr := fs.String("addr", defaultAddr(), "待ち受けアドレス")
 	web := fs.String("web", "", "フロントのビルド成果物のディレクトリ（空なら組み込みの仮の殻）")
 	origins := fs.String("origin", "", "追加で許すオリジン（カンマ区切り）")
 	secure := fs.Bool("secure-cookie", false, "Cookie に Secure を付ける（TLS 終端の後ろに置くとき）")
@@ -903,4 +903,16 @@ func cmdServe(args []string) error {
 		defer cancel()
 		return hs.Shutdown(ctx)
 	}
+}
+
+// defaultAddr は待ち受け先の既定。
+//
+// 8787 は避ける。このマシンでは既に別のサービスが 0.0.0.0:8787 を
+// 掴んでいて、既定のまま起動すると bind に失敗した。よくある開発用
+// ポート（3000 / 5000 / 8000 / 8080 / 5173 / 8787）から離す。
+func defaultAddr() string {
+	if a := os.Getenv("CAMP_ADDR"); a != "" {
+		return a
+	}
+	return "127.0.0.1:8785"
 }
