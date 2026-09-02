@@ -17,15 +17,15 @@ import (
 )
 
 type Hit struct {
-	BlockID   int64
-	MessageID int64
-	SessionID string
-	Title     string
-	Kind      string
-	ToolName  string
-	Timestamp string
-	Snippet   string
-	Score     float64
+	BlockID   int64   `json:"block_id"`
+	MessageID int64   `json:"message_id"`
+	SessionID string  `json:"session_id"`
+	Title     string  `json:"title"`
+	Kind      string  `json:"kind"`
+	ToolName  string  `json:"tool_name,omitempty"`
+	Timestamp string  `json:"timestamp"`
+	Snippet   string  `json:"snippet"`
+	Score     float64 `json:"score"`
 }
 
 type Opts struct {

@@ -9,17 +9,17 @@ import (
 
 // Touch は session_files の1行を、人が読める形にしたもの。
 type Touch struct {
-	AbsPath   string
-	RelPath   string
-	Op        string
-	Origin    string
-	At        string
-	SessionID string
+	AbsPath   string `json:"abs_path"`
+	RelPath   string `json:"rel_path,omitempty"`
+	Op        string `json:"op"`
+	Origin    string `json:"origin"`
+	At        string `json:"at"`
+	SessionID string `json:"session_id"`
 	// MessageUUID は「触ったターン」そのもの。これがあれば thread から
 	// 前後の会話をそのまま引ける。
-	MessageUUID string
-	Title       string
-	Backup      string
+	MessageUUID string `json:"message_uuid,omitempty"`
+	Title       string `json:"title,omitempty"`
+	Backup      string `json:"backup_name,omitempty"`
 }
 
 // Opts は絞り込み。空の項目は絞らない。
@@ -69,12 +69,12 @@ func Touches(db *store.DB, o Opts) ([]Touch, error) {
 
 // PathSummary は1つのパスについての要約。
 type PathSummary struct {
-	AbsPath  string
-	Sessions int
-	Touches  int
-	Ops      string
-	First    string
-	Last     string
+	AbsPath  string `json:"abs_path"`
+	Sessions int    `json:"sessions"`
+	Touches  int    `json:"touches"`
+	Ops      string `json:"ops"`
+	First    string `json:"first"`
+	Last     string `json:"last"`
 }
 
 const summarySQL = `

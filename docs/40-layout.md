@@ -53,6 +53,19 @@ SPAだがクライアントサイドルーティングで**本物のURLを持つ
 
 `web/dist` を `embed.FS` で `campd` に埋め込み、単一バイナリで配る。開発時はViteのdevサーバーへプロキシする。
 
+**M11 時点の暫定:** `web/dist` がまだ無いので、`internal/httpapi/assets/` に組み込みの2枚（`login.html`・仮の `index.html`）を置いて配っている。`campd serve -web <dir>` で実ビルドをディスクから配れる。M12 で埋め込みへ切り替える。
+
+## 認証の位置（D-011 / D-020）
+
+ゲートは `httpapi.Server.serve` の1本だけ。**ここを通らない経路を作らないこと。**
+
+```
+セキュリティヘッダ → /healthz だけ素通し → オリジン検証（状態を変える要求のみ）
+  → ログイン経路2つ → 認証 → 振り分け → 未マッチの GET は殻
+```
+
+`internal/query` は一覧・詳細の読み取りをまとめた場所。HTTP からも、Phase 2 のMCPサーバーからも同じものを使う。
+
 ## 運用上の注意: システムの `sqlite3` CLI では FTS を触れない
 
 Fedora の `sqlite3` コマンドは **FTS5 モジュールを持っていない**（`no such module: fts5`）。テーブルの中身は読めるが、`messages_fts` に対する `integrity-check` や `MATCH` は失敗する。

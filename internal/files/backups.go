@@ -10,17 +10,17 @@ import (
 
 // Backup は捕獲済みのバックアップ1件。
 type Backup struct {
-	ID        int64
-	AbsPath   string
-	RelPath   string
-	Version   int64
-	At        string // backup_time。編集される直前の時刻
-	SessionID string
-	Title     string
-	Name      string // <hash>@v<N>
-	Origin    string
-	Size      int64  // 展開後のバイト数
-	Missing   string // 実体が消えたのを見つけた時刻。空なら実体もまだある
+	ID        int64  `json:"id"`
+	AbsPath   string `json:"abs_path"`
+	RelPath   string `json:"rel_path,omitempty"`
+	Version   int64  `json:"version"`
+	At        string `json:"backup_time"` // backup_time。編集される直前の時刻
+	SessionID string `json:"session_id"`
+	Title     string `json:"title,omitempty"`
+	Name      string `json:"backup_name"` // <hash>@v<N>
+	Origin    string `json:"origin"`
+	Size      int64  `json:"size"`                 // 展開後のバイト数
+	Missing   string `json:"missing_at,omitempty"` // 実体が消えたのを見つけた時刻。空なら実体もまだある
 }
 
 const backupSQL = `

@@ -237,19 +237,19 @@ func prefiltered(raw []byte, prefixes []string) bool {
 
 // Finding は記録済みの1件を、人が判断できる形にしたもの。
 type Finding struct {
-	ID        int64
-	MessageID int64
-	SessionID string
-	Title     string
-	Type      string
-	At        string
-	Pattern   string
-	Offset    int
-	Length    int
-	Reviewed  bool
-	Verdict   string
+	ID        int64  `json:"id"`
+	MessageID int64  `json:"message_id"`
+	SessionID string `json:"session_id"`
+	Title     string `json:"title,omitempty"`
+	Type      string `json:"type"`
+	At        string `json:"timestamp"`
+	Pattern   string `json:"pattern"`
+	Offset    int    `json:"byte_offset"`
+	Length    int    `json:"length"`
+	Reviewed  bool   `json:"reviewed"`
+	Verdict   string `json:"verdict,omitempty"`
 	// Context は当たった場所の前後。既定では当たり自体を伏せる。
-	Context string
+	Context string `json:"context"`
 }
 
 const listSQL = `

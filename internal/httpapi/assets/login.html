@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Camp — ログイン</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.7 system-ui, sans-serif; margin: 0; display: grid;
+         place-items: center; min-height: 100dvh; }
+  form { display: grid; gap: .75rem; width: min(22rem, 90vw); }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+  p { margin: 0; opacity: .65; font-size: .85rem; }
+  input, button { font: inherit; padding: .55rem .7rem; border-radius: .4rem;
+                  border: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
+  button { cursor: pointer; }
+  .err { color: #c0392b; min-height: 1.4em; font-size: .85rem; }
+</style>
+<form id="f" method="post" action="/api/login">
+  <h1>Camp</h1>
+  <p>会話履歴とVaultをまとめて持つ場所。</p>
+  <input type="password" name="password" autocomplete="current-password"
+         placeholder="パスワード" required autofocus>
+  <button type="submit">入る</button>
+  <div class="err" id="e"></div>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const e = document.getElementById('e');
+  e.textContent = '';
+  const res = await fetch('/api/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: ev.target.password.value}),
+  });
+  if (res.ok) { location.href = '/'; return; }
+  const body = await res.json().catch(() => ({}));
+  e.textContent = body.error || ('失敗しました（' + res.status + '）');
+});
+</script>

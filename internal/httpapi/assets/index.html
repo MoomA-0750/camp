@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Camp</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.8 system-ui, sans-serif; margin: 0 auto; padding: 2rem 1.25rem;
+         max-width: 44rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  p { margin: .4rem 0; }
+  code { font-family: ui-monospace, monospace; font-size: .9em;
+         background: color-mix(in srgb, currentColor 8%, transparent);
+         padding: .1em .35em; border-radius: .25em; }
+  ul { padding-left: 1.2rem; }
+  .muted { opacity: .65; font-size: .9rem; }
+</style>
+<h1>Camp</h1>
+<p class="muted">画面はまだ無い（M12）。APIは動いている。</p>
+<ul>
+  <li><code>GET /api/hosts</code></li>
+  <li><code>GET /api/projects?host=</code></li>
+  <li><code>GET /api/sessions?host=&amp;project=&amp;agent=&amp;q=&amp;cursor=</code></li>
+  <li><code>GET /api/sessions/{id}</code> / <code>/messages?after=&amp;limit=</code></li>
+  <li><code>GET /api/search?q=</code></li>
+  <li><code>GET /api/usage/summary?by=day|model|session|project</code></li>
+  <li><code>GET /api/files?path=&amp;summary=1</code></li>
+  <li><code>GET /api/backups?path=</code> / <code>/api/backups/{id}/content</code></li>
+  <li><code>GET /api/findings</code></li>
+</ul>
+<p class="muted">この殻は未マッチのパス全部に返る。<code>/sessions/&lt;id&gt;</code>
+を直接開いてもリロードしても404にならないのは、これがあるから。</p>
+<p><a href="#" id="out">ログアウト</a></p>
+<script>
+document.getElementById('out').addEventListener('click', async (ev) => {
+  ev.preventDefault();
+  await fetch('/api/logout', {method: 'POST'});
+  location.href = '/login';
+});
+</script>

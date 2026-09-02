@@ -285,6 +285,27 @@ CREATE INDEX ix_fbk_path ON file_backups(abs_path, backup_time DESC);
 CREATE INDEX ix_fbk_sess ON file_backups(session_id, backup_time DESC);
 CREATE INDEX ix_fbk_sha  ON file_backups(sha256);
 
+-- ── 認証（D-011 / D-020）─────────────────────────────────────────────────────
+-- 鍵は1本、セッションはCookie1つ。単一ユーザーなのでこれで足りる。
+CREATE TABLE auth_credential (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  algo       TEXT NOT NULL,                  -- pbkdf2-sha256
+  iterations INTEGER NOT NULL,
+  salt       BLOB NOT NULL,
+  hash       BLOB NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- **トークンそのものは保存しない。** Cookie に載せる乱数の SHA-256 だけ。
+CREATE TABLE auth_sessions (
+  token_hash   BLOB PRIMARY KEY,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  user_agent   TEXT, remote_addr TEXT
+);
+CREATE INDEX ix_auth_sessions_exp ON auth_sessions(expires_at);
+
 -- ── Vault ───────────────────────────────────────────────────────────────────
 CREATE TABLE notes (
   id       INTEGER PRIMARY KEY,
@@ -388,3 +409,5 @@ CREATE TABLE usage_windows (
 19. **中身は内容でアドレスし、縮んだときだけ圧縮する。** `blobs.sha256` は展開後の中身のハッシュなので `codec` に依らない。実測809個15.5MiBが、重複除去（751本）と gzip で 4.7MiB。小さいファイルは gzip ヘッダのぶん太るので、縮まなかったものは `raw` のまま入れる。実体が消えた行には `missing_at` を立てるだけで、行も中身も消さない
 20. **検出器は記録するだけで、`raw_json` を1バイトも変えない**（D-010）。位置は `sensitive_findings.block_id` ではなく `(message_id, raw_json のバイト位置)` で持つ。`message_blocks.id` は `backfill` のたびに振り直されるので、人の判断（`verdict`）を載せる表をそこに繋いではいけない。同じ場所は二度記録しない（`ux_findings_spot` ＋ `ON CONFLICT DO NOTHING`）ので、何度走査しても判断は残る
 21. **高信頼のパターンだけを見る。** 発行元が決めた接頭辞と長さを持つものに限る。実測でこのコーパスは偽陽性100%・偽陰性100%（D-019）なので、パターンで見つからない実在の秘密は `known-secrets.txt` に登録して突き合わせる。その中身はリポジトリに置かない
+22. **HTTP は `/healthz` 以外を1つも素通ししない**（D-011 / D-020）。画面の殻もバンドルも認証の内側。ログインは組み込みの `/login` から。未認証は `/api/*` が 401 JSON、それ以外は `/login` へ 302
+23. **未マッチの GET は殻（`index.html`）を返す。ただし `/api/` は 404 JSON。** 殻が無いと `/sessions/<id>` の直接オープンとリロードが404になる。逆に `/api/` に殻を返すと、JSON を待っている相手が原因の分からない壊れ方をする

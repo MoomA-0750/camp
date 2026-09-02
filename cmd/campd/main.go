@@ -2,15 +2,22 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/MoomA-0750/camp/internal/files"
+	"github.com/MoomA-0750/camp/internal/httpapi"
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
@@ -61,6 +68,10 @@ func run(args []string) error {
 		return cmdBackup(rest)
 	case "secrets":
 		return cmdSecrets(rest)
+	case "serve":
+		return cmdServe(rest)
+	case "passwd":
+		return cmdPasswd(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -86,6 +97,8 @@ usage:
   campd capture [-dir D]  file-history の実体（編集前の中身）を DB に取り込む
   campd backup  [PATH]    捕獲したバックアップを一覧する（-show ID で中身を出す）
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
+  campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
+  campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
 `)
 }
 
@@ -752,4 +765,146 @@ func cmdSecrets(args []string) error {
 	}
 	fmt.Printf("\n%d 件。判定は campd secrets -ok <ID> [-verdict 文字列]\n", len(rows))
 	return nil
+}
+
+func cmdPasswd(args []string) error {
+	fs := flag.NewFlagSet("passwd", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Migrate(); err != nil {
+		return err
+	}
+
+	// 端末ならエコーを止めて読む。パイプで渡されたときは1行そのまま。
+	pw, err := readPassword("パスワード: ")
+	if err != nil {
+		return err
+	}
+	again, err := readPassword("もう一度: ")
+	if err != nil {
+		return err
+	}
+	if pw != again {
+		return fmt.Errorf("一致しない")
+	}
+	if err := httpapi.SetPassword(db, pw); err != nil {
+		return err
+	}
+	fmt.Println("設定した。開いていたログインセッションはすべて閉じた。")
+	return nil
+}
+
+// readPassword は端末ならエコーを止めて1行読む。
+//
+// x/term を足さずに stty へ寄せている。依存を増やさないための割り切りで、
+// 端末が無い（パイプ・CI）ときはそのまま読む。
+func readPassword(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	restore := func() {}
+	if isTerminal() {
+		if err := exec.Command("stty", "-echo").Run(); err == nil {
+			restore = func() {
+				exec.Command("stty", "echo").Run()
+				fmt.Fprintln(os.Stderr)
+			}
+		}
+	}
+	defer restore()
+
+	line, err := stdin.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// stdin は1本だけ持つ。呼ぶたびに bufio を作ると、1回目が2行とも
+// 読み込んでしまい、2回目が EOF になる（確認をパイプで渡すと必ず踏む）。
+var stdin = bufio.NewReader(os.Stdin)
+
+func isTerminal() bool {
+	st, err := os.Stdin.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}
+
+func cmdServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	addr := fs.String("addr", "127.0.0.1:8787", "待ち受けアドレス")
+	web := fs.String("web", "", "フロントのビルド成果物のディレクトリ（空なら組み込みの仮の殻）")
+	origins := fs.String("origin", "", "追加で許すオリジン（カンマ区切り）")
+	secure := fs.Bool("secure-cookie", false, "Cookie に Secure を付ける（TLS 終端の後ろに置くとき）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Migrate(); err != nil {
+		return err
+	}
+	if n, err := httpapi.PurgeExpiredSessions(db); err == nil && n > 0 {
+		fmt.Printf("期限切れのログイン %d 件を掃除した\n", n)
+	}
+	if !httpapi.HasPassword(db) {
+		return fmt.Errorf("パスワードが未設定。先に campd passwd を実行すること（D-011）")
+	}
+
+	var allow []string
+	for _, o := range strings.Split(*origins, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allow = append(allow, o)
+		}
+	}
+	srv, err := httpapi.New(db, httpapi.Options{
+		Addr: *addr, WebDir: *web, Origins: allow, SecureCookie: *secure,
+	})
+	if err != nil {
+		return err
+	}
+
+	hs := &http.Server{
+		Addr:              *addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	shell := "組み込みの仮の殻"
+	if *web != "" {
+		shell = *web
+	}
+	fmt.Printf("db      %s\naddr    http://%s\n画面    %s\n認証    必須（/healthz を除く全経路）\n",
+		*dbPath, *addr, shell)
+
+	// Ctrl-C で受け付けをやめ、走っている要求を待つ。
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	errc := make(chan error, 1)
+	go func() {
+		err := hs.ListenAndServe()
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		errc <- err
+	}()
+
+	select {
+	case err := <-errc:
+		return err
+	case <-stop:
+		fmt.Println("\n止める")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return hs.Shutdown(ctx)
+	}
 }
