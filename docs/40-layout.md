@@ -15,7 +15,13 @@ camp/
 │   ├── secrets/          破壊しない検出器（sensitive_findings）
 │   └── httpapi/          ルーティング・認証・SPAフォールバック
 └── web/                  Vite + React（TypeScript）
-    └── dist/             ビルド成果物。campd が埋め込んで配る
+    ├── embed.go          package web。dist を埋め込む
+    ├── src/
+    │   ├── api.ts        campd の HTTP 面をそのまま写したもの
+    │   ├── ui.tsx        読み込み中・失敗・空の3状態と、数の整形
+    │   ├── routes.test.tsx  URL が画面の状態になっているかの回帰テスト
+    │   └── pages/        Sessions / SessionDetail / Search / Usage
+    └── dist/             ビルド成果物。campd が埋め込んで配る（git には置かない）
 ```
 
 ## なぜGoか（D-009）
@@ -53,7 +59,22 @@ SPAだがクライアントサイドルーティングで**本物のURLを持つ
 
 `web/dist` を `embed.FS` で `campd` に埋め込み、単一バイナリで配る。開発時はViteのdevサーバーへプロキシする。
 
-**M11 時点の暫定:** `web/dist` がまだ無いので、`internal/httpapi/assets/` に組み込みの2枚（`login.html`・仮の `index.html`）を置いて配っている。`campd serve -web <dir>` で実ビルドをディスクから配れる。M12 で埋め込みへ切り替える。
+**画面の出どころは3段。上から順に使い、起動時にどれを使ったか出す。**
+
+1. `campd serve -web <dir>` — ディスクの実ビルド（開発中に差し替える用）
+2. 埋め込みの `web/dist` — `npm run build` を通してあれば入る
+3. 組み込みの仮の殻（`internal/httpapi/assets/`）— API一覧が出るだけのページ
+
+**`web/dist` は git に置かない。** ただし `//go:embed` はディレクトリが空だとコンパイルを通さないので `.gitkeep` だけ置いてある。`index.html` が無ければ埋め込みは無効として扱う（`web.Dist()` が `false` を返す）ので、**node を持たないところでも `campd` はビルドできる**。
+
+`internal/httpapi/assets/login.html` は組み込みのログイン画面。認証は静的ファイルも通さないので（D-020）、殻を配らずにログインできる入口が別に要る。JS 無しのフォーム投稿でも動く。
+
+ビルドは2段。`make`（= `make web campd`）で通る。
+
+```
+$ make          # cd web && npm ci && npm run build → go build -o campd
+$ make test     # go vet / gofmt / go test → cd web && npm test
+```
 
 ## 認証の位置（D-011 / D-020）
 
@@ -81,3 +102,18 @@ ok    fts5                     利用可
 ok    messages_fts integrity   整合
 ok    foreign_key_check        違反なし
 ```
+
+
+## 画面の状態はすべてURLに置く
+
+検索語も絞り込みも使用量の軸もページの起点も、`useState` ではなくクエリ文字列に持つ。
+
+```
+/sessions?q=認証&host=general-console&cursor=2026-09-02T06:32:04.242Z
+/search?q=認証&kind=tool_result
+/usage?by=model
+```
+
+理由は3つ。ブックマークできる。リロードで消えない。人にも自分の別セッションにも渡せる。Phase 2 のMCPサーバーがモデルに返すハンドルも同じURLに乗る。
+
+**テストで気をつけること:** `MemoryRouter` の `initialEntries` は初回マウントでしか読まれない。`rerender` でURLを差し替えても画面は動かないので、戻る/進むを試すには `createMemoryRouter` + `RouterProvider`（本物の履歴スタックを持つ）を使う。

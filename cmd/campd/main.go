@@ -879,12 +879,8 @@ func cmdServe(args []string) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	shell := "組み込みの仮の殻"
-	if *web != "" {
-		shell = *web
-	}
 	fmt.Printf("db      %s\naddr    http://%s\n画面    %s\n認証    必須（/healthz を除く全経路）\n",
-		*dbPath, *addr, shell)
+		*dbPath, *addr, srv.Source())
 
 	// Ctrl-C で受け付けをやめ、走っている要求を待つ。
 	stop := make(chan os.Signal, 1)

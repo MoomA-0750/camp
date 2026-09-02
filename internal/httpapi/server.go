@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/MoomA-0750/camp/internal/store"
+	"github.com/MoomA-0750/camp/web"
 )
 
 //go:embed assets
@@ -38,6 +39,8 @@ type Server struct {
 	opts         Options
 	mux          *http.ServeMux
 	static       http.Handler
+	assets       fs.FS  // 画面の実体。実在するファイルの判定にも使う
+	source       string // どこから画面を配っているか（起動時に出す）
 	shell        []byte // 未マッチのパスに返す殻
 	login        []byte
 	secureCookie bool
@@ -58,24 +61,35 @@ func New(db *store.DB, o Options) (*Server, error) {
 		return nil, err
 	}
 
-	// 実ビルドがあればそれを、無ければ組み込みの仮の殻を配る。
-	// M12 で web/dist を作ったらそちらが使われる。
-	if o.WebDir != "" {
+	// 画面の出どころは3つ。上から順に使う。
+	//
+	//  1. -web <dir>  ディスクの実ビルド（開発中に差し替える用）
+	//  2. 埋め込みの web/dist（npm run build を通してあれば入っている）
+	//  3. 組み込みの仮の殻（node を持たないところでもサーバーは動く）
+	switch {
+	case o.WebDir != "":
 		idx := filepath.Join(o.WebDir, "index.html")
 		if s.shell, err = os.ReadFile(idx); err != nil {
 			return nil, fmt.Errorf("%s が読めない: %w", idx, err)
 		}
-		s.static = http.FileServer(http.Dir(o.WebDir))
-	} else {
-		if s.shell, err = builtinFS.ReadFile("assets/index.html"); err != nil {
+		s.assets = os.DirFS(o.WebDir)
+		s.source = o.WebDir
+	default:
+		sub, ok := web.Dist()
+		if !ok {
+			if sub, err = fs.Sub(builtinFS, "assets"); err != nil {
+				return nil, err
+			}
+			s.source = "組み込みの仮の殻（web/dist が未ビルド）"
+		} else {
+			s.source = "埋め込みの web/dist"
+		}
+		if s.shell, err = fs.ReadFile(sub, "index.html"); err != nil {
 			return nil, err
 		}
-		sub, err := fs.Sub(builtinFS, "assets")
-		if err != nil {
-			return nil, err
-		}
-		s.static = http.FileServer(http.FS(sub))
+		s.assets = sub
 	}
+	s.static = http.FileServer(http.FS(s.assets))
 
 	s.routes()
 	return s, nil
@@ -242,19 +256,15 @@ func (s *Server) spa(w http.ResponseWriter, r *http.Request) {
 }
 
 // openStatic はそのパスに実ファイルがあるかを見る。
+// あれば静的配信、無ければ殻。どちらから配っていても同じ判定でよい。
 func (s *Server) openStatic(p string) bool {
 	name := strings.TrimPrefix(path.Clean("/"+p), "/")
 	if name == "" || name == "." {
 		return false
 	}
-	if s.opts.WebDir != "" {
-		st, err := os.Stat(filepath.Join(s.opts.WebDir, filepath.FromSlash(name)))
-		return err == nil && !st.IsDir()
-	}
-	f, err := builtinFS.Open("assets/" + name)
-	if err != nil {
-		return false
-	}
-	f.Close()
-	return true
+	st, err := fs.Stat(s.assets, name)
+	return err == nil && !st.IsDir()
 }
+
+// Source は画面をどこから配っているかを返す。起動時に出す用。
+func (s *Server) Source() string { return s.source }

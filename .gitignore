@@ -5,7 +5,8 @@
 
 # フロント
 node_modules/
-web/dist/
+web/dist/*
+!web/dist/.gitkeep
 *.tsbuildinfo
 
 # ローカルデータ（DBは複製先であり成果物ではない）
