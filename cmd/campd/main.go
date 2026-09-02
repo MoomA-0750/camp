@@ -21,6 +21,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/httpapi"
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/limits"
+	"github.com/MoomA-0750/camp/internal/mcp"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
 	"github.com/MoomA-0750/camp/internal/store"
@@ -80,6 +81,8 @@ func run(args []string) error {
 		return cmdVault(rest)
 	case "views":
 		return cmdViews(rest)
+	case "mcp":
+		return cmdMCP(rest)
 	case "limits":
 		return cmdLimits(rest)
 	case "login-url":
@@ -116,6 +119,7 @@ usage:
   campd vault index [DIR] Vault を索引する（Vault側には一切書かない）
   campd vault ghosts      触った記録はあるが実体が無いパスを並べる
   campd views [NAME]      .base のビューを一覧・実行する
+  campd mcp               MCPサーバーとして stdio で待つ（読み取り専用）
   campd limits record     statusLine の JSON を stdin から読んで残量を記録する
   campd limits show       記録済みの窓を新しい順に並べる（-current で現在ぶんだけ）
 `)
@@ -1327,4 +1331,20 @@ func clipCell(s string) string {
 		return "·"
 	}
 	return s
+}
+
+func cmdMCP(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// stdout はプロトコル 専用。ログは stderr へ出す。
+	return mcp.New(db, os.Stdin, os.Stdout, Version).Serve()
 }

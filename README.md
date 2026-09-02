@@ -8,7 +8,7 @@ Claude Codeのセッションと会話履歴をCLI側の都合から独立して
 
 ## ステータス
 
-**Phase 1 完了（M13〜M16）。**Phase 0（M0〜M12）＋プラン残量の記録（D-022）は済み。2026-09-01にリポジトリ作成。
+**Phase 2 完了（M17〜M20）。**Phase 0（M0〜M12）＋Phase 1（M13〜M16）＋プラン残量の記録（D-022）は済み。2026-09-01にリポジトリ作成。
 
 2026-09-01に4方向の評価（取り込み層の実証・プロトコルの実証・Obsidian置き換えの実現可能性・codexによる独立レビュー）を経てフェーズを再構成した。受け入れ条件と、実装して初めて分かったことは `dev/done/phase0-plan.md`。
 
@@ -91,6 +91,35 @@ $ campd vault ghosts                                        # 実体の無い触
 **Camp は Vault に一切書かない。** 索引は 4,170ファイル（markdown 4,121）・15.4MiB、走査18ms・索引2.4秒（2回目645ms）。ドット始まりのディレクトリは降りる前に切る（`.claude/worktrees/` にこの Vault の11倍のファイルがある）。
 
 ノートの中身は `blobs` に寄せてあるので、**Vault から消えたノートも Camp からは読める**。
+
+## ビューと MCP
+
+```
+$ campd views                 # .base の30ビューを一覧
+$ campd views -n 5 'Health/テーブル'
+$ campd mcp                   # MCPサーバー（stdio・読み取り専用）
+```
+
+Vault の `.base` をそのまま読む（書き戻さない）。ただし **`order:` は許可リストではなく「前に出す指定」として読み、列は既定で全部出す。**
+
+| ビュー | Bases の解釈 | Camp の解釈 |
+|---|---:|---:|
+| Health/テーブル | 11列 | **107列**（定義10 + 自動97） |
+| Note-Taking/All | 3列 | 13列 |
+
+実在の7ファイルで136列中100列（73%）がどのビューからも見えなくなっていた。列は増え続けるのに、許可リストは手で書いたときのまま止まるため。
+
+MCPに登録する（`~/.claude.json` 等）:
+
+```json
+{ "mcpServers": { "camp": {
+    "command": "/home/mooma-0750/Documents/git-cloned/camp/campd",
+    "args": ["mcp"],
+    "env": { "CAMP_DB": "/home/mooma-0750/Documents/git-cloned/camp/data/camp.sqlite" }
+} } }
+```
+
+道具は7つ、全部読み取り専用: `search_sessions` `get_session` `search_notes` `get_note` `views_list` `view` `usage`。
 
 ## リポジトリの外に置いた設定
 
