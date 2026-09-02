@@ -23,14 +23,15 @@ type Result struct {
 	SessionRuns int
 	SourceFiles int
 	Messages    int
-	Blocks      int      // 検索対象として切り出したブロック
-	Usage       int      // 計上した usage 行（重複除去後の実挿入＋更新回数ではなく、走査で作った行数）
-	Files       int      // ノートに繋いだ「触った」記録
-	Relinked    int      // file-history を発行元のターンに繋ぎ直した件数
-	Reread      int      // (dev,inode,size) の食い違いで世代を進めたファイル
-	Missing     int      // 今回の走査で消えていたファイル（行は残す）
-	Unchanged   int      // 追記が無く、要約を再利用して読み飛ばしたファイル
-	Orphans     []string // 親が見つからず stub に落としたサイドカー候補
+	Blocks      int           // 検索対象として切り出したブロック
+	Usage       int           // 計上した usage 行（重複除去後の実挿入＋更新回数ではなく、走査で作った行数）
+	Files       int           // ノートに繋いだ「触った」記録
+	Relinked    int           // file-history を発行元のターンに繋ぎ直した件数
+	Backups     *BackupResult // file-history の実体の捕獲。走査しなければ nil
+	Reread      int           // (dev,inode,size) の食い違いで世代を進めたファイル
+	Missing     int           // 今回の走査で消えていたファイル（行は残す）
+	Unchanged   int           // 追記が無く、要約を再利用して読み飛ばしたファイル
+	Orphans     []string      // 親が見つからず stub に落としたサイドカー候補
 }
 
 // Ingest は root 以下の会話記録を DB に取り込む。再実行しても重複しない。
@@ -127,6 +128,15 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	} else {
 		res.Relinked = int(n)
 	}
+
+	// 実体の捕獲は取り込みのたびに走らせる。CLI 側の GC と競争しており、
+	// 参照（JSONL）だけ残って中身が消えると復元できない。
+	// 参照の索引を先に作る必要があるので、必ず取り込みのあとに置く。
+	b, err := CaptureBackups(db, DefaultFileHistoryDir(root))
+	if err != nil {
+		return nil, err
+	}
+	res.Backups = b
 
 	// 追記が1行も無ければ集計は変わらない。ポーリングで回すので、
 	// 何も起きていないときのコストをゼロに寄せる。

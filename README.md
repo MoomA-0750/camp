@@ -8,7 +8,7 @@ Claude Codeのセッションと会話履歴をCLI側の都合から独立して
 
 ## ステータス
 
-Phase 0 実装中（M0〜M8 完了）。2026-09-01にリポジトリ作成。
+Phase 0 実装中（M0〜M9 完了）。2026-09-01にリポジトリ作成。
 
 2026-09-01に4方向の評価（取り込み層の実証・プロトコルの実証・Obsidian置き換えの実現可能性・codexによる独立レビュー）を経てフェーズを再構成した。進捗と受け入れ条件は `dev/active/phase0-plan.md`。
 
@@ -34,12 +34,23 @@ $ campd files Human/Projects/ExampleProject.md -summary -n 2
       2026-08-11 05:29 .. 2026-08-12 06:46  [mention edit read backup]
 370パス / 2,414件。大文字小文字は畳まない（改名の前後で別物として残る）
 
+$ campd capture    # file-history の実体（編集前の中身）を退避する。取り込みでも自動で走る
+走査 809個 / 新規 809個（15.5MiB）/ 保管 4.7MiB（同じ中身で済んだ 58個）
+
+$ campd backup Obsidian-vault/Human/Projects/ExampleProject.md -n 2
+   400  2026-08-07 01:30  v5   279.4KiB  …/Obsidian-vault/Human/Projects/ExampleProject.md
+        session 7c876746  （会話の題名）
+   399  2026-08-06 12:34  v4   277.5KiB  …/Obsidian-vault/Human/Projects/ExampleProject.md
+$ campd backup -show 400 | wc -l
+3627
+このディレクトリ（小文字v）はもう存在しない。中身が残っているのは Camp だけ
+
 $ campd backfill   # 派生テーブルを messages から作り直す（ディスクは読まない）
 ```
 
 | Phase | 内容 | 状態 |
 |---|---|---|
-| 0 | 取り込み・SQLite・**日本語対応**全文検索・最小UI | M0〜M8 完了（M9以降 実装中） |
+| 0 | 取り込み・SQLite・**日本語対応**全文検索・最小UI | M0〜M9 完了（M10以降 実装中） |
 | 1 | Vault読み取り＋ノート↔セッション相互リンク | 未着手 |
 | 2 | ビュー機構の読み取り側＋LLM文脈コンパイラ＋**MCPサーバー公開** | 未着手 |
 | 3 | セッション駆動（`claude -p` 双方向stream-json＋承認UI） | 未着手 |

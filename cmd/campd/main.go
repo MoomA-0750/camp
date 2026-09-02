@@ -54,6 +54,10 @@ func run(args []string) error {
 		return cmdThread(rest)
 	case "files":
 		return cmdFiles(rest)
+	case "capture":
+		return cmdCapture(rest)
+	case "backup":
+		return cmdBackup(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -76,6 +80,8 @@ usage:
   campd search  QUERY     全文検索（日本語は2文字から引ける）
   campd thread  SESSION   会話を木に組み立てて形を見る
   campd files   [PATH]    ノートを触ったターンを引く（-session でセッション側から）
+  campd capture [-dir D]  file-history の実体（編集前の中身）を DB に取り込む
+  campd backup  [PATH]    捕獲したバックアップを一覧する（-show ID で中身を出す）
 `)
 }
 
@@ -180,6 +186,10 @@ func cmdIngest(args []string) error {
 	if res.Missing > 0 {
 		fmt.Printf("消えていた     %d（行は残す）\n", res.Missing)
 	}
+	if b := res.Backups; b != nil {
+		fmt.Printf("実体の捕獲      %d 個（新規 %d・既知 %d）%s\n",
+			b.Scanned, b.Captured, b.Known, missingNote(b.Missing))
+	}
 	fmt.Printf("読み飛ばし      %d ファイル（追記なし）\n", res.Unchanged)
 	fmt.Printf("所要            %s\n", time.Since(started).Round(time.Millisecond))
 	return nil
@@ -217,8 +227,14 @@ func cmdBackfill(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ファイル結合    %d 件\n所要            %s\n",
-		links, time.Since(started).Round(time.Millisecond))
+	fmt.Printf("ファイル結合    %d 件\n", links)
+
+	meta, err := ingest.BackfillBackupMeta(db)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("バックアップ    %d 行の素性を作り直した（中身には触らない）\n所要            %s\n",
+		meta, time.Since(started).Round(time.Millisecond))
 	return nil
 }
 
@@ -537,4 +553,119 @@ func parseAround(fs *flag.FlagSet, args []string) ([]string, error) {
 		positional = append(positional, args[0])
 		args = args[1:]
 	}
+}
+
+// missingNote は「実体が消えた」件数を添える。0 なら何も言わない。
+func missingNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("／実体が消えた %d 個（中身は保持）", n)
+}
+
+func cmdCapture(args []string) error {
+	fs := flag.NewFlagSet("capture", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	dir := fs.String("dir", ingest.DefaultFileHistoryDir(defaultClaudeProjects()),
+		"~/.claude/file-history 相当のディレクトリ")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Migrate(); err != nil {
+		return err
+	}
+
+	started := time.Now()
+	r, err := ingest.CaptureBackups(db, *dir)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("dir             %s\n走査            %d 個\n新規            %d 個（%s）\n既知            %d 個\n",
+		r.Dir, r.Scanned, r.Captured, humanBytes(r.Bytes), r.Known)
+	fmt.Printf("保管            %s（同じ中身で済んだ %d 個）\n", humanBytes(r.Stored), r.Deduped)
+	if r.Orphans > 0 {
+		fmt.Printf("参照なし        %d 個（中身だけ残す）\n", r.Orphans)
+	}
+	if r.Missing > 0 {
+		fmt.Printf("実体が消えた    %d 個（行と中身は残す）\n", r.Missing)
+	}
+	fmt.Printf("所要            %s\n", time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func cmdBackup(args []string) error {
+	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	session := fs.String("session", "", "セッションID（前方一致）で絞る")
+	n := fs.Int("n", 20, "最大件数")
+	show := fs.Int64("show", 0, "この ID の中身を標準出力に出す")
+	rest, err := parseAround(fs, args)
+	if err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if *show > 0 {
+		b, body, err := files.BackupContent(db, *show)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "# %s\n# %s v%d  session %s  %d bytes%s\n",
+			b.AbsPath, short(b.At), b.Version, b.SessionID[:8], b.Size, missingMark(b.Missing))
+		_, err = os.Stdout.Write(body)
+		return err
+	}
+
+	path := ""
+	if len(rest) > 0 {
+		path = rest[0]
+	}
+	rows, err := files.Backups(db, files.Opts{Path: path, Session: *session, Limit: *n})
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("該当なし")
+		return nil
+	}
+	for _, b := range rows {
+		name := b.RelPath
+		if name == "" {
+			name = b.AbsPath
+		}
+		if name == "" {
+			name = "(パス不明: " + b.Name + ")"
+		}
+		fmt.Printf("%6d  %s  v%-3d %8s  %s%s\n",
+			b.ID, short(b.At), b.Version, humanBytes(b.Size), name, missingMark(b.Missing))
+		fmt.Printf("        session %s  %s\n", b.SessionID[:8], b.Title)
+	}
+	return nil
+}
+
+// missingMark は実体が消えている行に印を付ける。Camp にしか無い中身の目印。
+func missingMark(missingAt string) string {
+	if missingAt == "" {
+		return ""
+	}
+	return "  [実体は消滅 " + short(missingAt) + "]"
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%dB", n)
 }

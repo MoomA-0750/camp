@@ -2,7 +2,7 @@
 
 2026-09-01の実証（`dev/active/review-ingest.md`）を反映した確定版。**当初案は複数の点で壊れていた**ので、根拠は必ずそちらを参照すること。
 
-## 設計を決めた12の事実
+## 設計を決めた13の事実
 
 | # | 事実 | 帰結 |
 |---|---|---|
@@ -16,8 +16,9 @@
 | 8 | **`toolUseResult` と `attachment` は形が一定しない。** オブジェクト・文字列・配列のいずれもある（厳密な型で受けると実コーパスで26行が落ちた） | `json.RawMessage` で受けて遅延デコードする |
 | 9 | **run とセッションは多対多。** `--resume` は1セッションに多runを、`/clear` は1runに多セッションを作る（実測: run `bf4ff50f` が6日間で8セッションを生成） | `runs.session_id` を持たせず `session_runs` で対応を張る（D-012） |
 | 10 | **会話行が無いファイルは2種類ある。** 他ファイルから run として参照されるサイドカー（14件）と、参照もされない「起動しただけ」（9件）。後者は remote-control を開いて何も送らなかった痕跡 | `role` を5種にし、`sessions.conversation_count` で一覧から外せるようにする |
-| 12 | **`file-history-delta` は、それを出したアシスタント行より「先」に書かれる。** 403件中372件（あとに来るのは31件だけ）。自分の `uuid` も `sessionId` も持たず `messageId` で相手を指す | 取り込みの最中には繋ぎ先が存在しない。読み終えてから繋ぎ直す（D-017） |
 | 11 | **同じ `api_message_id` の行は usage が同一とは限らない。** ストリーミングの途中経過が並ぶため、出力側だけが伸びる（実測: 7,101 id 中48件。入力側が食い違う id はゼロ、時刻順で減る箇所もゼロ） | 「最初の1行を採る」は使えない。列ごとに `max` を取る（D-013） |
+| 12 | **`file-history-delta` は、それを出したアシスタント行より「先」に書かれる。** 403件中372件（あとに来るのは31件だけ）。自分の `uuid` も `sessionId` も持たず `messageId` で相手を指す | 取り込みの最中には繋ぎ先が存在しない。読み終えてから繋ぎ直す（D-017） |
+| 13 | **`file-history` の実体はディスクにしか無く、名前はセッションを跨いで衝突する。** 809個のブロブに対して `<hash>@v<N>` は618種（ハッシュはパスから作られるため、同じファイルを複数セッションが触れば必ずぶつかる）。しかも `backupFileName` は version 1 が `delta`、version 2 以上が `snapshot` にしか出ない | 保管の同一性は **`(session_id, backup_name)`**。片方の記録だけ読むと809個中637個の素性が付かない（D-018） |
 
 ## 全文検索は日本語で無言に失敗する（重要）
 
@@ -256,6 +257,34 @@ CREATE TABLE session_files (
 CREATE INDEX ix_sfiles_path    ON session_files(abs_path, at DESC);
 CREATE INDEX ix_sfiles_session ON session_files(session_id, at DESC);
 
+-- ── file-history の実体 ─────────────────────────────────────────────────────
+-- CLI がいずれ捨てるバックアップの中身そのもの。捨てられたあとも読めること。
+CREATE TABLE blobs (
+  sha256    TEXT PRIMARY KEY,             -- 展開後の中身のハッシュ。codec に依らない
+  size      INTEGER NOT NULL,             -- 展開後のバイト数
+  codec     TEXT NOT NULL,                -- raw|gzip。縮まなければ raw で置く
+  content   BLOB NOT NULL,
+  stored_at TEXT NOT NULL
+);
+
+CREATE TABLE file_backups (
+  id          INTEGER PRIMARY KEY,
+  session_id  TEXT NOT NULL REFERENCES sessions(id),
+  backup_name TEXT NOT NULL,              -- <hash>@v<N>。セッションを跨ぐと衝突する
+  version     INTEGER,
+  abs_path    TEXT,                       -- 参照が無いブロブは NULL（origin='orphan'）
+  rel_path    TEXT,
+  backup_time TEXT,
+  sha256      TEXT NOT NULL REFERENCES blobs(sha256),
+  origin      TEXT NOT NULL,              -- delta|snapshot|orphan
+  captured_at TEXT NOT NULL,
+  missing_at  TEXT,                       -- 実体が消えたのを見つけた時刻。行は消さない
+  UNIQUE(session_id, backup_name)
+);
+CREATE INDEX ix_fbk_path ON file_backups(abs_path, backup_time DESC);
+CREATE INDEX ix_fbk_sess ON file_backups(session_id, backup_time DESC);
+CREATE INDEX ix_fbk_sha  ON file_backups(sha256);
+
 -- ── Vault ───────────────────────────────────────────────────────────────────
 CREATE TABLE notes (
   id       INTEGER PRIMARY KEY,
@@ -355,3 +384,5 @@ CREATE TABLE usage_windows (
     - **`Obsidian-Vault` と `Obsidian-vault` は別物として残す。** 小文字v は 2026-08-09〜08-10 の6セッションで使われ、いまディレクトリは存在しない（改名された）。名前だけ同じノートが5つある。畳むと「触っていない側を触ったことにする」（D-016）
     - **`file-history-snapshot` は使わない。** 展開すると4,754行になるが新しいパスは1つも増えない（286パスは370に完全に含まれる）。version 2以上の `backupFileName` を持つのはこちらだけなので M9 では読む
 17. **`file-history` の繋ぎ先は取り込みの最後に1本の UPDATE で入れる。** その場で引くと372件が繋がらず、`backfill` と結果が食い違う。いったん `file-history` 行自身を指しておき、`LinkFileHistory` が繋ぎ直す。繋ぎ直したあとの指し先は `assistant` なので二度目以降は1行も動かない（D-017）
+18. **`file-history` の実体は取り込みのたびに捕獲する。** 参照（JSONL）は永久に持てるが中身はディスクにしかなく、CLI がいずれ GC する。保管の鍵は `(session_id, backup_name)`。名前は809個中618種しか無くセッションを跨いで衝突するので、名前を鍵にすると素性が混ざり、片方が消えても気付けない。素性は `delta`（version 1、172個・92パス）と `snapshot`（version 2以上、637個・283パス）の**両方**から採る。片方では足りない（D-018）
+19. **中身は内容でアドレスし、縮んだときだけ圧縮する。** `blobs.sha256` は展開後の中身のハッシュなので `codec` に依らない。実測809個15.5MiBが、重複除去（751本）と gzip で 4.7MiB。小さいファイルは gzip ヘッダのぶん太るので、縮まなかったものは `raw` のまま入れる。実体が消えた行には `missing_at` を立てるだけで、行も中身も消さない
