@@ -1,13 +1,25 @@
-import { useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { api, type Message } from '../api'
 import { Empty, Failed, Loading, bytes, num, short, useAsync } from '../ui'
 
 export default function SessionDetail() {
   const { id = '' } = useParams()
-  const [after, setAfter] = useState(0)
+  // 読んでいる位置も「制御行を出すか」も URL に置く。リロードで消えず、
+  // その場所をそのまま人に渡せる。
+  const [sp, setSp] = useSearchParams()
+  const after = Number(sp.get('after') ?? 0)
+  const all = sp.get('all') === '1'
+  const set = (patch: Record<string, string>) => {
+    const next = new URLSearchParams(sp)
+    for (const [k, v] of Object.entries(patch)) {
+      if (v) next.set(k, v)
+      else next.delete(k)
+    }
+    setSp(next)
+  }
+
   const meta = useAsync(() => api.session(id), [id])
-  const body = useAsync(() => api.messages(id, after, 120), [id, after])
+  const body = useAsync(() => api.messages(id, after, 120, all), [id, after, all])
   const touched = useAsync(() => api.files({ session: id, limit: 40 }), [id])
   const backups = useAsync(() => api.backups({ session: id, limit: 40 }), [id])
 
@@ -24,7 +36,7 @@ export default function SessionDetail() {
         {s.git_branch ? ` · ${s.git_branch}` : ''}
         <br />
         {short(s.started_at)} 〜 {short(s.updated_at)} ·{' '}
-        {num(s.conversation)} 往復 / {num(s.messages)} 行
+        {num(s.conversation)} 往復 / {num(s.messages)} 行（うち制御行 {num(s.messages - s.conversation)}）
         {s.cost_usd ? ` · $${s.cost_usd.toFixed(2)}` : ''}
         {s.model ? ` · ${s.model}` : ''}
       </p>
@@ -63,6 +75,14 @@ export default function SessionDetail() {
         </details>
       )}
 
+      <form className="filters" onSubmit={(e) => e.preventDefault()}>
+        <label>
+          <input type="checkbox" checked={all}
+                 onChange={(e) => set({ all: e.target.checked ? '1' : '', after: '' })} />
+          {' '}制御行も出す（mode・permission-mode・bridge-session など）
+        </label>
+      </form>
+
       {body.loading && <Loading />}
       {body.error && <Failed error={body.error} />}
       {body.data && body.data.messages.length === 0 && <Empty>この先に本文は無い</Empty>}
@@ -73,10 +93,11 @@ export default function SessionDetail() {
 
       <div className="pager">
         {after > 0 && (
-          <button className="btn" onClick={() => setAfter(0)}>先頭へ</button>
+          <button className="btn" onClick={() => set({ after: '' })}>先頭へ</button>
         )}
         {body.data && body.data.messages.length >= 120 && (
-          <button className="btn" onClick={() => setAfter(body.data!.next_after)}>続き</button>
+          <button className="btn"
+                  onClick={() => set({ after: String(body.data!.next_after) })}>続き</button>
         )}
         <Link to="/sessions">一覧へ戻る</Link>
       </div>
@@ -94,6 +115,13 @@ function Turn({ m }: { m: Message }) {
         <span>{short(m.timestamp)}</span>
         {m.model && <span className="mono">{m.model}</span>}
       </div>
+      {!m.blocks?.length && (
+        // 索引に本文が残っていない行。実測（session 77a524b0）で 271件あり、
+        // すべて署名だけの thinking だった。コーパス全体では assistant 3,114件・
+        // user 157件（後者は本文の無い tool_result）。空行を並べると
+        // 「表示が壊れている」ようにしか見えないので、そうと書く。
+        <p className="muted">（索引に本文が残っていない行）</p>
+      )}
       {m.blocks?.map((b, i) => {
         const label = b.tool_name ? `${b.kind} · ${b.tool_name}` : b.kind
         if (b.kind === 'text') return <pre key={i}>{b.text}</pre>

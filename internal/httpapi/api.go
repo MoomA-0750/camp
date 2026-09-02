@@ -86,7 +86,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	rows, err := query.Messages(s.db, r.PathValue("id"),
-		int64(atoi(q.Get("after"))), atoi(q.Get("limit")))
+		int64(atoi(q.Get("after"))), atoi(q.Get("limit")), q.Get("all") == "1")
 	if err != nil {
 		s.fail(w, r, http.StatusInternalServerError, err.Error())
 		return

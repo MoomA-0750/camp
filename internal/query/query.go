@@ -208,17 +208,29 @@ type Block struct {
 
 // Messages はセッションの本文を、ファイル内の並び順で返す。
 // after は前ページ最後の messages.id。
-func Messages(db *store.DB, sessionID string, after int64, limit int) ([]Message, error) {
+//
+// all が false のときは会話行（user / assistant）だけを返す。既定をこちらに
+// するのは、実データでは制御行のほうが多いため。実測（session 77a524b0）:
+// 2,825行のうち 1,505行が mode / permission-mode / bridge-session /
+// last-prompt / ai-title などで、既定で全部出すと会話が埋もれて読めない。
+// 判定は sessions.conversation_count と同じにする。ヘッダの数と中身が
+// 食い違うと、どちらが嘘なのか分からなくなる。
+func Messages(db *store.DB, sessionID string, after int64, limit int, all bool) ([]Message, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
+	}
+	everything := 0
+	if all {
+		everything = 1
 	}
 	rows, err := db.Query(`
 		select m.id, coalesce(m.uuid, ''), coalesce(m.parent_uuid, ''), m.type,
 		       coalesce(m.role, ''), coalesce(m.timestamp, ''), coalesce(m.model, '')
 		  from messages m
 		 where m.session_id = ? and m.id > ?
+		   and (? = 1 or m.type in ('user','assistant'))
 		 order by m.source_file_id, m.byte_offset
-		 limit ?`, sessionID, after, limit)
+		 limit ?`, sessionID, after, everything, limit)
 	if err != nil {
 		return nil, err
 	}

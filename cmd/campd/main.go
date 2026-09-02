@@ -72,6 +72,8 @@ func run(args []string) error {
 		return cmdServe(rest)
 	case "passwd":
 		return cmdPasswd(rest)
+	case "login-url":
+		return cmdLoginURL(rest)
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -99,6 +101,7 @@ usage:
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
   campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
+  campd login-url         使い捨てのログインURLを1本出す（開発中の入口）
 `)
 }
 
@@ -915,4 +918,31 @@ func defaultAddr() string {
 		return a
 	}
 	return "127.0.0.1:8785"
+}
+
+func cmdLoginURL(args []string) error {
+	fs := flag.NewFlagSet("login-url", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	base := fs.String("base", "http://"+defaultAddr(), "サーバーのベースURL")
+	ttl := fs.Duration("ttl", httpapi.LoginTokenTTL, "有効時間")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Migrate(); err != nil {
+		return err
+	}
+
+	tok, exp, err := httpapi.MintLoginToken(db, *ttl)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s/login?t=%s\n", strings.TrimRight(*base, "/"), tok)
+	fmt.Fprintf(os.Stderr, "1回だけ使える。%s まで（%s）。\n",
+		exp.Local().Format("15:04:05"), *ttl)
+	return nil
 }

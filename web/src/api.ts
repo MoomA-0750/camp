@@ -80,9 +80,12 @@ export const api = {
 
   session: (id: string) => fetchJSON<Session>(`/api/sessions/${encodeURIComponent(id)}`),
 
-  messages: (id: string, after = 0, limit = 100) =>
+  // all=1 で制御行（mode / permission-mode / bridge-session など）も出す。
+  // 既定は会話行だけ。実データでは制御行のほうが多い。
+  messages: (id: string, after = 0, limit = 100, all = false) =>
     fetchJSON<{ messages: Message[]; next_after: number }>(
-      `/api/sessions/${encodeURIComponent(id)}/messages` + qs({ after, limit })),
+      `/api/sessions/${encodeURIComponent(id)}/messages` +
+        qs({ after, limit, all: all ? '1' : '' })),
 
   search: (q: string, o: { kind?: string; session?: string; limit?: number } = {}) =>
     fetchJSON<Hit[]>('/api/search' + qs({ q, ...o })),

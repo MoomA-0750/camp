@@ -127,6 +127,25 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.handleLogin(w, r)
 		return
 	case r.URL.Path == "/login" && isSafeMethod(r.Method):
+		// 使い捨てトークン付きなら、そのまま認証済みにして中へ入れる。
+		// campd login-url が発行する開発中の入口（パスワードは通らない）。
+		if t := r.URL.Query().Get("t"); t != "" {
+			if !redeemLoginToken(s.db, t) {
+				s.log.Warn("使い捨てトークンが通らない", "remote", r.RemoteAddr)
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+			tok, exp, err := newSession(s.db, r)
+			if err != nil {
+				s.fail(w, r, http.StatusInternalServerError, err.Error())
+				return
+			}
+			s.setCookie(w, tok, exp)
+			s.log.Info("使い捨てトークンでログイン", "remote", r.RemoteAddr)
+			// トークンを URL から落とすため、素の / へ送り直す。
+			http.Redirect(w, r, "/", http.StatusFound)
+			return
+		}
 		s.writeHTML(w, s.login)
 		return
 	}

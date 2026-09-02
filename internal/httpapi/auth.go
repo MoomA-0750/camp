@@ -260,3 +260,52 @@ func HasPassword(db *store.DB) bool {
 	}
 	return n > 0
 }
+
+// LoginTokenTTL は使い捨てトークンの既定の寿命。
+// URL に載る以上ブラウザの履歴に残るので、短くして1回で殺す。
+const LoginTokenTTL = 2 * time.Minute
+
+// MintLoginToken は使い捨てのログイン用トークンを1つ作る。
+//
+// 開発中に、パスワードを打たずにブラウザを認証済みにするための入口。
+// 発行できるのは DB に書ける者だけで、その者はもう全部読めるので、
+// これで新しく手に入るものは無い。
+func MintLoginToken(db *store.DB, ttl time.Duration) (string, time.Time, error) {
+	if ttl <= 0 {
+		ttl = LoginTokenTTL
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", time.Time{}, err
+	}
+	tok := base64.RawURLEncoding.EncodeToString(raw)
+	now := time.Now().UTC()
+	exp := now.Add(ttl)
+	if _, err := db.Exec(`
+		insert into auth_login_tokens(token_hash, created_at, expires_at)
+		values(?,?,?)`, hashToken(tok), now.Format(time.RFC3339), exp.Format(time.RFC3339)); err != nil {
+		return "", time.Time{}, err
+	}
+	// 期限切れは溜めない。
+	db.Exec(`delete from auth_login_tokens where expires_at < ?`, nowRFC3339())
+	return tok, exp, nil
+}
+
+// redeemLoginToken は使い捨てトークンを1回だけ通す。
+//
+// 「未使用かつ期限内」の行に印を付ける UPDATE 1本で判定する。
+// 読んでから書くと、同じトークンで2回入れる隙間ができる。
+func redeemLoginToken(db *store.DB, tok string) bool {
+	if tok == "" {
+		return false
+	}
+	r, err := db.Exec(`
+		update auth_login_tokens set used_at = ?
+		 where token_hash = ? and used_at is null and expires_at >= ?`,
+		nowRFC3339(), hashToken(tok), nowRFC3339())
+	if err != nil {
+		return false
+	}
+	n, _ := r.RowsAffected()
+	return n > 0
+}

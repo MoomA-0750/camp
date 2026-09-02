@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MoomA-0750/camp/internal/store"
 )
@@ -325,3 +326,82 @@ type jar struct{ m map[string][]*http.Cookie }
 
 func (j *jar) SetCookies(u *url.URL, cs []*http.Cookie) { j.m[u.Host] = cs }
 func (j *jar) Cookies(u *url.URL) []*http.Cookie        { return j.m[u.Host] }
+
+// 使い捨てトークンは1回だけ通る。開発中の入口だが、二度使えたら
+// 「URL を知っている者が何度でも入れる」ことになり、パスワードを
+// 置いた意味が消える。
+func TestLoginTokenIsSingleUse(t *testing.T) {
+	ts, db := newServer(t)
+	tok, _, err := MintLoginToken(db, LoginTokenTTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &http.Client{Jar: mustJar(), CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	res, err := c.Get(ts.URL + "/login?t=" + url.QueryEscape(tok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusFound || res.Header.Get("Location") != "/" {
+		t.Fatalf("1回目が %d → %q", res.StatusCode, res.Header.Get("Location"))
+	}
+	// Cookie が入って、認証を通る。
+	res, _ = c.Get(ts.URL + "/api/me")
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("トークンで入れていない: %d", res.StatusCode)
+	}
+
+	// 2回目は通らない。別のクライアントで試す。
+	c2 := &http.Client{Jar: mustJar(), CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	res, _ = c2.Get(ts.URL + "/login?t=" + url.QueryEscape(tok))
+	res.Body.Close()
+	if res.Header.Get("Location") != "/login" {
+		t.Fatalf("2回目が通ってしまった: %d → %q", res.StatusCode, res.Header.Get("Location"))
+	}
+	res, _ = c2.Get(ts.URL + "/api/me")
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("2回目のクライアントが入れてしまった: %d", res.StatusCode)
+	}
+}
+
+// 期限切れは通らない。
+func TestLoginTokenExpires(t *testing.T) {
+	ts, db := newServer(t)
+	tok, _, err := MintLoginToken(db, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 期限は秒精度（RFC3339）なので、確実に過去にしてから試す。
+	if _, err := db.Exec(`update auth_login_tokens set expires_at = '2020-01-01T00:00:00Z'`); err != nil {
+		t.Fatal(err)
+	}
+	c := bare()
+	res, _ := c.Get(ts.URL + "/login?t=" + url.QueryEscape(tok))
+	res.Body.Close()
+	if res.Header.Get("Location") != "/login" {
+		t.Fatalf("期限切れが通った: %d → %q", res.StatusCode, res.Header.Get("Location"))
+	}
+}
+
+// でたらめなトークンは通らない。
+func TestBogusLoginTokenIsRejected(t *testing.T) {
+	ts, _ := newServer(t)
+	c := bare()
+	res, _ := c.Get(ts.URL + "/login?t=" + url.QueryEscape("でたらめ"))
+	res.Body.Close()
+	if res.Header.Get("Location") != "/login" {
+		t.Fatalf("通ってしまった: %d → %q", res.StatusCode, res.Header.Get("Location"))
+	}
+}
+
+func mustJar() http.CookieJar {
+	j, _ := newJar()
+	return j
+}
