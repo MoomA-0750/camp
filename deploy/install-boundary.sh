@@ -48,11 +48,13 @@ install -o root -g root -m 0755 "$REPO/campd" /usr/local/bin/campd
 echo "  /usr/local/bin/campd（$HUMAN からは差し替えられない）"
 
 echo "== 4. 読み取りだけを与える =="
-# 既定ACLなので、Claude Code が新しく作る 0600 のファイルにも自動で乗る。
+# **既定ACLは使わない。** Claude Code は記録を 0600 で直接作るので、
+# 既定ACLは mask に潰されて効かない（#effective:---）。しかも既定ACLを置くと
+# group:: が入り、あとから mask を直したときにグループへ権限が広がる。実測済み。
+# 代わりに、人間の権限で定期的に付け直す（camp-acl.timer）。
 for d in "/home/$HUMAN/.claude/projects" "/home/$HUMAN/.claude/file-history" "$VAULT"; do
 	[ -d "$d" ] || { echo "  飛ばす（無い）: $d"; continue; }
-	setfacl -R  -m u:camp:rX "$d"
-	setfacl -R -d -m u:camp:rX "$d"
+	setfacl -R -m u:camp:rX "$d"
 	echo "  読み取りACL: $d"
 done
 # 途中のディレクトリを通り抜けられるように x だけ足す。中身は見せない。
@@ -64,6 +66,13 @@ install -o root -g root -m 0644 "$REPO/deploy/camp.service" /etc/systemd/system/
 install -o root -g root -m 0644 "$REPO/deploy/camp-ingest.service" /etc/systemd/system/
 install -o root -g root -m 0644 "$REPO/deploy/camp-ingest.timer" /etc/systemd/system/
 systemctl daemon-reload
+
+# ACL を配り直すのは**人間の権限**でなければできない（持ち主だけが setfacl できる）。
+# だから system 側ではなく user 側の unit として入れる。
+UD="/home/$HUMAN/.config/systemd/user"
+install -d -o "$HUMAN" -g "$HUMAN" -m 0755 "$UD"
+install -o "$HUMAN" -g "$HUMAN" -m 0644 "$REPO/deploy/camp-acl.service" "$UD/"
+install -o "$HUMAN" -g "$HUMAN" -m 0644 "$REPO/deploy/camp-acl.timer" "$UD/"
 echo "  入れた。まだ起動していない（DB を移してから）"
 
 cat <<'NEXT'
@@ -75,10 +84,14 @@ cat <<'NEXT'
   sudo install -o camp -g camp -m 0600 data/camp.sqlite /var/lib/camp/camp.sqlite
   sudo -u camp /usr/local/bin/campd doctor -db /var/lib/camp/camp.sqlite -fix
   sudo systemctl enable --now camp.service camp-ingest.timer
+  systemctl --user daemon-reload
+  systemctl --user enable --now camp-acl.timer   # ← sudo を付けない
 
 確かめること:
 
   cat /var/lib/camp/camp.sqlite            # Permission denied になる
   echo x >> /usr/local/bin/campd           # Permission denied になる
-  campd report -action test.boundary       # 通る（追記だけ）
+  campd report -action test.boundary       # 通る（追記だけ。要 再ログイン）
+  sudo -u camp /usr/local/bin/campd doctor -db /var/lib/camp/camp.sqlite
+                                           # 「DB の見え方 … 境界 済」になる
 NEXT

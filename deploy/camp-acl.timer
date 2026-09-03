@@ -1,0 +1,10 @@
+[Unit]
+Description=Camp — 新しい会話記録を camp から読めるようにする
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

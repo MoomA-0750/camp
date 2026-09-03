@@ -1,0 +1,19 @@
+[Unit]
+Description=Camp — camp ユーザーへ読み取りACLを配り直す
+
+# なぜ定期実行が要るか:
+#
+# Claude Code は会話記録を **0600 で直接作る**。POSIX ACL の「既定ACL」は
+# ファイル作成時の mode でマスクされるので、0600 で作られたファイルでは
+# mask が --- になり、`u:camp:r` は #effective:--- になって効かない（実測）。
+# しかも既定ACLを置くと `group::r-x` が入り、あとから mask を直したときに
+# **グループにまで権限が広がる**。だから既定ACLは使わない。
+#
+# 代わりに、持ち主（人間）の権限で再帰的に付け直す。0600 のファイルに
+# `-m u:camp:rX` を当てると mask が r-- になり、そこで初めて効く。
+# 922 ファイルで 0.016 秒。
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/setfacl -R -m u:camp:rX %h/.claude/projects
+ExecStart=-/usr/bin/setfacl -R -m u:camp:rX %h/.claude/file-history
+ExecStart=/usr/bin/setfacl -R -m u:camp:rX %h/Documents/git-cloned/Obsidian-Vault
