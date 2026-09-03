@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 
@@ -255,4 +256,87 @@ func BackfillSessionFiles(db *store.DB) (links int, msgs int, err error) {
 		return 0, 0, err
 	}
 	return links, msgs, nil
+}
+
+// RebuildBlocksFor は指定したメッセージの派生ブロックだけを作り直す。
+//
+// `BackfillBlocks` は全件を消して作り直すので、数件を直すために使えない。
+// **FTS は external-content なので、消すときは `delete` に元の値を渡す。**
+// 値がずれると索引が壊れ、doctor の integrity-check（rank=1）が落ちる。
+func RebuildBlocksFor(db *store.DB, ids []int64) (blocks int, err error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	for _, id := range ids {
+		if err := dropBlocksTx(tx, id); err != nil {
+			return 0, err
+		}
+	}
+
+	bw, err := newBlockWriter(tx)
+	if err != nil {
+		return 0, err
+	}
+	defer bw.Close()
+
+	for _, id := range ids {
+		var raw []byte
+		if err := tx.QueryRow(`select raw_json from messages where id = ?`, id).Scan(&raw); err != nil {
+			return 0, err
+		}
+		var l Line
+		if err := json.Unmarshal(raw, &l); err != nil {
+			continue // 壊れた行。messages には残る
+		}
+		n, err := bw.write(id, &l)
+		if err != nil {
+			return 0, err
+		}
+		blocks += n
+	}
+	bw.Close()
+	return blocks, tx.Commit()
+}
+
+// dropBlocksTx は1メッセージのブロックと FTS 索引を対で消す。
+func dropBlocksTx(tx *sql.Tx, messageID int64) error {
+	rows, err := tx.Query(`
+		select id, coalesce(bigrams,'') from message_blocks where message_id = ?`, messageID)
+	if err != nil {
+		return err
+	}
+	type blk struct {
+		id      int64
+		bigrams string
+	}
+	var blks []blk
+	for rows.Next() {
+		var b blk
+		if err := rows.Scan(&b.id, &b.bigrams); err != nil {
+			rows.Close()
+			return err
+		}
+		blks = append(blks, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, b := range blks {
+		if _, err := tx.Exec(
+			`insert into messages_fts(messages_fts, rowid, bigrams) values('delete', ?, ?)`,
+			b.id, b.bigrams); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`delete from message_blocks where id = ?`, b.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }

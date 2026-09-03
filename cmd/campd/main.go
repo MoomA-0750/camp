@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -84,6 +86,8 @@ func run(args []string) error {
 		return cmdSnapshot(rest)
 	case "audit":
 		return cmdAudit(rest)
+	case "redact":
+		return cmdRedact(rest)
 	case "secrets":
 		return cmdSecrets(rest)
 	case "serve":
@@ -127,6 +131,7 @@ usage:
   campd tombstones        消したものの記録を新しい順に並べる
   campd retain            保持の規則を見る・切り替える・当てる（既定は --dry-run）
   campd audit             監査ログを新しい順に読む（-verify で連鎖を確かめる）
+  campd redact            既知の値を標準入力から受け取り、写っている場所を全部伏せる
   campd snapshot -out F   DBの一貫したスナップショットを暗号化して書き出す
   campd snapshot -restore F -out P  スナップショットを戻して doctor まで通す
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
@@ -1710,5 +1715,76 @@ func cmdAudit(args []string) error {
 		}
 	}
 	fmt.Printf("\n%d 件\n", len(rows))
+	return nil
+}
+
+// cmdRedact は既知の値を伏せる。**値は標準入力からだけ受け取り、決して表示しない。**
+//
+// パターンで探す検出器はこのコーパスで偽陽性100%・偽陰性100%だった（D-010）。
+// だから「知っている値で数えて、知っている値だけ伏せる」に限る。
+func cmdRedact(args []string) error {
+	fs := flag.NewFlagSet("redact", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	reason := fs.String("reason", "", "なぜ伏せるか（必須）")
+	apply := fs.Bool("apply", false, "実際に伏せる（既定は見積りだけ）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *apply && *reason == "" {
+		return errors.New("-reason が要る。理由の無い削除は残さない")
+	}
+
+	fmt.Fprintln(os.Stderr, "伏せたい値を標準入力から読む（表示はしない）")
+	secret, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+	secret = bytes.TrimRight(secret, "\r\n")
+	if len(secret) < 4 {
+		return errors.New("短すぎる。関係ない場所まで潰す")
+	}
+	defer wipe(secret)
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	plan, err := retain.FindSecret(db, secret)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(secret)
+	fmt.Printf("照合語: 長さ %d / sha256先頭8 %s\n\n", len(secret), hex.EncodeToString(sum[:])[:8])
+	fmt.Printf("  messages.raw_json            %5d 件\n", len(plan.Messages))
+	fmt.Printf("  message_blocks.text          %5d 件\n", plan.Blocks)
+	fmt.Printf("  message_blocks.bigrams(FTS)  %5d 件\n", plan.Bigrams)
+	fmt.Printf("  blobs.content(展開後)        %5d 件\n", len(plan.Blobs))
+	fmt.Printf("\n  合計 %d 件\n", plan.Total())
+
+	if plan.Total() == 0 {
+		return nil
+	}
+	if !*apply {
+		fmt.Println("\n見積りだけ。実際に伏せるには --apply -reason '…' を付ける。")
+		return nil
+	}
+
+	out, err := retain.Secret(db, secret, retain.Op{Reason: *reason, Actor: "campd redact"})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\n伏せた: messages %d / blocks 作り直し %d / blobs %d / %d バイト\n",
+		out.Messages, out.Blocks, out.Blobs, out.BytesRemoved)
+
+	after, err := retain.FindSecret(db, secret)
+	if err != nil {
+		return err
+	}
+	if after.Total() != 0 {
+		return fmt.Errorf("まだ %d 件残っている", after.Total())
+	}
+	fmt.Println("走査し直して 0 件。")
 	return nil
 }
