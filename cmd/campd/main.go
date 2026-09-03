@@ -61,7 +61,11 @@ func run(args []string) error {
 	// 引数で -db を指していない場合だけ見る。空のDBを作って
 	// それについて報告するのを止める（詳しくは checkNotAGhostDB）。
 	if !hasFlag(rest, "-db") {
-		if err := checkNotAGhostDB(cmd, defaultDBPath()); err != nil {
+		sub := ""
+		if len(rest) > 0 {
+			sub = rest[0]
+		}
+		if err := checkNotAGhostDB(cmd, sub, defaultDBPath()); err != nil {
 			return err
 		}
 	}
@@ -573,9 +577,22 @@ const systemDBPath = "/var/lib/camp/camp.sqlite"
 // 中身が無いから ok なのを、中身が正しいから ok と読み違える。
 //
 // 作ってよいのは migrate と passwd だけ。
-func checkNotAGhostDB(cmd, path string) error {
+func checkNotAGhostDB(cmd, sub, path string) error {
 	switch cmd {
+	// 作ってよいもの。
 	case "migrate", "passwd", "version", "help", "":
+		return nil
+	// DB を開かないもの。**止める理由が無い。**
+	case "report", "scan":
+		return nil
+	}
+	// `limits record` は DB を開けなければ自分で報告口へ回す。
+	// `limits show` は DB を読むので止める。
+	if cmd == "limits" && sub == "record" {
+		return nil
+	}
+	// `vault scan` は歩くだけ。`vault index` と `vault ghosts` は DB を使う。
+	if cmd == "vault" && sub == "scan" {
 		return nil
 	}
 	if os.Getenv("CAMP_DB") != "" {
@@ -1105,12 +1122,18 @@ func cmdLimitsRecord(args []string) error {
 		return err
 	}
 
-	// **境界の向こうへは socket で渡す。**
-	// M25.5 で DB は camp のものになったので、statusLine のフック
-	// （人間のユーザーで動く）からは書けない。残量が手に入るのは
-	// プロンプトの描画時だけなので、観測は人間側でしかできない。
-	// DB を開けないときは黙って報告口へ回す。
-	if !canOpen(*dbPath) {
+	// **どこへ渡すかは、この順で決める。**
+	//
+	//  1. -db か CAMP_DB で明示されていれば、そこへ直接書く（開発中の DB 用）
+	//  2. 報告口があれば、そこへ渡す。**常駐している campd が持ち主**なので
+	//     こちらが本番の経路
+	//  3. どちらも無ければ、既定のパスへ直接書く（campd 単体で使う場合）
+	//
+	// 2 を 1 より後に置くのは意図。逆にすると、cwd にたまたま古い
+	// data/camp.sqlite があるだけでそちらへ書き、本番へ届いていないのに
+	// 届いたつもりになる（2026-09-04 に実際に起きた）。
+	explicit := hasFlag(args, "-db") || os.Getenv("CAMP_DB") != ""
+	if limitsTarget(explicit, *sock, *dbPath) == targetSocket {
 		err := reportLimits(*sock, os.Stdin)
 		if err != nil && !*quiet {
 			return err
@@ -2037,4 +2060,38 @@ func reportLimits(sock string, r io.Reader) error {
 		return fmt.Errorf("断られた: %s", rep.Error)
 	}
 	return nil
+}
+
+// socketExists は、そこに socket があるかだけを見る（繋がるかは見ない）。
+func socketExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode()&os.ModeSocket != 0
+}
+
+// 残量をどこへ渡すか。
+const (
+	targetDB     = "db"
+	targetSocket = "socket"
+)
+
+// limitsTarget は渡し先を決める。**この順序が肝。**
+//
+//  1. 明示された DB があれば、そこへ直接（開発中の DB 用）
+//  2. 報告口があれば、そこへ。常駐している campd が DB の持ち主
+//  3. どちらも無ければ既定のパスへ直接（campd 単体で使う場合）
+//
+// 2 を 1 より後に置くのは意図。逆にすると、cwd にたまたま古い
+// data/camp.sqlite があるだけでそちらへ書き、**本番へ届いていないのに
+// 届いたつもりになる**（2026-09-04 に実際に起きた）。
+func limitsTarget(explicit bool, sock, dbPath string) string {
+	if explicit {
+		return targetDB
+	}
+	if sock != "" && socketExists(sock) {
+		return targetSocket
+	}
+	if !canOpen(dbPath) {
+		return targetSocket
+	}
+	return targetDB
 }
