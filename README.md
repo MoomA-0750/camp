@@ -138,6 +138,38 @@ fi
 
 statusLine を使っていない場合は `campd limits record` に同じ形の JSON を stdin で渡せばよい。確認は `campd limits show`。
 
+## 権限の境界（M25.5）
+
+Camp が世話をするエージェントは、人間のユーザーで動き、環境を自由に横断する。
+**そこは縛らない。**縛るのは Camp のほう。
+
+| | 誰のもの | エージェントから |
+|---|---|---|
+| `/var/lib/camp/camp.sqlite` | `camp` (0600、置き場 0700) | 読めない・書けない |
+| `/usr/local/bin/campd` | `root` (0755) | 差し替えられない |
+| `~/.claude/projects`・Vault | 人間のもの | **今までどおり**。camp には既定ACLで読み取りだけ |
+| `/run/camp/report.sock` | `camp:campreport` (0660) | **追記だけできる** |
+
+入れ方は `deploy/install-boundary.sh`（root で1回）。unit は `deploy/` の3本。
+`campd doctor` の「DB の見え方」が、境界が入っているかを毎回言う。
+
+**何が守られるか**: すでに書かれた監査ログを書き換えられない。DB そのものを読めない。
+
+**何は守られないか**: エージェントは報告をやめられる（launcher は同じユーザーで動く）。
+守れるのは過去の記録であって、これからの網羅性ではない。
+人間は `sudo` で全部触れる——それは意図どおり。
+**`campd` に NOPASSWD の sudoers 規則は置かない。** 置いた瞬間、エージェントも同じ力を得る。
+
+### 境界の外から記録を残す
+
+```
+$ campd report -action session.start -target /home/mooma-0750/proj
+記録した  id=42
+```
+
+`actor` を名乗る欄は無い。campd が `SO_PEERCRED` で呼び出し元を確かめて書く。
+読み出しも更新も削除も、この口には**命令そのものが無い**。
+
 ## 退避先（バックアップ）
 
 **稼働中のDBは平文のまま。** SQLCipher は systemd 常駐と相性が悪く、再起動のたびに

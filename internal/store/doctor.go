@@ -6,8 +6,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/user"
+	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -34,6 +37,13 @@ func (db *DB) Doctor() ([]Check, error) {
 
 	ver, err := db.Version()
 	add("sqlite", err, ver)
+
+	// **境界が実際に効いているか。**
+	// M25.5 で campd を専用ユーザーへ移した。設定を忘れても気づけるように、
+	// DB そのものの見え方をここで見る。全会話履歴・Vault索引・伏字化前の
+	// バックアップが、他のユーザーから読めてはいけない。
+	fexErr, fexDetail := db.fileExposure()
+	add("DB の見え方", fexErr, fexDetail)
 
 	var jm string
 	err = db.QueryRow("PRAGMA journal_mode").Scan(&jm)
@@ -441,4 +451,50 @@ func (db *DB) AuditChain() (int, error) {
 		prev = hash
 	}
 	return n, rows.Err()
+}
+
+// fileExposure は DB ファイルとその置き場が、持ち主以外から見えるかを調べる。
+//
+// M25.5 の権限境界は「エージェントと同じユーザーからは届かない」ことで成り立つ。
+// その前提が崩れていたら、ここで言う。
+func (db *DB) fileExposure() (error, string) {
+	fi, err := os.Stat(db.Path)
+	if err != nil {
+		return err, ""
+	}
+	dir := filepath.Dir(db.Path)
+	di, err := os.Stat(dir)
+	if err != nil {
+		return err, ""
+	}
+
+	owner, uid := "?", uint32(0)
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		uid = st.Uid
+		owner = fmt.Sprint(uid)
+		if u, err := user.LookupId(owner); err == nil {
+			owner = u.Username
+		}
+	}
+	// **持ち主が通常のログインアカウントなら、境界はまだ入っていない。**
+	// M25.5 の後は専用のシステムユーザー（uid < 1000）のものになる。
+	// エージェントは人間のユーザーで動くので、そこが同じである限り
+	// DB も監査ログも触れる。
+	boundary := "境界 済（専用ユーザーのもの）"
+	if uid >= 1000 {
+		boundary = "境界 未（ログインユーザーのもの。エージェントから届く）"
+	}
+	detail := fmt.Sprintf("%s / ファイル %04o / 置き場 %04o / %s",
+		owner, fi.Mode().Perm(), di.Mode().Perm(), boundary)
+
+	// **落とすのはファイルの mode だけ。** 置き場が 0755 でも、ファイルが
+	// 0600 なら中身は読めない（辿れて名前が見えるだけ）。置き場の緩さは
+	// 念のため書き添えるにとどめる。
+	if di.Mode().Perm()&0o007 != 0 {
+		detail += "（置き場は誰でも辿れる）"
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("中身が持ち主以外から読める。%s", detail), detail
+	}
+	return nil, detail
 }
