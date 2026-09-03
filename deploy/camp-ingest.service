@@ -1,0 +1,20 @@
+[Unit]
+Description=Camp — 会話記録の取り込み
+After=camp.service
+
+[Service]
+Type=oneshot
+User=camp
+Group=camp
+ExecStart=/usr/local/bin/campd ingest
+ExecStart=/usr/local/bin/campd capture
+Environment=CAMP_DB=/var/lib/camp/camp.sqlite
+Environment=CAMP_CLAUDE_PROJECTS=/home/mooma-0750/.claude/projects
+StateDirectory=camp
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/camp
+UMask=0077

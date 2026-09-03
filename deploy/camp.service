@@ -1,0 +1,50 @@
+[Unit]
+Description=Camp — 会話記録とVaultの保持・検索
+Documentation=file:/home/mooma-0750/Documents/git-cloned/camp/README.md
+After=network.target
+
+[Service]
+Type=simple
+User=camp
+Group=camp
+
+# 実体は root のもの。**エージェントと同じユーザーからは差し替えられない。**
+# リポジトリ内の ./campd を指してはいけない（そこは書き換えられる）。
+ExecStart=/usr/local/bin/campd serve
+
+# DB は camp のもの。0700 のディレクトリに置く。
+Environment=CAMP_DB=/var/lib/camp/camp.sqlite
+Environment=CAMP_ADDR=127.0.0.1:8785
+# 読むだけ。ACL で camp に読み取りを与えてある。
+Environment=CAMP_CLAUDE_PROJECTS=/home/mooma-0750/.claude/projects
+Environment=CAMP_VAULT=/home/mooma-0750/Documents/git-cloned/Obsidian-Vault
+Environment=CAMP_REPORT_GROUP=campreport
+
+# /run/camp を作る。ここに追記専用の報告口が開く。
+RuntimeDirectory=camp
+RuntimeDirectoryMode=0750
+StateDirectory=camp
+StateDirectoryMode=0700
+
+# 触る必要のないものは触れなくしておく。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/camp
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+UMask=0077
+
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

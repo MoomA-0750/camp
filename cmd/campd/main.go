@@ -7,10 +7,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,6 +29,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/mcp"
+	"github.com/MoomA-0750/camp/internal/report"
 	"github.com/MoomA-0750/camp/internal/retain"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
@@ -86,6 +89,8 @@ func run(args []string) error {
 		return cmdSnapshot(rest)
 	case "audit":
 		return cmdAudit(rest)
+	case "report":
+		return cmdReport(rest)
 	case "redact":
 		return cmdRedact(rest)
 	case "secrets":
@@ -131,6 +136,7 @@ usage:
   campd tombstones        消したものの記録を新しい順に並べる
   campd retain            保持の規則を見る・切り替える・当てる（既定は --dry-run）
   campd audit             監査ログを新しい順に読む（-verify で連鎖を確かめる）
+  campd report -action A  境界の外から監査ログへ1行だけ足す（DBには触らない）
   campd redact            既知の値を標準入力から受け取り、写っている場所を全部伏せる
   campd snapshot -out F   DBの一貫したスナップショットを暗号化して書き出す
   campd snapshot -restore F -out P  スナップショットを戻して doctor まで通す
@@ -912,6 +918,8 @@ func cmdServe(args []string) error {
 	web := fs.String("web", "", "フロントのビルド成果物のディレクトリ（空なら組み込みの仮の殻）")
 	origins := fs.String("origin", "", "追加で許すオリジン（カンマ区切り）")
 	secure := fs.Bool("secure-cookie", false, "Cookie に Secure を付ける（TLS 終端の後ろに置くとき）")
+	sock := fs.String("report-sock", defaultReportSock(), "追記専用の報告口（空なら開かない）")
+	sockGroup := fs.String("report-group", os.Getenv("CAMP_REPORT_GROUP"), "報告口を持たせるグループ（空なら変えない）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -952,6 +960,19 @@ func cmdServe(args []string) error {
 	}
 	fmt.Printf("db      %s\naddr    http://%s\n画面    %s\n認証    必須（/healthz を除く全経路）\n",
 		*dbPath, *addr, srv.Source())
+
+	// **境界の外から監査ログへ追記するためだけの口。**
+	// Phase 3 のセッションは人間と同じユーザーで動き、DB には触れない。
+	// 触れないまま「何をしたか」を残せるように、追記だけを受ける。
+	if *sock != "" {
+		rl, err := report.Listen(db, *sock, *sockGroup)
+		if err != nil {
+			return fmt.Errorf("報告口を開けない: %w", err)
+		}
+		defer rl.Close()
+		go rl.Serve()
+		fmt.Printf("報告口    %s（追記だけ。読み出しも書き換えも命令が無い）\n", rl.Addr())
+	}
 
 	// Ctrl-C で受け付けをやめ、走っている要求を待つ。
 	stop := make(chan os.Signal, 1)
@@ -1823,5 +1844,81 @@ func cmdRedact(args []string) error {
 		return fmt.Errorf("まだ %d 件残っている", n)
 	}
 	fmt.Println("全表・全列を走査し直して 0 件。")
+	return nil
+}
+
+// defaultReportSock は追記専用の報告口の場所。
+//
+// 常駐させるときは systemd の RuntimeDirectory=camp が /run/camp を作る。
+// 手元で動かすときは XDG_RUNTIME_DIR の下。無ければ開かない。
+func defaultReportSock() string {
+	if p := os.Getenv("CAMP_REPORT_SOCK"); p != "" {
+		return p
+	}
+	if fi, err := os.Stat("/run/camp"); err == nil && fi.IsDir() {
+		return "/run/camp/report.sock"
+	}
+	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
+		return filepath.Join(d, "camp-report.sock")
+	}
+	return ""
+}
+
+// cmdReport は境界の外から監査ログへ1行追記する。**DB は開かない。**
+//
+// これが campd と同じ権限を要らない唯一の書き込み経路。Phase 3 の launcher は
+// これ（か同じ socket）を使う。名乗る欄が無いのは意図で、actor は campd が
+// カーネルに聞いて決める。
+func cmdReport(args []string) error {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	sock := fs.String("sock", defaultReportSock(), "報告口のパス")
+	action := fs.String("action", "", "何をしたか（必須）")
+	target := fs.String("target", "", "対象")
+	session := fs.String("session", "", "セッションID")
+	outcome := fs.String("outcome", "ok", "ok / denied / error / timeout")
+	detail := fs.String("detail", "", "詳細（自由文）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *action == "" {
+		return fmt.Errorf("-action が要る")
+	}
+	if *sock == "" {
+		return fmt.Errorf("報告口が見つからない。-sock で指定する")
+	}
+
+	ev := map[string]any{
+		"action": *action, "target": *target,
+		"session": *session, "outcome": *outcome,
+	}
+	if *detail != "" {
+		ev["detail"] = *detail
+	}
+	body, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+
+	c, err := net.DialTimeout("unix", *sock, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("報告口へ繋がらない: %w", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := c.Write(append(body, '\n')); err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(c)
+	if !sc.Scan() {
+		return fmt.Errorf("返事が無い")
+	}
+	var r report.Reply
+	if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+		return fmt.Errorf("返事を読めない: %s", sc.Text())
+	}
+	if !r.OK {
+		return fmt.Errorf("断られた: %s", r.Error)
+	}
+	fmt.Printf("記録した  id=%d\n", r.ID)
 	return nil
 }

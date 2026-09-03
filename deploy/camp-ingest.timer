@@ -1,0 +1,10 @@
+[Unit]
+Description=Camp — 定期的に会話記録を取り込む
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
