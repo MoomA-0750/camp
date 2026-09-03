@@ -22,6 +22,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/mcp"
+	"github.com/MoomA-0750/camp/internal/retain"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
 	"github.com/MoomA-0750/camp/internal/store"
@@ -73,6 +74,8 @@ func run(args []string) error {
 		return cmdBackup(rest)
 	case "tombstones":
 		return cmdTombstones(rest)
+	case "retain":
+		return cmdRetain(rest)
 	case "secrets":
 		return cmdSecrets(rest)
 	case "serve":
@@ -114,6 +117,7 @@ usage:
   campd capture [-dir D]  file-history の実体（編集前の中身）を DB に取り込む
   campd backup  [PATH]    捕獲したバックアップを一覧する（-show ID で中身を出す）
   campd tombstones        消したものの記録を新しい順に並べる
+  campd retain            保持の規則を見る・切り替える・当てる（既定は --dry-run）
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
   campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
@@ -1417,5 +1421,116 @@ func cmdTombstones(args []string) error {
 		return nil
 	}
 	fmt.Printf("\n%d 件 / 合計 %d バイト\n", count, total)
+	return nil
+}
+
+// cmdRetain は保持の規則を扱う。**既定は何もしない。**
+//
+// 引数なしで叩くと規則の一覧と見積りだけを出す。実際に落とすのは
+// --apply を明示したときだけで、そのときも Plan が返したものしか触らない。
+func cmdRetain(args []string) error {
+	fs := flag.NewFlagSet("retain", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	apply := fs.Bool("apply", false, "実際に落とす（既定は見積りだけ）")
+	enable := fs.String("enable", "", "規則を有効にする（名前で指定）")
+	disable := fs.String("disable", "", "規則を無効にする（名前で指定）")
+	includeUnrecoverable := fs.Bool("include-unrecoverable", false,
+		"元ファイルが消えていて戻せない行も対象にする")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if *enable != "" {
+		if err := retain.SetEnabled(db, *enable, true); err != nil {
+			return err
+		}
+		fmt.Printf("有効にした: %s\n", *enable)
+	}
+	if *disable != "" {
+		if err := retain.SetEnabled(db, *disable, false); err != nil {
+			return err
+		}
+		fmt.Printf("無効にした: %s\n", *disable)
+	}
+
+	pols, err := retain.Policies(db, false)
+	if err != nil {
+		return err
+	}
+	fmt.Println("規則:")
+	for _, p := range pols {
+		mark := "  "
+		if p.Enabled {
+			mark = "on"
+		}
+		fmt.Printf("  [%s] %-24s %s\n", mark, p.Name, p.Kind)
+		if p.Note != "" {
+			fmt.Printf("       %s\n", p.Note)
+		}
+	}
+
+	plan, err := retain.Plan(db, *includeUnrecoverable)
+	if err != nil {
+		return err
+	}
+	if len(plan) == 0 {
+		fmt.Println("\n対象なし。有効な規則が無いか、落とせるものが無い。")
+		return nil
+	}
+
+	var bytes int64
+	sessions := map[string]int{}
+	unrecoverable := 0
+	for _, r := range plan {
+		bytes += int64(r.Bytes)
+		sessions[r.SessionID]++
+		if !r.Recoverable {
+			unrecoverable++
+		}
+	}
+	fmt.Printf("\n対象 %d 行 / %d バイト / %d セッション\n", len(plan), bytes, len(sessions))
+	if unrecoverable > 0 {
+		fmt.Printf("  うち %d 行は元ファイルが無く、戻せない\n", unrecoverable)
+	}
+
+	// 対象の多いセッションを上から少しだけ。全部並べても読めない。
+	type sc struct {
+		id string
+		n  int
+	}
+	var top []sc
+	for id, n := range sessions {
+		top = append(top, sc{id, n})
+	}
+	sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
+	if len(top) > 5 {
+		top = top[:5]
+	}
+	for _, t := range top {
+		fmt.Printf("  %s  %d 行\n", t.id, t.n)
+	}
+
+	if !*apply {
+		fmt.Println("\n見積りだけ。実際に落とすには --apply を付ける。")
+		return nil
+	}
+
+	out, err := retain.Apply(db, plan, "campd retain")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\n落とした: %d 行 / %d バイト", out.Messages, out.BytesRemoved)
+	if out.Unrecoverable > 0 {
+		fmt.Printf("（うち戻せない %d 行）", out.Unrecoverable)
+	}
+	fmt.Println()
+	if int64(len(plan)) != int64(out.Messages) {
+		return fmt.Errorf("見積り %d 行に対して実際は %d 行。食い違っている", len(plan), out.Messages)
+	}
 	return nil
 }

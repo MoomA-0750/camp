@@ -19,6 +19,8 @@ const (
 	KindRawJSON = "message.raw_json"
 	KindBlocks  = "message_blocks"
 	KindBlob    = "blob"
+	// KindTrim は行を残したまま、読めない部分だけを落としたとき。
+	KindTrim = "message.trim"
 )
 
 // Op は削除1件の指示。
