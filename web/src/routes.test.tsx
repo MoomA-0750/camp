@@ -7,6 +7,7 @@ import Sessions from './pages/Sessions'
 import SessionDetail from './pages/SessionDetail'
 import Search from './pages/Search'
 import Usage from './pages/Usage'
+import Audit from './pages/Audit'
 
 // API は返した URL をそのまま覚えるだけの偽物にする。
 // 「画面が何を引きに行ったか」＝「URL が状態になっているか」を見る。
@@ -34,6 +35,7 @@ function app() {
       <Route path="/sessions/:id" element={<SessionDetail />} />
       <Route path="/search" element={<Search />} />
       <Route path="/usage" element={<Usage />} />
+      <Route path="/audit" element={<Audit />} />
       <Route path="*" element={<p>そのページは無い</p>} />
     </Routes>
   )
@@ -165,4 +167,26 @@ test('消した行は「ここに何かあったが消した」と出る', async
   expect(screen.getByText(/平文の認証情報が写っていた/)).toBeTruthy()
   // 消した行に「本文が残っていない」を重ねて出さない。出すと理由が埋もれる。
   expect(screen.getAllByText(/索引に本文が残っていない行/).length).toBe(1)
+})
+
+// 受け入れ（M24）: 監査ログが画面から時系列で読めること。
+test('監査ログが画面から読める', async () => {
+  stubFetch((url) => {
+    if (url.startsWith('/api/audit')) {
+      return { audit: [
+        { id: 3, at: '2026-09-03T10:00:00Z', actor: 'user', action: 'tool.deny',
+          target: 'rm -rf /', outcome: 'denied', hash: 'c' },
+        { id: 2, at: '2026-09-03T09:00:00Z', actor: 'user', action: 'tool.approve',
+          target: 'ls -la', outcome: 'ok', hash: 'b' },
+      ], next_before: 2 }
+    }
+    return []
+  })
+  render(<MemoryRouter initialEntries={['/audit']}>{app()}</MemoryRouter>)
+
+  await waitFor(() => expect(screen.getByText('tool.deny')).toBeTruthy())
+  expect(screen.getByText('tool.approve')).toBeTruthy()
+  expect(screen.getByText('denied')).toBeTruthy()
+  // 拒否や失敗は目に付く形にする。
+  expect(document.querySelectorAll('tr.notable').length).toBe(1)
 })

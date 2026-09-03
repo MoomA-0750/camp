@@ -4,8 +4,11 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/MoomA-0750/camp/internal/audit"
 	"github.com/MoomA-0750/camp/internal/store"
 )
 
@@ -145,6 +148,18 @@ func Apply(db *store.DB, plan []PlanRow, actor string) (Outcome, error) {
 	}
 	rules := allRules(pols)
 	now := time.Now().UTC().Format(time.RFC3339)
+
+	// **消したことは監査ログにも残す。** tombstones は「何が消えたか」の記録で、
+	// 監査ログは「誰がいつ何をしたか」の記録。役目が違うので両方に残す。
+	if _, err := audit.Append(db, audit.Entry{
+		Actor:   actor,
+		Action:  "retain.apply",
+		Target:  fmt.Sprintf("%d 行", len(plan)),
+		Detail:  detailOf(plan),
+		Outcome: audit.OK,
+	}); err != nil {
+		return out, err
+	}
 
 	for _, p := range plan {
 		var raw []byte
@@ -343,4 +358,24 @@ func reanchorFindings(tx *sql.Tx, messageID int64, cuts []Cut) (struct{ moved, l
 		n.moved++
 	}
 	return n, nil
+}
+
+// detailOf は監査ログに残す要約。**中身は入れない。**
+func detailOf(plan []PlanRow) string {
+	var bytes int64
+	unrec := 0
+	pol := map[string]int{}
+	for _, r := range plan {
+		bytes += int64(r.Bytes)
+		pol[r.Policy]++
+		if !r.Recoverable {
+			unrec++
+		}
+	}
+	names := make([]string, 0, len(pol))
+	for k, n := range pol {
+		names = append(names, fmt.Sprintf("%s:%d", k, n))
+	}
+	sort.Strings(names)
+	return fmt.Sprintf("%d バイト / 戻せない %d 行 / %s", bytes, unrec, strings.Join(names, " "))
 }

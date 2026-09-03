@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/MoomA-0750/camp/internal/audit"
 	"github.com/MoomA-0750/camp/internal/files"
 	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/query"
@@ -44,8 +45,32 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/notes/{id}/sessions", s.handleNoteSessions)
 	m.HandleFunc("GET /api/vault/ghosts", s.handleGhosts)
 	m.HandleFunc("GET /api/vault/issues", s.handleIssues)
+	m.HandleFunc("GET /api/audit", s.handleAudit)
 	m.HandleFunc("GET /api/views", s.handleViews)
 	m.HandleFunc("GET /api/views/{id...}", s.handleView)
+}
+
+// handleAudit は監査ログを新しい順に返す。
+//
+// **読むだけ。書く口はここに置かない。** 監査ログは Camp 自身が
+// 何をしたかの記録で、外から足せるようにすると記録の意味が薄れる。
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rows, err := audit.List(s.db, audit.Opts{
+		Session: q.Get("session"),
+		Action:  q.Get("action"),
+		Limit:   atoi(q.Get("limit")),
+		Before:  int64(atoi(q.Get("before"))),
+	})
+	if err != nil {
+		s.fail(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	next := int64(0)
+	if len(rows) > 0 {
+		next = rows[len(rows)-1].ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"audit": rows, "next_before": next})
 }
 
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {

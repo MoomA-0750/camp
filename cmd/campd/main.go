@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MoomA-0750/camp/internal/audit"
 	"github.com/MoomA-0750/camp/internal/files"
 	"github.com/MoomA-0750/camp/internal/httpapi"
 	"github.com/MoomA-0750/camp/internal/ingest"
@@ -81,6 +82,8 @@ func run(args []string) error {
 		return cmdRetain(rest)
 	case "snapshot":
 		return cmdSnapshot(rest)
+	case "audit":
+		return cmdAudit(rest)
 	case "secrets":
 		return cmdSecrets(rest)
 	case "serve":
@@ -123,6 +126,7 @@ usage:
   campd backup  [PATH]    捕獲したバックアップを一覧する（-show ID で中身を出す）
   campd tombstones        消したものの記録を新しい順に並べる
   campd retain            保持の規則を見る・切り替える・当てる（既定は --dry-run）
+  campd audit             監査ログを新しい順に読む（-verify で連鎖を確かめる）
   campd snapshot -out F   DBの一貫したスナップショットを暗号化して書き出す
   campd snapshot -restore F -out P  スナップショットを戻して doctor まで通す
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
@@ -1604,6 +1608,17 @@ func cmdSnapshot(args []string) error {
 	}
 	defer db.Close()
 	info, err := snapshot.Create(db, *out, key)
+	outcome := audit.OK
+	if err != nil {
+		outcome = audit.Error
+	}
+	// 退避先を作ったことも記録する。**持ち出しは監査の対象。**
+	if _, aerr := audit.Append(db, audit.Entry{
+		Actor: "campd snapshot", Action: "snapshot.create", Target: *out,
+		Detail: fmt.Sprintf("sha256 %s", info.SHA256), Outcome: outcome,
+	}); aerr != nil {
+		return aerr
+	}
 	if err != nil {
 		return err
 	}
@@ -1638,4 +1653,62 @@ func wipe(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// cmdAudit は監査ログを読む。**足す口はここに置かない。**
+func cmdAudit(args []string) error {
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	session := fs.String("session", "", "セッションIDで絞る")
+	action := fs.String("action", "", "action で絞る")
+	n := fs.Int("n", 50, "最大件数")
+	verify := fs.Bool("verify", false, "連鎖をたどって抜けと書き換えを探す")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if *verify {
+		have, err := audit.TriggersInPlace(db)
+		if err != nil {
+			return err
+		}
+		if miss := audit.Missing(have); len(miss) > 0 {
+			fmt.Printf("FAIL  トリガが外れている: %s\n", strings.Join(miss, ", "))
+		} else {
+			fmt.Println("ok    追記専用のトリガはある")
+		}
+		checked, err := audit.Verify(db)
+		if err != nil {
+			fmt.Printf("FAIL  連鎖: %v（%d 行まで確かめた）\n", err, checked)
+			return errors.New("監査ログが書き換わっている")
+		}
+		fmt.Printf("ok    連鎖: %d 行が繋がっている\n", checked)
+		return nil
+	}
+
+	rows, err := audit.List(db, audit.Opts{Session: *session, Action: *action, Limit: *n})
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("まだ何も記録されていない")
+		return nil
+	}
+	for _, e := range rows {
+		mark := " "
+		if e.Outcome != audit.OK {
+			mark = "!"
+		}
+		fmt.Printf("%s %s  %-14s %-18s %s\n", mark, e.At, e.Actor, e.Action, e.Target)
+		if e.SessionID != "" {
+			fmt.Printf("    session %s  → %s\n", e.SessionID, e.Outcome)
+		}
+	}
+	fmt.Printf("\n%d 件\n", len(rows))
+	return nil
 }

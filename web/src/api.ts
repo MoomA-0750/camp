@@ -18,6 +18,11 @@ export type Session = {
   messages: number; conversation: number; cost_usd?: number; is_sidechain?: boolean
 }
 
+export type AuditEntry = {
+  id: number; at: string; actor: string; action: string
+  target?: string; session_id?: string; detail?: string
+  outcome: string; hash: string
+}
 export type Block = { kind: string; tool_name?: string; text?: string }
 // 「ここに何かあったが消した」。値は入らない。
 export type Redaction = {
@@ -170,6 +175,14 @@ export const api = {
     fetchJSON<Backup[]>('/api/backups' + qs(o)),
 
   vaults: () => fetchJSON<VaultInfo[]>('/api/vaults'),
+
+  audit: (o: { session?: string; action?: string; n?: number } = {}) =>
+    fetchJSON<{ audit: AuditEntry[] }>(
+      '/api/audit?' + new URLSearchParams({
+        ...(o.session ? { session: o.session } : {}),
+        ...(o.action ? { action: o.action } : {}),
+        ...(o.n ? { limit: String(o.n) } : {}),
+      })).then((r) => r.audit),
 
   views: () => fetchJSON<ViewInfo[]>('/api/views'),
   view: (id: string) =>

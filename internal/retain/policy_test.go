@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MoomA-0750/camp/internal/audit"
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/retain"
 	"github.com/MoomA-0750/camp/internal/store"
@@ -358,3 +359,43 @@ func TestFindingsKeepPointingAtTheRightPlace(t *testing.T) {
 
 func indexOf(b []byte, s string) int { return strings.Index(string(b), s) }
 func hasPrefix(s, p string) bool     { return strings.HasPrefix(s, p) }
+
+// 消したことは監査ログにも残る。
+//
+// tombstones は「何が消えたか」、監査ログは「誰がいつ何をしたか」。
+// 役目が違うので両方に残す。**監査ログのほうは後から消せない。**
+func TestApplyIsRecordedInTheAuditLog(t *testing.T) {
+	db, _, _ := seedPolicy(t)
+	enableAll(t, db)
+
+	plan, err := retain.Plan(db, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := retain.Apply(db, plan, "policy_test"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := audit.List(db, audit.Opts{Action: "retain.apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("監査ログに %d 件（1 件を期待）", len(rows))
+	}
+	e := rows[0]
+	if e.Actor != "policy_test" {
+		t.Errorf("誰がやったか残っていない: %q", e.Actor)
+	}
+	if !strings.Contains(e.Detail, "バイト") || !strings.Contains(e.Detail, "戻せない") {
+		t.Errorf("何をしたか分からない: %q", e.Detail)
+	}
+
+	// 消せない。
+	if _, err := db.Exec(`delete from audit where action = 'retain.apply'`); err == nil {
+		t.Error("削除の記録を消せてしまった")
+	}
+	if _, err := audit.Verify(db); err != nil {
+		t.Errorf("連鎖が壊れている: %v", err)
+	}
+}

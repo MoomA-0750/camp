@@ -16,6 +16,8 @@ a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .muted { color: var(--muted); }
 .error { color: #c0392b; }
+/* ok 以外の結果（拒否・失敗・時間切れ）。監査ログで目を引かせる。 */
+.notable td { background: color-mix(in srgb, #c0392b 8%, transparent); }
 .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .92em; }
 
 /* 消した行。空行と紛れないように、地の文とは違う扱いにする。

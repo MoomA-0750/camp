@@ -9,6 +9,7 @@ import Usage from './pages/Usage'
 import Notes from './pages/Notes'
 import NoteDetail from './pages/NoteDetail'
 import VaultHealth from './pages/VaultHealth'
+import Audit from './pages/Audit'
 import Views from './pages/Views'
 import ViewDetail from './pages/ViewDetail'
 import './styles.css'
@@ -39,6 +40,9 @@ function App() {
         <NavLink to="/vault" className={({ isActive }) => (isActive ? 'on' : '')}>
           Vault の点検
         </NavLink>
+        <NavLink to="/audit" className={({ isActive }) => (isActive ? 'on' : '')}>
+          監査ログ
+        </NavLink>
         <div className="spacer" />
         <button onClick={() => void api.logout()}>ログアウト</button>
       </nav>
@@ -54,6 +58,7 @@ function App() {
           <Route path="/views" element={<Views />} />
           <Route path="/views/*" element={<ViewDetail />} />
           <Route path="/vault" element={<VaultHealth />} />
+          <Route path="/audit" element={<Audit />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </main>

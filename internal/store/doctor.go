@@ -1,7 +1,9 @@
 package store
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"sort"
@@ -130,6 +132,23 @@ func (db *DB) Doctor() ([]Check, error) {
 		err = fmt.Errorf("%d 件の所見が raw_json の外を指している", dangling)
 	}
 	add("findings の位置", err, "中身を指している")
+
+	// 監査ログ。追記専用が守られているか、連鎖が切れていないか。
+	//
+	// トリガは DROP TRIGGER で外せる。**止められないので、気づけるようにする。**
+	tr, err := db.AuditTriggers()
+	if err != nil {
+		add("audit 追記専用", err, "")
+	} else {
+		detail := "書き換えも削除も拒む"
+		if len(tr) > 0 {
+			err = fmt.Errorf("トリガが外れている: %s", strings.Join(tr, ", "))
+		}
+		add("audit 追記専用", err, detail)
+	}
+
+	n, err := db.AuditChain()
+	add("audit 連鎖", err, fmt.Sprintf("%d 行が繋がっている", n))
 
 	pv, err := db.ParserVersions()
 	if err != nil {
@@ -343,4 +362,81 @@ func (db *DB) TableCounts() (map[string]int64, error) {
 		out[n] = c
 	}
 	return out, nil
+}
+
+// AuditTriggers は監査ログを守るトリガのうち、外れているものの名前を返す。
+// 空なら全部ある。
+func (db *DB) AuditTriggers() ([]string, error) {
+	rows, err := db.Query(`
+		select name from sqlite_schema
+		 where type='trigger' and tbl_name='audit'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		have[n] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, w := range []string{"audit_no_delete", "audit_no_update"} {
+		if !have[w] {
+			missing = append(missing, w)
+		}
+	}
+	return missing, nil
+}
+
+// AuditChain は監査ログの連鎖をたどり、抜けと書き換えを探す。
+//
+// internal/audit と同じ計算をここに置いているのは、store が audit を
+// 参照すると import が逆流するため。**式を変えるときは両方直す。**
+// audit_test の TestTheDoctorAgreesWithTheAuditPackage が食い違いを見張る。
+func (db *DB) AuditChain() (int, error) {
+	rows, err := db.Query(`
+		select id, at, actor, action, coalesce(target,''), coalesce(session_id,''),
+		       coalesce(detail_json,''), outcome, prev_hash, hash
+		  from audit order by id`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	prev := ""
+	first := true
+	n := 0
+	for rows.Next() {
+		var id int64
+		var at, actor, action, target, session, detail, outcome, gotPrev, hash string
+		if err := rows.Scan(&id, &at, &actor, &action, &target, &session,
+			&detail, &outcome, &gotPrev, &hash); err != nil {
+			return n, err
+		}
+		n++
+		if first && hash == "genesis" {
+			prev, first = hash, false
+			continue
+		}
+		first = false
+		if gotPrev != prev {
+			return n, fmt.Errorf("id=%d で連鎖が切れている。前の行が消されたか差し替えられた", id)
+		}
+		h := sha256.New()
+		for _, f := range []string{prev, at, actor, action, target, session, detail, outcome} {
+			h.Write([]byte(f))
+			h.Write([]byte{0})
+		}
+		if want := hex.EncodeToString(h.Sum(nil)); want != hash {
+			return n, fmt.Errorf("id=%d の中身が書き換わっている", id)
+		}
+		prev = hash
+	}
+	return n, rows.Err()
 }
