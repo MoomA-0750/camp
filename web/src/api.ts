@@ -19,9 +19,14 @@ export type Session = {
 }
 
 export type Block = { kind: string; tool_name?: string; text?: string }
+// 「ここに何かあったが消した」。値は入らない。
+export type Redaction = {
+  at: string; reason: string; actor: string
+  bytes_removed: number; recoverable: boolean
+}
 export type Message = {
   id: number; uuid?: string; parent_uuid?: string; type: string; role?: string
-  timestamp?: string; model?: string; blocks?: Block[]
+  timestamp?: string; model?: string; blocks?: Block[]; redacted?: Redaction
 }
 
 export type Hit = {

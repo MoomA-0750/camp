@@ -71,6 +71,8 @@ func run(args []string) error {
 		return cmdCapture(rest)
 	case "backup":
 		return cmdBackup(rest)
+	case "tombstones":
+		return cmdTombstones(rest)
 	case "secrets":
 		return cmdSecrets(rest)
 	case "serve":
@@ -102,7 +104,7 @@ func usage() {
 usage:
   campd version           バージョンを表示する
   campd migrate [-db P]   スキーマを最新まで適用する（冪等）
-  campd doctor  [-db P]   DB の状態を点検する
+  campd doctor  [-db P]   DB の状態を点検する（-fix で missing_at を直す）
   campd scan    [-root D] 会話記録を読んで実測レポートを出す（DBには書かない）
   campd ingest  [-root D] 会話記録を DB に取り込む（再実行しても重複しない）
   campd backfill [-db P]  messages から派生テーブル（usage・索引・ファイル結合）を作り直す
@@ -111,6 +113,7 @@ usage:
   campd files   [PATH]    ノートを触ったターンを引く（-session でセッション側から）
   campd capture [-dir D]  file-history の実体（編集前の中身）を DB に取り込む
   campd backup  [PATH]    捕獲したバックアップを一覧する（-show ID で中身を出す）
+  campd tombstones        消したものの記録を新しい順に並べる
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
   campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
@@ -444,6 +447,7 @@ func cmdDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
 	verbose := fs.Bool("v", false, "テーブルごとの行数も出す")
+	fix := fs.Bool("fix", false, "実体の消えた元ファイルに missing_at を入れる")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -453,6 +457,14 @@ func cmdDoctor(args []string) error {
 		return err
 	}
 	defer db.Close()
+
+	if *fix {
+		n, err := db.MarkMissingSourceFiles()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("fix   %-24s %d 本に missing_at を入れた\n", "source_files", n)
+	}
 
 	checks, err := db.Doctor()
 	if err != nil {
@@ -1347,4 +1359,63 @@ func cmdMCP(args []string) error {
 
 	// stdout はプロトコル 専用。ログは stderr へ出す。
 	return mcp.New(db, os.Stdin, os.Stdout, Version).Serve()
+}
+
+// cmdTombstones は削除の記録を並べる。**消したことが見えない削除を作らない**ための
+// 表側の口。ここに出ないものは、このリポジトリの削除経路を通っていない。
+func cmdTombstones(args []string) error {
+	fs := flag.NewFlagSet("tombstones", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	n := fs.Int("n", 50, "最大件数")
+	kind := fs.String("kind", "", "kind で絞る（message.raw_json / message_blocks / blob）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`
+		select redacted_at, kind, ref, reason, actor, bytes_removed, recoverable,
+		       coalesce(note,'')
+		  from tombstones
+		 where (? = '' or kind = ?)
+		 order by redacted_at desc, id desc
+		 limit ?`, *kind, *kind, *n)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	count := 0
+	var total int64
+	for rows.Next() {
+		var at, k, ref, reason, actor, note string
+		var bytes int64
+		var recoverable int
+		if err := rows.Scan(&at, &k, &ref, &reason, &actor, &bytes, &recoverable, &note); err != nil {
+			return err
+		}
+		mark := "戻せる  "
+		if recoverable == 0 {
+			mark = "戻せない"
+		}
+		fmt.Printf("%s  %s  %-18s %-10s %8d B  %s\n", at, mark, k, ref, bytes, reason)
+		if note != "" {
+			fmt.Printf("%*s%s\n", 22, "", note)
+		}
+		count++
+		total += bytes
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if count == 0 {
+		fmt.Println("まだ何も消していない")
+		return nil
+	}
+	fmt.Printf("\n%d 件 / 合計 %d バイト\n", count, total)
+	return nil
 }

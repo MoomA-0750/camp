@@ -110,6 +110,34 @@ func resumeSHA(path string, offset int64) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// rotatedFrom は「前回見たファイルと同じ実体か」を決める。
+//
+// **dev（デバイス番号）は見ない。** st_dev はマウントごとにカーネルが振る値で、
+// 再起動や再マウントで変わる。実測（2026-09-03）で、再起動後に dev が 51→35 と
+// 変わっただけで inode も中身も同じ 72 ファイル全部が「別の実体」と判定され、
+// 世代が進んで**コーパス全体が二重に取り込まれた**（33,621行 322MB →
+// 69,630行 529MB）。**再起動のたびにDBが倍になる。**
+//
+// inode だけでは、消して作り直したファイルが同じ番号を再利用したときに
+// 気づけない。そこは resumeSHA（前回の再開点の直前256バイト）が見ている。
+// 中身が違えば必ず食い違うので、identity は inode と中身で足りる。
+func rotatedFrom(prior *Prior, inode, size int64, resume func() string) bool {
+	if prior == nil || prior.Offset <= 0 {
+		return false
+	}
+	switch {
+	case prior.Inode != inode:
+		return true // 別の実体になった
+	case size < prior.Offset:
+		return true // 切り詰められた
+	case resume() != prior.ResumeSHA:
+		// 同じ inode のまま、前より長く書き直された。
+		// size と inode だけ見ていると気づけない。
+		return true
+	}
+	return false
+}
+
 // SummaryVersion は要約キャッシュの世代。パーサを直したら上げる。
 // 上げると保存済みの要約が捨てられ、全ファイルが先頭から読み直される。
 const SummaryVersion = 1
@@ -245,18 +273,10 @@ func summarize(root, path string, d fs.DirEntry, prior *Prior) (*FileSummary, er
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		dev, inode = int64(st.Dev), int64(st.Ino)
 	}
-	rotated := false
+	rotated := rotatedFrom(prior, inode, info.Size(), func() string {
+		return resumeSHA(path, prior.Offset)
+	})
 	if prior != nil && prior.Offset > 0 {
-		switch {
-		case prior.Dev != dev || prior.Inode != inode:
-			rotated = true // 別の実体になった
-		case info.Size() < prior.Offset:
-			rotated = true // 切り詰められた
-		case resumeSHA(path, prior.Offset) != prior.ResumeSHA:
-			// 同じ inode のまま、前より長く書き直された。
-			// size と inode だけ見ていると気づけない。
-			rotated = true
-		}
 		if !rotated && prior.Version == SummaryVersion && len(prior.Summary) > 0 {
 			if err := json.Unmarshal(prior.Summary, f); err == nil {
 				start = prior.Offset
@@ -439,3 +459,10 @@ func (f *FileSummary) Timestamps() (started, updated string) {
 	}
 	return
 }
+
+// ParserVersion は messages から派生行（message_blocks・usage・session_files）を
+// 作るパーサの世代。**抽出の結果が変わる直しをしたら上げる。**
+//
+// 0 は「分からない」を意味する予約値で、M21 より前に取り込んだ行に付く。
+// 上げ忘れるより、上げすぎて作り直すほうが安い。
+const ParserVersion = 1

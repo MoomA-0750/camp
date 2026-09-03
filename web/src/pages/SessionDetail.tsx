@@ -115,7 +115,19 @@ function Turn({ m }: { m: Message }) {
         <span>{short(m.timestamp)}</span>
         {m.model && <span className="mono">{m.model}</span>}
       </div>
-      {!m.blocks?.length && (
+      {m.redacted && (
+        // 消した行。**空行と同じ見た目にしない。**
+        // ブロックが0本の行は他にもあるので（下の「本文が残っていない行」）、
+        // 区別が付かないと「消したことが見えない削除」になる。
+        <p className="redacted">
+          ここに何かあったが消した — {m.redacted.reason}
+          <span className="muted">
+            {' '}（{short(m.redacted.at)} · {m.redacted.actor} · {m.redacted.bytes_removed} バイト
+            {m.redacted.recoverable ? '' : ' · 元ファイルが無く戻せない'}）
+          </span>
+        </p>
+      )}
+      {!m.redacted && !m.blocks?.length && (
         // 索引に本文が残っていない行。実測（session 77a524b0）で 271件あり、
         // すべて署名だけの thinking だった。コーパス全体では assistant 3,114件・
         // user 157件（後者は本文の無い tool_result）。空行を並べると

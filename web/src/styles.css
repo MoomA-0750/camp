@@ -18,6 +18,14 @@ a:hover { text-decoration: underline; }
 .error { color: #c0392b; }
 .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .92em; }
 
+/* 消した行。空行と紛れないように、地の文とは違う扱いにする。
+   けばけばしくはしない——事故ではなく、意図してやった記録なので。 */
+.redacted {
+  margin: .4rem 0; padding: .5rem .7rem;
+  border-left: 3px solid var(--muted); background: var(--soft);
+  border-radius: 0 .35rem .35rem 0;
+}
+
 .app { display: grid; grid-template-columns: 13rem 1fr; min-height: 100dvh; }
 nav {
   border-right: 1px solid var(--line); padding: 1.1rem .9rem; position: sticky; top: 0;

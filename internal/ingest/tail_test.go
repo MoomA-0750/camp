@@ -249,3 +249,76 @@ func TestRewriteLongerSameInodeIsDetected(t *testing.T) {
 		t.Fatalf("source_files が %d 行。2世代であるべき", n)
 	}
 }
+
+// 再起動でデバイス番号が変わっても、同じファイルは同じファイルと見る。
+//
+// st_dev はマウントごとにカーネルが振る値で、再起動や再マウントで変わる。
+// 実測（2026-09-03）で dev が 51→35 と変わっただけで 72 ファイル全部が
+// 「別の実体」と判定され、コーパス全体が二重に取り込まれた
+// （33,621行 322MB → 69,630行 529MB）。**再起動のたびにDBが倍になる。**
+//
+// dev を渡さなくなったことを関数の形で確かめても意味がないので、
+// **DB に残った古い dev を書き換えて、取り込み経路をそのまま通す。**
+func TestDeviceNumberChangeIsNotANewFile(t *testing.T) {
+	db := newTestDB(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "-nonexistent-proj")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	path := filepath.Join(dir, sid+".jsonl")
+	if err := os.WriteFile(path, []byte(convoLines(sid, 0, 5)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Ingest(db, "h", root); err != nil {
+		t.Fatal(err)
+	}
+	before := count(t, db, `select count(*) from messages`)
+	if before == 0 {
+		t.Fatal("前提が崩れている: 何も取り込めていない")
+	}
+
+	// 再起動を再現する。inode も中身もそのまま、dev だけ別の値になる。
+	if _, err := db.Exec(`update source_files set dev = dev + 100`); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Ingest(db, "h", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reread != 0 {
+		t.Errorf("デバイス番号が変わっただけで %d ファイルの世代が進んだ。再起動のたびにDBが倍になる", res.Reread)
+	}
+	if after := count(t, db, `select count(*) from messages`); after != before {
+		t.Errorf("メッセージが %d → %d に増えた（二重取り込み）", before, after)
+	}
+	if n := count(t, db, `select count(*) from source_files where superseded_at is not null`); n != 0 {
+		t.Errorf("%d 本が旧世代に落ちた", n)
+	}
+}
+
+// rotatedFrom は inode と再開点の中身だけで実体の入れ替わりを見る。
+func TestRotationLooksAtInodeAndContent(t *testing.T) {
+	const sha = "0123456789abcdef"
+	prior := &Prior{Offset: 100, Inode: 2152211, ResumeSHA: sha}
+	same := func() string { return sha }
+
+	if rotatedFrom(prior, prior.Inode, 200, same) {
+		t.Error("何も変わっていないのに世代を進めようとしている")
+	}
+	if !rotatedFrom(prior, prior.Inode+1, 200, same) {
+		t.Error("inode が変わったのに同じファイル扱いしている")
+	}
+	// inode を使い回されても、再開点の中身が違えば気づく。
+	if !rotatedFrom(prior, prior.Inode, 200, func() string { return "ちがう" }) {
+		t.Error("中身が入れ替わったのに気づいていない")
+	}
+	if !rotatedFrom(prior, prior.Inode, 50, same) {
+		t.Error("切り詰めに気づいていない")
+	}
+	if rotatedFrom(nil, 1, 200, same) || rotatedFrom(&Prior{}, 1, 200, same) {
+		t.Error("初回なのに世代を進めようとしている")
+	}
+}

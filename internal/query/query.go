@@ -3,6 +3,7 @@
 package query
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/MoomA-0750/camp/internal/store"
@@ -197,6 +198,21 @@ type Message struct {
 	Timestamp string  `json:"timestamp,omitempty"`
 	Model     string  `json:"model,omitempty"`
 	Blocks    []Block `json:"blocks,omitempty"`
+
+	// Redacted は消したメッセージに入る。**空ブロックと区別できるようにする。**
+	// ブロックが0本のメッセージは他にもある（本文が空の thinking など）ので、
+	// 「何も無い」と「あったが消した」を画面で見分けられないと、
+	// 消したことが見えない削除になる。
+	Redacted *Redaction `json:"redacted,omitempty"`
+}
+
+// Redaction は「ここに何かあったが消した」の中身。値は入れない。
+type Redaction struct {
+	At           string `json:"at"`
+	Reason       string `json:"reason"`
+	Actor        string `json:"actor"`
+	BytesRemoved int64  `json:"bytes_removed"`
+	Recoverable  bool   `json:"recoverable"`
 }
 
 // Block は本文のかたまり。索引に入っているものと同じ切り方。
@@ -278,7 +294,45 @@ func Messages(db *store.DB, sessionID string, after int64, limit int, all bool) 
 			out[i].Blocks = append(out[i].Blocks, b)
 		}
 	}
-	return out, brows.Err()
+	if err := brows.Err(); err != nil {
+		return nil, err
+	}
+	brows.Close()
+
+	if err := attachRedactions(db, out, byID, ids); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// attachRedactions は消したメッセージに印を付ける。
+func attachRedactions(db *store.DB, out []Message, byID map[int64]int, ids []any) error {
+	q := `select ref, redacted_at, reason, actor, bytes_removed, recoverable
+	        from tombstones
+	       where kind = 'message.raw_json'
+	         and cast(ref as integer) in (?` + strings.Repeat(",?", len(ids)-1) + `)`
+	rows, err := db.Query(q, ids...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ref string
+		var r Redaction
+		var rec int
+		if err := rows.Scan(&ref, &r.At, &r.Reason, &r.Actor, &r.BytesRemoved, &rec); err != nil {
+			return err
+		}
+		r.Recoverable = rec == 1
+		id, err := strconv.ParseInt(ref, 10, 64)
+		if err != nil {
+			continue
+		}
+		if i, ok := byID[id]; ok {
+			out[i].Redacted = &r
+		}
+	}
+	return rows.Err()
 }
 
 // UsageRow は使用量の1行。by で意味が変わる。

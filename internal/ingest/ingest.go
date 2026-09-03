@@ -31,6 +31,7 @@ type Result struct {
 	Reread      int           // (dev,inode,size) の食い違いで世代を進めたファイル
 	Missing     int           // 今回の走査で消えていたファイル（行は残す）
 	Unchanged   int           // 追記が無く、要約を再利用して読み飛ばしたファイル
+	Suppressed  int           // tombstone があるので取り込まなかった行
 	Orphans     []string      // 親が見つからず stub に落としたサイドカー候補
 }
 
@@ -119,6 +120,7 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 		res.Usage += c.Usage
 		res.Blocks += c.Blocks
 		res.Files += c.Files
+		res.Suppressed += c.Suppressed
 	}
 
 	// file-history はアシスタント行より先に書かれることが多いので、
@@ -606,10 +608,34 @@ func writeRuns(tx *sql.Tx, c *Corpus, fileIDs map[string]int64) (runs, links int
 // writeCounts は writeMessages が書いた派生レコードの数。
 // 派生表を足すたびに戻り値が増えるので、束ねておく。
 type writeCounts struct {
-	Messages int
-	Usage    int
-	Blocks   int
-	Files    int
+	Messages   int
+	Usage      int
+	Blocks     int
+	Files      int
+	Suppressed int // tombstone があるので取り込まなかった行
+}
+
+// suppressedOffsets は、このファイルで「消した」と記録されている位置を返す。
+//
+// tombstone は message_id ではなく (source_file_id, byte_offset) で引く。
+// 行を作り直したら message_id は変わるが、元ファイルの中の位置は変わらないため。
+func suppressedOffsets(db *store.DB, fileID int64) (map[int64]bool, error) {
+	rows, err := db.Query(`
+		select byte_offset from tombstones
+		 where source_file_id = ? and byte_offset is not null`, fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var off int64
+		if err := rows.Scan(&off); err != nil {
+			return nil, err
+		}
+		out[off] = true
+	}
+	return out, rows.Err()
 }
 
 func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}) (writeCounts, error) {
@@ -640,6 +666,16 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		ownRun = f.SessionID
 	}
 
+	// 消した位置は取り込み直さない。
+	//
+	// 通常は ingested_offset より先しか読まないので当たらないが、ファイルが
+	// 作り直された（incarnation が変わった）ときや、offset を戻して読み直した
+	// ときにここが効く。**消したものが黙って戻るのが一番まずい。**
+	suppressed, err := suppressedOffsets(db, fileID)
+	if err != nil {
+		return writeCounts{}, err
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return writeCounts{}, err
@@ -652,8 +688,8 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 			parent_uuid, logical_parent_uuid, type, subtype, role, timestamp,
 			cwd, cli_version, is_sidechain, agent_id, is_meta, is_compact_summary,
 			is_api_error, api_message_id, request_id, model, service_tier, effort,
-			degraded, raw_json)
-		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			degraded, raw_json, parser_version)
+		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(source_file_id, byte_offset) do nothing`)
 	if err != nil {
 		return writeCounts{}, err
@@ -690,6 +726,10 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	// 前回の位置から読む。ファイル全体を読み直して古い行を捨てる書き方だと、
 	// 2行の追記のために165MBを走査することになる。
 	res, walkErr := WalkFileFrom(f.Path, offset, func(l *Line) error {
+		if suppressed[l.Offset] {
+			cnt.Suppressed++
+			return nil
+		}
 		runID := ownRun
 		if l.RunID != "" {
 			runID = l.RunID
@@ -715,7 +755,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 			nz(l.ParentUUID), nz(l.LogicalParentUUID), l.Type, nz(l.Subtype), nz(role), nz(l.Timestamp),
 			nz(l.CWD), nz(l.CLIVersion), b2i(l.IsSidechain), nz(l.AgentID), b2i(l.IsMeta),
 			b2i(l.IsCompactSummary), b2i(l.IsAPIErrorMessage), nz(apiID), nz(l.RequestID),
-			nz(model), nz(tier), nz(l.Effort), b2i(l.Degraded), l.Raw)
+			nz(model), nz(tier), nz(l.Effort), b2i(l.Degraded), l.Raw, ParserVersion)
 		if err != nil {
 			return err
 		}

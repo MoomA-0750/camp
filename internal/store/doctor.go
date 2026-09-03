@@ -1,8 +1,12 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
+	"os"
 	"sort"
+	"strings"
+	"time"
 )
 
 // Check は健全性チェック1件の結果。
@@ -51,8 +55,14 @@ func (db *DB) Doctor() ([]Check, error) {
 	add("fts5", err, "利用可")
 
 	// external-content の索引が本体とずれていないか。
-	_, err = db.Exec(`INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')`)
-	add("messages_fts integrity", err, "整合")
+	//
+	// **rank=1 を渡す。** 引数なしの integrity-check は索引の内部整合しか見ず、
+	// content 表（message_blocks）との突き合わせをしない。実測（2026-09-03）で、
+	// message_blocks から行だけ消しても引数なしは通り、`messages_fts MATCH` は
+	// 消したはずの語を返し続けた。**消したものが検索から引ける状態を通す点検は
+	// 点検ではない。**
+	_, err = db.Exec(`INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`)
+	add("messages_fts integrity", err, "本体と整合")
 
 	rows, err := db.Query("PRAGMA foreign_key_check")
 	if err != nil {
@@ -79,7 +89,209 @@ func (db *DB) Doctor() ([]Check, error) {
 		add("tables", nil, fmt.Sprintf("%d テーブル", len(counts)))
 	}
 
+	// ここから先は「戻せるか」の点検。削除を許す以上、ここが正しくないと
+	// 判断の土台が無い。
+	src, err := db.SourceFileStatus()
+	if err != nil {
+		add("source_files 実体", err, "")
+	} else {
+		detail := fmt.Sprintf("%d 本すべて実在", src.Total)
+		if src.Gone > 0 {
+			detail = fmt.Sprintf("%d 本中 %d 本が実体なし（%d 行 / %s がここにしか無い）",
+				src.Total, src.Gone, src.OrphanMessages, humanBytes(src.OrphanBytes))
+			if src.Stale > 0 {
+				err = fmt.Errorf("%s。うち %d 本は missing_at が NULL のまま（doctor -fix で直す）",
+					detail, src.Stale)
+			}
+		}
+		add("source_files 実体", err, detail)
+	}
+
+	tomb, err := db.TombstoneStatus()
+	if err != nil {
+		add("tombstones", err, "")
+	} else {
+		if tomb.Dangling > 0 {
+			err = fmt.Errorf("tombstone の無い空 raw_json が %d 行", tomb.Dangling)
+		}
+		add("tombstones", err, fmt.Sprintf("%d 件（うち作り直せない削除 %d 件）",
+			tomb.Total, tomb.Unrecoverable))
+	}
+
+	pv, err := db.ParserVersions()
+	if err != nil {
+		add("parser_version", err, "")
+	} else {
+		parts := make([]string, 0, len(pv))
+		for _, v := range sortedKeys(pv) {
+			label := fmt.Sprint(v)
+			if v == 0 {
+				label = "不明"
+			}
+			parts = append(parts, fmt.Sprintf("v%s:%d", label, pv[v]))
+		}
+		add("parser_version", nil, strings.Join(parts, " "))
+	}
+
 	return checks, nil
+}
+
+// SourceFiles は「元ファイルが今もあるか」の点検結果。
+type SourceFiles struct {
+	Total          int   // 現行の source_files
+	Gone           int   // ディスクに実体が無い
+	Stale          int   // 実体が無いのに missing_at が NULL
+	OrphanMessages int   // 実体の無いファイル由来のメッセージ
+	OrphanBytes    int64 // その raw_json の合計
+}
+
+// SourceFileStatus は source_files の実体をディスクと突き合わせる。
+//
+// **列ではなく実体を見る。** missing_at は前回の走査時点の話でしかなく、
+// そのあとに消えたファイルは NULL のまま残る。実測（2026-09-03）で
+// 83本中1本が既に消えていて、DBは83本すべてあると思っていた。
+func (db *DB) SourceFileStatus() (SourceFiles, error) {
+	var out SourceFiles
+	rows, err := db.Query(`
+		select id, path, missing_at from source_files where superseded_at is null`)
+	if err != nil {
+		return out, err
+	}
+	var goneIDs []int64
+	for rows.Next() {
+		var id int64
+		var path string
+		var missing sql.NullString
+		if err := rows.Scan(&id, &path, &missing); err != nil {
+			rows.Close()
+			return out, err
+		}
+		out.Total++
+		if _, err := os.Stat(path); err != nil {
+			out.Gone++
+			goneIDs = append(goneIDs, id)
+			if !missing.Valid {
+				out.Stale++
+			}
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+
+	for _, id := range goneIDs {
+		var n int
+		var b sql.NullInt64
+		if err := db.QueryRow(`
+			select count(*), sum(length(raw_json)) from messages where source_file_id = ?`,
+			id).Scan(&n, &b); err != nil {
+			return out, err
+		}
+		out.OrphanMessages += n
+		out.OrphanBytes += b.Int64
+	}
+	return out, nil
+}
+
+// MarkMissingSourceFiles は実体の無いファイルに missing_at を入れる。
+// 行は消さない（消えたことを知っているのが Camp の値打ちなので）。
+func (db *DB) MarkMissingSourceFiles() (int, error) {
+	rows, err := db.Query(`
+		select id, path from source_files
+		 where superseded_at is null and missing_at is null`)
+	if err != nil {
+		return 0, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		var path string
+		if err := rows.Scan(&id, &path); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if _, err := os.Stat(path); err != nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, id := range ids {
+		if _, err := db.Exec(`update source_files set missing_at = ? where id = ?`, now, id); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
+// Tombstones は削除記録の点検結果。
+type Tombstones struct {
+	Total         int
+	Unrecoverable int
+	Dangling      int // raw_json が空なのに tombstone が無いメッセージ
+}
+
+// TombstoneStatus は「消したのに記録が無い」を探す。
+//
+// 記録の無い削除は、あとから「元から空だったのか消したのか」を区別できない。
+// このパッケージを通さずに raw_json を空にした痕跡がここに出る。
+func (db *DB) TombstoneStatus() (Tombstones, error) {
+	var out Tombstones
+	if err := db.QueryRow(`select count(*), coalesce(sum(1-recoverable),0) from tombstones`).
+		Scan(&out.Total, &out.Unrecoverable); err != nil {
+		return out, err
+	}
+	err := db.QueryRow(`
+		select count(*) from messages m
+		 where length(m.raw_json) = 0
+		   and not exists(select 1 from tombstones t
+		                   where t.kind = 'message.raw_json' and t.ref = cast(m.id as text))`).
+		Scan(&out.Dangling)
+	return out, err
+}
+
+// ParserVersions は派生行を作ったパーサの世代ごとの行数を返す。0 は「不明」。
+func (db *DB) ParserVersions() (map[int]int64, error) {
+	rows, err := db.Query(`select parser_version, count(*) from messages group by 1 order by 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int]int64{}
+	for rows.Next() {
+		var v int
+		var n int64
+		if err := rows.Scan(&v, &n); err != nil {
+			return nil, err
+		}
+		out[v] = n
+	}
+	return out, rows.Err()
+}
+
+func sortedKeys(m map[int]int64) []int {
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
 }
 
 // TableCounts は各テーブルの行数を返す（FTS の内部テーブルは除く）。

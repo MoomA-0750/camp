@@ -140,3 +140,29 @@ test('401 はログイン画面へ送る', async () => {
   render(<MemoryRouter initialEntries={['/usage']}>{app()}</MemoryRouter>)
   await waitFor(() => expect(href.value).toBe('/login'))
 })
+
+// 受け入れ（M21）: 消した行が空行と区別できること。
+//
+// ブロックが0本の行は他にもある（署名だけの thinking など）。同じ見た目に
+// なると「あったが消した」のか「元から無かった」のかが分からなくなり、
+// 消したことが見えない削除になる。
+test('消した行は「ここに何かあったが消した」と出る', async () => {
+  stubFetch((url) => {
+    if (url.startsWith('/api/sessions/abc/messages')) {
+      return { messages: [
+        { id: 1, type: 'user', role: 'user',
+          redacted: { at: '2026-09-03T00:00:00Z', reason: '平文の認証情報が写っていた',
+                      actor: 'campd retain', bytes_removed: 4096, recoverable: true } },
+        { id: 2, type: 'assistant', role: 'assistant' },
+      ], next_after: 2 }
+    }
+    if (url.startsWith('/api/sessions/abc')) return session
+    return []
+  })
+  render(<MemoryRouter initialEntries={['/sessions/abc']}>{app()}</MemoryRouter>)
+
+  await waitFor(() => expect(screen.getByText(/ここに何かあったが消した/)).toBeTruthy())
+  expect(screen.getByText(/平文の認証情報が写っていた/)).toBeTruthy()
+  // 消した行に「本文が残っていない」を重ねて出さない。出すと理由が埋もれる。
+  expect(screen.getAllByText(/索引に本文が残っていない行/).length).toBe(1)
+})
