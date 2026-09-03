@@ -3,13 +3,16 @@ package report_test
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MoomA-0750/camp/internal/audit"
+	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/report"
 	"github.com/MoomA-0750/camp/internal/store"
 )
@@ -199,5 +202,52 @@ func TestTheOutsideCannotFloodOrStuffTheLog(t *testing.T) {
 	}
 	if !refused {
 		t.Error("いくらでも書き込めてしまう")
+	}
+}
+
+// 残量だけは境界を越えられる。**それ以外は越えられない。**
+//
+// プラン残量は statusLine の描画時にしか手に入らず、観測できるのは
+// 人間のユーザー側だけ。M25.5 で DB が camp のものになったので、
+// この1種類だけ socket を通す。
+func TestLimitsCanCrossButNothingElseCan(t *testing.T) {
+	db := newDB(t)
+	l := listen(t, db)
+
+	body := fmt.Sprintf(
+		`{"model":{"display_name":"Opus 5"},"context_window":{"used_percentage":40.0},`+
+			`"rate_limits":{"five_hour":{"used_percentage":37.5,"resets_at":%d},`+
+			`"seven_day":{"used_percentage":12.0,"resets_at":%d}}}`,
+		time.Now().Add(time.Hour).Unix(), time.Now().Add(72*time.Hour).Unix())
+	msg, err := json.Marshal(report.Event{Kind: "limits", Payload: json.RawMessage(body)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := send(t, l, string(msg)); !r.OK {
+		t.Fatalf("残量を渡せない: %s", r.Error)
+	}
+
+	ws, err := limits.Windows(db, limits.Opts{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) == 0 {
+		t.Fatal("記録されていない")
+	}
+
+	// payload だけ渡しても、残量以外の表には何も入らない。
+	send(t, l, `{"kind":"usage","payload":{"x":1}}`)
+	send(t, l, `{"kind":"messages","payload":{"raw_json":"x"}}`)
+	if r := send(t, l, `{"kind":"limits"}`); r.OK {
+		t.Error("payload の無い limits が通った")
+	}
+	for _, tbl := range []string{"messages", "message_blocks", "notes", "tombstones"} {
+		var n int
+		if err := db.QueryRow(`select count(*) from ` + tbl).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("socket 経由で %s が %d 行になった", tbl, n)
+		}
 	}
 }

@@ -57,6 +57,15 @@ func run(args []string) error {
 	}
 
 	cmd, rest := args[0], args[1:]
+
+	// 引数で -db を指していない場合だけ見る。空のDBを作って
+	// それについて報告するのを止める（詳しくは checkNotAGhostDB）。
+	if !hasFlag(rest, "-db") {
+		if err := checkNotAGhostDB(cmd, defaultDBPath()); err != nil {
+			return err
+		}
+	}
+
 	switch cmd {
 	case "version", "--version", "-v":
 		fmt.Println("campd", Version)
@@ -551,6 +560,37 @@ func defaultDBPath() string {
 		return p
 	}
 	return filepath.Join("data", "camp.sqlite")
+}
+
+// systemDBPath は常駐している campd が使う場所。
+const systemDBPath = "/var/lib/camp/camp.sqlite"
+
+// checkNotAGhostDB は、**空のDBを黙って作って、それについて報告する**のを止める。
+//
+// M25.5 で本番の DB は /var/lib/camp へ移った。それでも `campd doctor` を
+// 引数なしで叩くと、リポジトリの data/camp.sqlite が無ければ SQLite が
+// 作ってしまい、空のDBに対する点検結果が「ほぼ ok」で出る（実測 2026-09-04）。
+// 中身が無いから ok なのを、中身が正しいから ok と読み違える。
+//
+// 作ってよいのは migrate と passwd だけ。
+func checkNotAGhostDB(cmd, path string) error {
+	switch cmd {
+	case "migrate", "passwd", "version", "help", "":
+		return nil
+	}
+	if os.Getenv("CAMP_DB") != "" {
+		return nil // 明示的に指した場所なら口を出さない
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	// **`systemDBPath` の有無は確かめない。** 境界が効いていれば、
+	// このプロセス（人間のユーザー）からは置き場を辿れず Stat が失敗する。
+	// 「無い」と「見えない」を区別できないので、どちらの道も出す。
+	return fmt.Errorf(`%s が無い。空のDBを作って点検しても意味が無いので止める
+  常駐しているほうを見るなら: sudo -u camp /usr/local/bin/campd %s -db %s
+  ここに新しく作るなら:       campd migrate -db %s`,
+		path, cmd, systemDBPath, path)
 }
 
 func cmdFiles(args []string) error {
@@ -1060,8 +1100,22 @@ func cmdLimitsRecord(args []string) error {
 	agent := fs.String("agent", limits.AgentClaudeCode, "エージェント識別子")
 	source := fs.String("source", limits.SourceStatusLine, "観測元")
 	quiet := fs.Bool("quiet", true, "何も出力しない（フックからの既定）")
+	sock := fs.String("sock", defaultReportSock(), "DBを開けないときに使う報告口")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// **境界の向こうへは socket で渡す。**
+	// M25.5 で DB は camp のものになったので、statusLine のフック
+	// （人間のユーザーで動く）からは書けない。残量が手に入るのは
+	// プロンプトの描画時だけなので、観測は人間側でしかできない。
+	// DB を開けないときは黙って報告口へ回す。
+	if !canOpen(*dbPath) {
+		err := reportLimits(*sock, os.Stdin)
+		if err != nil && !*quiet {
+			return err
+		}
+		return nil
 	}
 
 	db, err := store.Open(*dbPath)
@@ -1920,5 +1974,67 @@ func cmdReport(args []string) error {
 		return fmt.Errorf("断られた: %s", r.Error)
 	}
 	fmt.Printf("記録した  id=%d\n", r.ID)
+	return nil
+}
+
+// hasFlag は引数に -name / --name / -name=… があるかを見る。
+func hasFlag(args []string, name string) bool {
+	for _, a := range args {
+		if a == name || a == "-"+name ||
+			strings.HasPrefix(a, name+"=") || strings.HasPrefix(a, "-"+name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// canOpen は、そのパスの DB を自分で開いて書けるかを見る。
+// **無ければ「開ける」とは言わない。** 空のDBを作って書き込むのは、
+// 本番へ届いていないのに届いたつもりになる一番まずい形（2026-09-04）。
+func canOpen(path string) bool {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
+
+// reportLimits は statusLine の観測を報告口へ流す。
+func reportLimits(sock string, r io.Reader) error {
+	if sock == "" {
+		return fmt.Errorf("報告口が無い")
+	}
+	body, err := io.ReadAll(io.LimitReader(r, 64*1024))
+	if err != nil {
+		return err
+	}
+	if !json.Valid(body) {
+		return fmt.Errorf("statusLine の JSON が読めない")
+	}
+	msg, err := json.Marshal(report.Event{Kind: "limits", Payload: body})
+	if err != nil {
+		return err
+	}
+	c, err := net.DialTimeout("unix", sock, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(append(msg, '\n')); err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(c)
+	if !sc.Scan() {
+		return fmt.Errorf("返事が無い")
+	}
+	var rep report.Reply
+	if err := json.Unmarshal(sc.Bytes(), &rep); err != nil {
+		return err
+	}
+	if !rep.OK {
+		return fmt.Errorf("断られた: %s", rep.Error)
+	}
 	return nil
 }

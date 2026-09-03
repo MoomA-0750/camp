@@ -166,5 +166,17 @@ func openRealDB(t *testing.T) *store.DB {
 		return nil
 	}
 	t.Cleanup(func() { db.Close() })
+
+	// **ファイルがあることと、中身があることは別。**
+	// M25.5 で本番DBは /var/lib/camp へ移った。リポジトリ側に空の
+	// camp.sqlite が残っていると、Stat は通るのに中身が無く、
+	// この試験が「実データで回らない」ではなく「表が無い」で落ちる。
+	// 空なら実データ扱いしない（＝skip させる）。
+	var n int
+	if err := db.QueryRow(
+		`select count(*) from sqlite_master where type='table' and name='notes'`,
+	).Scan(&n); err != nil || n == 0 {
+		return nil
+	}
 	return db
 }

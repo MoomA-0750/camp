@@ -4,6 +4,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"os"
 
 	_ "modernc.org/sqlite"
 )
@@ -23,7 +24,7 @@ var pragmas = []string{
 	"_pragma=synchronous(NORMAL)",
 }
 
-// Open は path のデータベースを開く。ファイルが無ければ作る。
+// Open は path のデータベースを開く。ファイルが無ければ作る（0600 で）。
 func Open(path string) (*DB, error) {
 	dsn := path
 	for i, p := range pragmas {
@@ -46,6 +47,15 @@ func Open(path string) (*DB, error) {
 	// 書き込みは単一接続に寄せる。SQLite の writer は1つしか居られないので、
 	// プールに複数の writer を持たせても待たされるだけで得がない。
 	sqlDB.SetMaxOpenConns(1)
+
+	// **持ち主以外に見せない。** SQLite は 0644 & ~umask で作る。中身は
+	// 全会話履歴と Vault の索引なので、既定に任せてよいものではない。
+	// -wal / -shm も同じ（本文の断片がそのまま入る）。
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if fi, err := os.Stat(path + suffix); err == nil && fi.Mode().Perm()&0o077 != 0 {
+			os.Chmod(path+suffix, 0o600)
+		}
+	}
 
 	return &DB{DB: sqlDB, Path: path}, nil
 }

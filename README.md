@@ -117,7 +117,7 @@ MCPに登録する（`~/.claude.json` 等）:
 { "mcpServers": { "camp": {
     "command": "/home/mooma-0750/Documents/git-cloned/camp/campd",
     "args": ["mcp"],
-    "env": { "CAMP_DB": "/home/mooma-0750/Documents/git-cloned/camp/data/camp.sqlite" }
+    "env": { "CAMP_DB": "/var/lib/camp/camp.sqlite" }
 } } }
 ```
 
@@ -128,13 +128,19 @@ MCPに登録する（`~/.claude.json` 等）:
 **statusLine のフック。** プラン残量はここでしか手に入らないので、記録は `~/.claude/statusline.sh` に1ブロック足して行う（D-022）。新しいマシンで動かすときは同じものを入れる。既存の statusline がある場合は `input="$(cat)"` の直後に置く。
 
 ```bash
-CAMPD="${CAMP_BIN:-$HOME/Documents/git-cloned/camp/campd}"
+CAMPD="${CAMP_BIN:-/usr/local/bin/campd}"
+[ -x "$CAMPD" ] || CAMPD="$HOME/Documents/git-cloned/camp/campd"
 if [ -x "$CAMPD" ]; then
-  printf '%s' "$input" | CAMP_DB="${CAMP_DB:-$HOME/Documents/git-cloned/camp/data/camp.sqlite}" \
-    "$CAMPD" limits record >/dev/null 2>&1 &
+  printf '%s' "$input" | "$CAMPD" limits record >/dev/null 2>&1 &
   disown 2>/dev/null || true
 fi
 ```
+
+**`CAMP_DB` は指定しない。** M25.5 以降、DB は `camp` ユーザーのもので、
+statusLine のフック（人間のユーザーで動く）からは書けない。`campd limits record` は
+DB を開けないと分かると**黙って報告口へ回す**。残量が手に入るのはプロンプトの
+描画時だけで、それを観測できるのは人間側だけなので、**境界を越えられるのは
+この1種類だけ**にしてある。
 
 statusLine を使っていない場合は `campd limits record` に同じ形の JSON を stdin で渡せばよい。確認は `campd limits show`。
 

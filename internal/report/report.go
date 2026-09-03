@@ -13,7 +13,9 @@ package report
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -25,11 +27,19 @@ import (
 	"time"
 
 	"github.com/MoomA-0750/camp/internal/audit"
+	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/store"
 )
 
 // Event は外から送れるものの全部。**これ以上は送れない。**
 type Event struct {
+	// Kind が "limits" のときだけ Payload を見る（statusLine の JSON を
+	// そのまま渡す）。残量はプロンプトの描画時にしか手に入らず、それを
+	// 観測できるのは人間のユーザー側だけなので、境界を越える必要がある。
+	// **越えられるのはこの1種類だけ。**
+	Kind    string          `json:"kind"`
+	Payload json.RawMessage `json:"payload"`
+
 	Action  string `json:"action"`
 	Target  string `json:"target"`
 	Session string `json:"session"`
@@ -195,6 +205,9 @@ const (
 )
 
 func (l *Listener) append(who string, e Event) (int64, error) {
+	if e.Kind == "limits" {
+		return l.recordLimits(e)
+	}
 	if e.Action == "" {
 		return 0, fmt.Errorf("action が要る")
 	}
@@ -225,6 +238,26 @@ func (l *Listener) append(who string, e Event) (int64, error) {
 		Detail:    e.Detail,
 		Outcome:   outcome,
 	})
+}
+
+// recordLimits は statusLine の観測を取り込む。**書けるのは残量だけ。**
+// 返すのは記録できた窓の数で、DBの中身は返さない。
+func (l *Listener) recordLimits(e Event) (int64, error) {
+	if len(e.Payload) == 0 {
+		return 0, fmt.Errorf("payload が要る")
+	}
+	if len(e.Payload) > maxDetail {
+		return 0, fmt.Errorf("payload が長すぎる（%d バイト、上限 %d）", len(e.Payload), maxDetail)
+	}
+	got, err := limits.Record(l.db, bytes.NewReader(e.Payload),
+		limits.AgentClaudeCode, limits.SourceStatusLine)
+	if err != nil {
+		if errors.Is(err, limits.ErrNoWindows) {
+			return 0, nil // 窓が出ていないだけ。異常ではない
+		}
+		return 0, err
+	}
+	return int64(len(got)), nil
 }
 
 func writeReply(c net.Conn, r Reply) {
