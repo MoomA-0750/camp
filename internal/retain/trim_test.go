@@ -213,3 +213,71 @@ func TestTrimHandlesManyImages(t *testing.T) {
 		t.Error("片方にしか無い画像まで落とした")
 	}
 }
+
+// 落とした前後で、元のバイト位置を読み替えられる。
+//
+// sensitive_findings は raw_json のバイト位置で所見を持っていて、
+// 「raw_json は不変」がその土台だった（D-010）。M22 がその土台を崩したので、
+// 崩した側が位置を面倒みる。
+func TestReanchorMovesPositionsAndDropsTheOnesInside(t *testing.T) {
+	cuts := []Cut{
+		{Start: 10, End: 30, Shift: 18}, // 20バイトが2バイト（""）になる
+		{Start: 50, End: 60, Shift: 8},
+	}
+	for _, tc := range []struct {
+		name string
+		off  int
+		want int
+		ok   bool
+	}{
+		{"落とす前", 5, 5, true},
+		{"1つめの直前", 9, 9, true},
+		{"1つめの中", 15, 0, false},
+		{"1つめの直後", 30, 12, true},
+		{"2つめの直前", 49, 31, true},
+		{"2つめの中", 55, 0, false},
+		{"2つめの直後", 60, 34, true},
+		{"ずっと後ろ", 100, 74, true},
+	} {
+		got, ok := Reanchor(tc.off, cuts)
+		if ok != tc.ok {
+			t.Errorf("%s: ok=%v（%v を期待）", tc.name, ok, tc.ok)
+			continue
+		}
+		if ok && got != tc.want {
+			t.Errorf("%s: %d → %d（%d を期待）", tc.name, tc.off, got, tc.want)
+		}
+	}
+}
+
+// 読み替えた位置が、実際に同じ中身を指している。
+func TestReanchoredPositionsStillPointAtTheSameBytes(t *testing.T) {
+	const sig = "SIGNATURESIGNATURE"
+	raw := []byte(`{"a":"みつけたいもの","message":{"content":[` +
+		`{"type":"thinking","signature":"` + sig + `"}]},"z":"うしろのもの"}`)
+
+	before := strings.Index(string(raw), "みつけたいもの")
+	after := strings.Index(string(raw), "うしろのもの")
+	if before < 0 || after < 0 {
+		t.Fatal("目印が見つからない")
+	}
+
+	out, _, cuts, changed, err := TrimCuts(raw, []Rule{RuleThinkingSignature})
+	if err != nil || !changed {
+		t.Fatalf("落とせていない: %v", err)
+	}
+
+	for _, tc := range []struct {
+		off  int
+		want string
+	}{{before, "みつけたいもの"}, {after, "うしろのもの"}} {
+		got, ok := Reanchor(tc.off, cuts)
+		if !ok {
+			t.Errorf("%q の位置を読み替えられなかった", tc.want)
+			continue
+		}
+		if !strings.HasPrefix(string(out[got:]), tc.want) {
+			t.Errorf("%q を指すはずが %q を指している", tc.want, string(out[got:min(got+30, len(out))]))
+		}
+	}
+}

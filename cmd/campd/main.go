@@ -3,10 +3,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,6 +27,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/retain"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
+	"github.com/MoomA-0750/camp/internal/snapshot"
 	"github.com/MoomA-0750/camp/internal/store"
 	"github.com/MoomA-0750/camp/internal/thread"
 	"github.com/MoomA-0750/camp/internal/vault"
@@ -76,6 +79,8 @@ func run(args []string) error {
 		return cmdTombstones(rest)
 	case "retain":
 		return cmdRetain(rest)
+	case "snapshot":
+		return cmdSnapshot(rest)
 	case "secrets":
 		return cmdSecrets(rest)
 	case "serve":
@@ -118,6 +123,8 @@ usage:
   campd backup  [PATH]    捕獲したバックアップを一覧する（-show ID で中身を出す）
   campd tombstones        消したものの記録を新しい順に並べる
   campd retain            保持の規則を見る・切り替える・当てる（既定は --dry-run）
+  campd snapshot -out F   DBの一貫したスナップショットを暗号化して書き出す
+  campd snapshot -restore F -out P  スナップショットを戻して doctor まで通す
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
   campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
@@ -1533,4 +1540,102 @@ func cmdRetain(args []string) error {
 		return fmt.Errorf("見積り %d 行に対して実際は %d 行。食い違っている", len(plan), out.Messages)
 	}
 	return nil
+}
+
+// cmdSnapshot は退避先を作る／戻す。
+//
+// **campd は鍵を持たない。** 標準入力から受け取り、終わったら忘れる。
+// 稼働中のDBは平文のままなので（SQLCipher は systemd 常駐と相性が悪い）、
+// 守れるのは持ち出す先だけ。そこは確実に守る。
+func cmdSnapshot(args []string) error {
+	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	out := fs.String("out", "", "書き出し先")
+	restore := fs.String("restore", "", "戻すスナップショット")
+	keyFile := fs.String("key-file", "", "鍵のファイル（既定は標準入力から読む）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return errors.New("-out が要る")
+	}
+
+	key, err := readKey(*keyFile)
+	if err != nil {
+		return err
+	}
+	defer wipe(key)
+
+	if *restore != "" {
+		info, err := snapshot.Restore(*restore, *out, key)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("戻した     %s\n", info.Path)
+		fmt.Printf("  中身     %d バイト / sha256 %s\n", info.PlainBytes, info.SHA256)
+
+		// **戻しただけでは戻ったことにならない。** 開いて点検まで通す。
+		db, err := store.Open(info.Path)
+		if err != nil {
+			return fmt.Errorf("戻したが開けない: %w", err)
+		}
+		defer db.Close()
+		checks, err := db.Doctor()
+		if err != nil {
+			return err
+		}
+		failed := 0
+		for _, c := range checks {
+			if !c.OK {
+				fmt.Printf("FAIL  %-24s %s\n", c.Name, c.Detail)
+				failed++
+			}
+		}
+		if failed > 0 {
+			return fmt.Errorf("戻したDBが %d 件の点検に落ちた", failed)
+		}
+		fmt.Println("  点検     すべて通った")
+		return nil
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	info, err := snapshot.Create(db, *out, key)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("取った     %s\n", info.Path)
+	fmt.Printf("  中身     %d バイト / sha256 %s\n", info.PlainBytes, info.SHA256)
+	fmt.Printf("  暗号文   %d バイト\n", info.CipherBytes)
+	fmt.Println("  この sha256 を控えておく。戻したときに同じ値が出れば中身は同じ。")
+	return nil
+}
+
+// readKey は鍵を読む。**どこにも書かない。**
+func readKey(file string) ([]byte, error) {
+	var b []byte
+	var err error
+	if file != "" {
+		b, err = os.ReadFile(file)
+	} else {
+		fmt.Fprintln(os.Stderr, "鍵を標準入力から読む（1Password から渡す）")
+		b, err = io.ReadAll(os.Stdin)
+	}
+	if err != nil {
+		return nil, err
+	}
+	b = bytes.TrimRight(b, "\r\n")
+	if len(b) < 8 {
+		return nil, errors.New("鍵が短すぎる（8バイト以上）")
+	}
+	return b, nil
+}
+
+func wipe(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }

@@ -118,6 +118,19 @@ func (db *DB) Doctor() ([]Check, error) {
 			tomb.Total, tomb.Unrecoverable))
 	}
 
+	// raw_json のバイト位置で持っている所見が、いまも中身を指しているか。
+	// M22 で raw_json が不変でなくなったので、ここを見ないと気づけない。
+	var dangling int
+	err = db.QueryRow(`
+		select count(*) from sensitive_findings f
+		  join messages m on m.id = f.message_id
+		 where f.byte_offset is not null
+		   and f.byte_offset + coalesce(f.length, 0) > length(m.raw_json)`).Scan(&dangling)
+	if err == nil && dangling > 0 {
+		err = fmt.Errorf("%d 件の所見が raw_json の外を指している", dangling)
+	}
+	add("findings の位置", err, "中身を指している")
+
 	pv, err := db.ParserVersions()
 	if err != nil {
 		add("parser_version", err, "")

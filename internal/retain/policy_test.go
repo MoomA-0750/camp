@@ -1,9 +1,11 @@
 package retain_test
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MoomA-0750/camp/internal/ingest"
@@ -271,3 +273,88 @@ func TestDerivedRowsCanStillBeRebuiltFromWhatIsLeft(t *testing.T) {
 		t.Errorf("作り直した索引が壊れている: %s", detail)
 	}
 }
+
+// 落としたあとも、人が付けた判断つきの所見が正しい位置を指し続ける。
+//
+// sensitive_findings は raw_json のバイト位置で所見を持つ唯一の表で、
+// verdict（人の判断）は作り直せない。**位置の土台を崩した側が面倒をみる。**
+func TestFindingsKeepPointingAtTheRightPlace(t *testing.T) {
+	db, _, _ := seedPolicy(t)
+	enableAll(t, db)
+
+	// 落とす対象を含む行に、前と後ろの2つの所見を置く。
+	var id int64
+	var raw []byte
+	if err := db.QueryRow(`
+		select id, raw_json from messages where instr(raw_json,'SIGNATURESIGNATURE') > 0`).
+		Scan(&id, &raw); err != nil {
+		t.Fatal(err)
+	}
+	sig := int64(indexOf(raw, "SIGNATURESIGNATURE"))
+	after := int64(indexOf(raw, "のこる本文"))
+	before := int64(indexOf(raw, `"type"`))
+	if sig < 0 || after < 0 || before < 0 {
+		t.Fatal("目印が見つからない")
+	}
+	for _, f := range []struct {
+		name string
+		off  int64
+		ln   int64
+	}{{"まえ", before, 6}, {"なか", sig, 18}, {"うしろ", after, 15}} {
+		if _, err := db.Exec(`
+			insert into sensitive_findings(message_id, pattern, byte_offset, length, reviewed, verdict, found_at)
+			values(?,?,?,?,1,'本人が確認済み','2026-09-03')`, id, f.name, f.off, f.ln); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan, err := retain.Plan(db, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := retain.Apply(db, plan, "policy_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.FindingsLost != 1 {
+		t.Errorf("落とした範囲の中にあった所見が %d 件（1 を期待）", out.FindingsLost)
+	}
+	if out.FindingsMoved != 1 {
+		t.Errorf("位置を読み替えた所見が %d 件（うしろの1件を期待）", out.FindingsMoved)
+	}
+
+	// 判断は残る。位置だけ捨てる。
+	var verdict string
+	var off sql.NullInt64
+	if err := db.QueryRow(`
+		select verdict, byte_offset from sensitive_findings where pattern='なか'`).
+		Scan(&verdict, &off); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "本人が確認済み" {
+		t.Error("人の判断が消えた")
+	}
+	if off.Valid {
+		t.Error("落とした範囲の中を指したままになっている")
+	}
+
+	// 読み替えた所見が、ちゃんと元と同じ中身を指している。
+	var newRaw []byte
+	var newOff int64
+	if err := db.QueryRow(`
+		select m.raw_json, f.byte_offset from sensitive_findings f
+		  join messages m on m.id = f.message_id where f.pattern='うしろ'`).
+		Scan(&newRaw, &newOff); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(newRaw[newOff:]); !hasPrefix(got, "のこる本文") {
+		t.Errorf("読み替えた位置が別の場所を指している: %.30s", got)
+	}
+
+	if failed, detail := doctorFail(t, db, "findings の位置"); failed {
+		t.Errorf("所見が raw_json の外を指している: %s", detail)
+	}
+}
+
+func indexOf(b []byte, s string) int { return strings.Index(string(b), s) }
+func hasPrefix(s, p string) bool     { return strings.HasPrefix(s, p) }

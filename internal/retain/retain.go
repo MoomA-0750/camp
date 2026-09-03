@@ -37,6 +37,11 @@ type Outcome struct {
 	Blobs         int   // 消した blob
 	BytesRemoved  int64 // 実際に落としたバイト数
 	Unrecoverable int   // 元ファイルが無く、作り直せない削除だった件数
+
+	// raw_json のバイト位置で持っている所見（sensitive_findings）の面倒。
+	// 位置の土台を崩した以上、崩した側が数えて報告する。
+	FindingsMoved int // 位置を読み替えた
+	FindingsLost  int // 落とした範囲の中にあったので位置を捨てた
 }
 
 // Message は1メッセージの raw_json と派生行を落とし、tombstone を残す。

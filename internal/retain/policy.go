@@ -154,7 +154,7 @@ func Apply(db *store.DB, plan []PlanRow, actor string) (Outcome, error) {
 			p.MessageID).Scan(&raw, &srcID, &off); err != nil {
 			return out, err
 		}
-		trimmed, removed, changed, err := Trim(raw, rules)
+		trimmed, removed, cuts, changed, err := TrimCuts(raw, rules)
 		if err != nil || !changed {
 			continue
 		}
@@ -167,6 +167,13 @@ func Apply(db *store.DB, plan []PlanRow, actor string) (Outcome, error) {
 			tx.Rollback()
 			return out, err
 		}
+		lost, err := reanchorFindings(tx, p.MessageID, cuts)
+		if err != nil {
+			tx.Rollback()
+			return out, err
+		}
+		out.FindingsMoved += lost.moved
+		out.FindingsLost += lost.lost
 		if err := insertTombstone(tx, tombstone{
 			Kind: KindTrim, Ref: fmt.Sprint(p.MessageID),
 			SourceFileID: srcID, ByteOffset: off,
@@ -277,4 +284,63 @@ func b2i(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// reanchorFindings は raw_json のバイト位置で持っている所見を、詰めた後の
+// 位置へ読み替える。
+//
+// `sensitive_findings` は**人の判断（verdict）を載せる唯一の派生表**で、
+// 作り直せない（D-010）。位置の土台だった「raw_json は不変」を M22 で
+// 崩した以上、崩した側が位置を面倒みる。
+//
+// 落とした範囲の中に入っていた所見は位置を捨てる（NULL にする）。
+// **黙ってずらさない。** ずらすと、別の場所を指した所見が「確認済み」の
+// 判断つきで残る。
+func reanchorFindings(tx *sql.Tx, messageID int64, cuts []Cut) (struct{ moved, lost int }, error) {
+	var n struct{ moved, lost int }
+	rows, err := tx.Query(`
+		select id, byte_offset from sensitive_findings
+		 where message_id = ? and byte_offset is not null`, messageID)
+	if err != nil {
+		return n, err
+	}
+	type hit struct {
+		id  int64
+		off int
+	}
+	var hits []hit
+	for rows.Next() {
+		var h hit
+		if err := rows.Scan(&h.id, &h.off); err != nil {
+			rows.Close()
+			return n, err
+		}
+		hits = append(hits, h)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return n, err
+	}
+
+	for _, h := range hits {
+		newOff, ok := Reanchor(h.off, cuts)
+		if !ok {
+			if _, err := tx.Exec(`
+				update sensitive_findings set byte_offset = null, length = null
+				 where id = ?`, h.id); err != nil {
+				return n, err
+			}
+			n.lost++
+			continue
+		}
+		if newOff == h.off {
+			continue
+		}
+		if _, err := tx.Exec(`
+			update sensitive_findings set byte_offset = ? where id = ?`, newOff, h.id); err != nil {
+			return n, err
+		}
+		n.moved++
+	}
+	return n, nil
 }

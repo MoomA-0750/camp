@@ -138,12 +138,37 @@ fi
 
 statusLine を使っていない場合は `campd limits record` に同じ形の JSON を stdin で渡せばよい。確認は `campd limits show`。
 
+## 退避先（バックアップ）
+
+**稼働中のDBは平文のまま。** SQLCipher は systemd 常駐と相性が悪く、再起動のたびに
+手で解錠することになる。守れるのは持ち出す先だけなので、そこは確実に守る。
+
+```bash
+# 取る。鍵は 1Password から渡す。campd は鍵を持たない
+op read "op://Private/camp backup/password" |   ./campd snapshot -out ~/backups/camp-$(date +%Y%m%d).snapshot
+
+# 戻す。戻したあと doctor まで通って初めて成功
+op read "op://Private/camp backup/password" |   ./campd snapshot -restore ~/backups/camp-20260903.snapshot -out /tmp/restored.sqlite
+```
+
+- `VACUUM INTO` で一貫したスナップショットを取る。稼働中でも WAL ごと辻褄が合う
+  （ファイルをコピーする方式は `-wal` と `-shm` を取りこぼす）
+- AES-256-GCM。鍵は PBKDF2-HMAC-SHA256 を 600,000 回。4 MiB ずつに区切って
+  暗号化するので、274 MB でもメモリに載せない
+- **後ろを切り落としたファイルは復元を拒否する。** 静かに欠けたバックアップは、
+  取れていないバックアップより悪い
+- 既にあるファイルは上書きしない。復元に失敗したら中途半端なファイルを残さない
+- 取ったときに出る `sha256` を控えておく。**戻したときに同じ値が出れば中身は同じ**
+
+実測（2026-09-03、274 MB）: 取るのに 4.4 秒、戻すのに 4.8 秒、暗号文の増分は 1,089 バイト。
+実際に稼働中のDBを消して戻し、`doctor` が全項目通ることを確かめてある。
+
 ## 制約
 
 - **Claude Proサブスクの範囲内に収める。** APIクレジットは使わない。これがClaude Agent SDKを採れない理由（Agent SDKはAPIキー前提）
 - セッション駆動は `claude` CLI のヘッドレス双方向JSONモードで行う
 - **バックエンドはGo、フロントはVite + React SPA**（`docs/40-layout.md`）。Next.jsは使わない
-- 履歴は生のまま保存し、リダクトしない。破壊しない検出器で記録だけ残す（`docs/10-decisions.md` D-010）
+- 履歴は生のまま保存する。**パターン検出によるリダクトはしない**（偽陽性100%・偽陰性100%だった。`docs/10-decisions.md` D-010）。ただし2026-09-03から、**索引に入っていない部分**（誰も復号できない `thinking` 署名、二重に入っている画像）だけは `campd retain` で落とせる。消したぶんは `tombstones` に残る
 - Tailscale内に閉じたうえで**アプリ認証を最初から入れる**（D-011）
 - プラン上限はいずれ `claude -p` の制御プロトコルから取る（`rate_limit_event` / `get_usage`。トークン消費ゼロ）。ただし**記録だけは statusLine のフックで先に始めている**——この値は捨てられたら遡れない唯一の素材（D-022）
 - 権限確認UIは `--permission-prompt-tool stdio` で作れる（`--help` に出ない隠しフラグだが実在する）

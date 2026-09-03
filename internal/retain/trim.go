@@ -30,6 +30,13 @@ const (
 	RuleDuplicateImage Rule = "duplicate-image"
 )
 
+// Cut は落とした範囲。元のバイト位置に紐づいたものを直すのに使う。
+type Cut struct {
+	Start int // 元のバイト列での開始位置
+	End   int // 元のバイト列での終了位置
+	Shift int // この位置より後ろが前へ詰まる量
+}
+
 // Trim は raw_json から rule の対象を落とした新しいバイト列を返す。
 //
 // **触らない部分は1バイトも変えない。** JSON を読み直して書き戻す実装だと、
@@ -39,10 +46,16 @@ const (
 // 中身で探して置換する実装は使えない。同じ画像が2箇所にある行で、
 // 残すべき message.content 側まで一緒に消えるため（テストで確認済み）。
 func Trim(raw []byte, rules []Rule) (out []byte, removed int, changed bool, err error) {
+	out, removed, _, changed, err = TrimCuts(raw, rules)
+	return
+}
+
+// TrimCuts は Trim と同じことをして、落とした範囲も返す。
+func TrimCuts(raw []byte, rules []Rule) (out []byte, removed int, cuts []Cut, changed bool, err error) {
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		// 読めない行は触らない。壊れた行を壊し直しても得がない。
-		return raw, 0, false, fmt.Errorf("JSON として読めない: %w", err)
+		return raw, 0, nil, false, fmt.Errorf("JSON として読めない: %w", err)
 	}
 
 	var paths [][]any
@@ -50,7 +63,7 @@ func Trim(raw []byte, rules []Rule) (out []byte, removed int, changed bool, err 
 		paths = append(paths, collect(doc, r)...)
 	}
 	if len(paths) == 0 {
-		return raw, 0, false, nil
+		return raw, 0, nil, false, nil
 	}
 
 	type span struct{ start, end int }
@@ -67,24 +80,46 @@ func Trim(raw []byte, rules []Rule) (out []byte, removed int, changed bool, err 
 		spans = append(spans, span{s, e})
 	}
 	if len(spans) == 0 {
-		return raw, 0, false, nil
+		return raw, 0, nil, false, nil
 	}
 
 	// 後ろから差し替える。前から詰めると以降の位置がずれる。
 	sort.Slice(spans, func(i, j int) bool { return spans[i].start > spans[j].start })
 	out = append([]byte(nil), raw...)
 	for _, sp := range spans {
-		removed += sp.end - sp.start - 2
+		shift := sp.end - sp.start - 2
+		removed += shift
+		cuts = append(cuts, Cut{Start: sp.start, End: sp.end, Shift: shift})
 		out = append(out[:sp.start], append([]byte(`""`), out[sp.end:]...)...)
 	}
 	if removed == 0 {
-		return raw, 0, false, nil
+		return raw, 0, nil, false, nil
 	}
 	// 差し替えた結果が JSON として読めることを必ず確かめる。
 	if !json.Valid(out) {
-		return raw, 0, false, fmt.Errorf("差し替えた結果が JSON として壊れた")
+		return raw, 0, nil, false, fmt.Errorf("差し替えた結果が JSON として壊れた")
 	}
-	return out, removed, true, nil
+	// 前から順に並べて返す。位置を直す側が扱いやすい。
+	sort.Slice(cuts, func(i, j int) bool { return cuts[i].Start < cuts[j].Start })
+	return out, removed, cuts, true, nil
+}
+
+// Reanchor は元の位置 off を、cuts のぶん詰めた後の位置に読み替える。
+//
+// 落とした範囲の中に入っていた位置は読み替えられない（ok=false）。
+// **そこは黙ってずらさない。** ずらすと、別の場所を指した所見が
+// 「人が確認済み」の判断つきで残ることになる。
+func Reanchor(off int, cuts []Cut) (int, bool) {
+	shift := 0
+	for _, c := range cuts {
+		switch {
+		case off >= c.End:
+			shift += c.Shift
+		case off >= c.Start:
+			return 0, false // 落とした範囲の中だった
+		}
+	}
+	return off - shift, true
 }
 
 // collect は rule の対象になる値の**位置**を集める。
