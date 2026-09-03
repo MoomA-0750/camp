@@ -208,7 +208,8 @@ func TestRedactedMessageDoesNotComeBackOnReingest(t *testing.T) {
 	}
 
 	// オフセットを戻して、ファイルを頭から読み直させる。
-	// incarnation が変わったときに実際に起きる経路。
+	// **これは世代交代ではない**（source_files の行は同じ）。
+	// 世代が変わる経路は TestRedactedMessageDoesNotComeBackAfterTheFileIsRecreated。
 	if _, err := db.Exec(`update source_files set ingested_offset = 0`); err != nil {
 		t.Fatal(err)
 	}
@@ -390,5 +391,92 @@ func TestTheAPICanTellARedactionFromAnEmptyRow(t *testing.T) {
 		if msgs[i].ID != id && msgs[i].Redacted != nil {
 			t.Errorf("消していない行 %d に印が付いている", msgs[i].ID)
 		}
+	}
+}
+
+// 元ファイルが同じ内容のまま作り直されても、何も起きない。
+//
+// 2026-09-03 の outer gate で見つけた穴。ファイルの身元に inode を使っていたので、
+// 中身が1バイトも同じでも inode が変われば世代が上がり、
+//
+//   - 全行がもう一度 messages へ入り（一意制約は (source_file_id, byte_offset)）
+//   - 古い世代に紐づいた tombstone が効かなくなって消したものが戻る
+//
+// の2つが同時に起きていた。rsync（既定で一時ファイル＋rename）、
+// バックアップからの復元、別マシンへの移動が全部この経路。
+// **身元は中身で決める**ようにしたので、そもそも世代が上がらない。
+func TestRecreatingTheFileWithTheSameBytesChangesNothing(t *testing.T) {
+	const secret = "reincarnate7777"
+	db, root, path := seed(t, secret)
+	id := findMessage(t, db, secret)
+	if _, err := retain.Message(db, id, retain.Op{Reason: "テスト", Actor: "retain_test"}); err != nil {
+		t.Fatal(err)
+	}
+	before := scan(t, db, `select count(*) from messages`)
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil { // 新しい inode になる
+		t.Fatal(err)
+	}
+
+	if _, err := ingest.Ingest(db, "testhost", root); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := scan(t, db, `select count(*) from source_files where superseded_at is not null`); n != 0 {
+		t.Errorf("中身は同じなのに %d 本が旧世代に落ちた", n)
+	}
+	if after := scan(t, db, `select count(*) from messages`); after != before {
+		t.Errorf("メッセージが %d → %d に増えた（二重取り込み）", before, after)
+	}
+	if n := scan(t, db, `select count(*) from messages where instr(raw_json,?)>0`, secret); n != 0 {
+		t.Errorf("消したものが %d 件戻った", n)
+	}
+}
+
+// 本当に世代が変わった場合でも、消したものは戻らない。
+//
+// 上の修正は「世代を上げない」ことで守るが、切り詰めて書き直された場合は
+// 世代が上がるのが正しい。そのときの保険が tombstone の行ハッシュ。
+// **位置でも世代でもなく、行そのものの sha256 で弾く。**
+func TestRedactedLineStaysGoneEvenWhenTheFileTrulyRotates(t *testing.T) {
+	const secret = "trulyrotated5555"
+	db, root, path := seed(t, secret)
+	id := findMessage(t, db, secret)
+	if _, err := retain.Message(db, id, retain.Op{Reason: "テスト", Actor: "retain_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 先頭に1行足して書き直す。再開点の中身が変わるので世代が上がる。
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := `{"type":"user","uuid":"u-prepended","sessionId":"` + sid +
+		`","timestamp":"2026-09-01T00:00:00.000Z","cwd":"/nonexistent/proj",` +
+		`"message":{"role":"user","content":"先頭に足した行"}}` + "\n"
+	if err := os.WriteFile(path, append([]byte(head), body...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ingest.Ingest(db, "testhost", root); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := scan(t, db, `select count(*) from source_files where superseded_at is not null`); n == 0 {
+		t.Fatal("世代交代が起きていない。この試験は保険を突けていない")
+	}
+	if n := scan(t, db, `select count(*) from messages where instr(raw_json,?)>0`, secret); n != 0 {
+		t.Errorf("世代が変わったら消したものが %d 件戻った", n)
+	}
+	if n := scan(t, db, `select count(*) from message_blocks where instr(coalesce(text,''),?)>0`, secret); n != 0 {
+		t.Errorf("世代が変わったら message_blocks に %d 件戻った", n)
 	}
 }

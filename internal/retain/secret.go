@@ -155,7 +155,8 @@ func Secret(db *store.DB, secret []byte, op Op) (Outcome, error) {
 			SourceFileID: srcID, ByteOffset: off,
 			Reason: op.Reason, Actor: op.Actor, At: now,
 			Bytes: int64(len(secret) * n), Recoverable: false,
-			Note: "既知の値を同じ長さの伏字にした。位置は動かしていない",
+			Note:       "既知の値を同じ長さの伏字にした。位置は動かしていない",
+			LineSHA256: LineHash(raw),
 		}); err != nil {
 			tx.Rollback()
 			return out, err
@@ -174,6 +175,14 @@ func Secret(db *store.DB, secret []byte, op Op) (Outcome, error) {
 	}
 	out.Blocks = blocks
 
+	// **FTS の影の表には、消したはずのバイト列が残る。**
+	// external-content の FTS5 は 'delete' を積み上げるだけで、古い segment の
+	// 中身は messages_fts_data に居座る。`sqlite3` で直接読めば平文が出てくる
+	// （2026-09-03 の総なめで実測）。索引を作り直して segment ごと捨てる。
+	if _, err := db.Exec(`insert into messages_fts(messages_fts) values('rebuild')`); err != nil {
+		return out, fmt.Errorf("FTS を作り直せない: %w", err)
+	}
+
 	for _, sha := range plan.Blobs {
 		n, err := maskBlob(db, sha, secret, mask, op, now)
 		if err != nil {
@@ -182,7 +191,45 @@ func Secret(db *store.DB, secret []byte, op Op) (Outcome, error) {
 		out.Blobs++
 		out.BytesRemoved += int64(n)
 	}
+
+	// **ここまでは「知っている置き場」。残りを総なめで拾う。**
+	// messages から派生した列（sessions.first_user_message、last_prompt、
+	// source_files.summary_json など）は上の経路では消えない。2026-09-03 の
+	// outer gate まで、そこに平文が残ったまま「0件」と報告していた。
+	swept, err := maskEverywhereElse(db, secret, mask)
+	if err != nil {
+		return out, err
+	}
+	out.Columns = swept
 	return out, nil
+}
+
+// maskEverywhereElse は、残っている列を片端から伏せる。伏字は元と同じ長さなので
+// バイト位置は動かない（`sensitive_findings` のアンカーが生きる）。
+//
+// FTS の影の表には触らない。索引が本体とずれる。あそこに写っている値は
+// message_blocks を作り直せば消えるので、呼ぶ側が先に作り直しておく。
+func maskEverywhereElse(db *store.DB, secret, mask []byte) (int, error) {
+	hits, err := Sweep(db, secret)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, h := range hits {
+		if FTSShadow(h.Table) {
+			// 本体を直せば消える。ここで直接触ると索引が壊れる。
+			continue
+		}
+		q := fmt.Sprintf(`update %q set %q = replace(%q, ?, ?) where instr(%q, ?) > 0`,
+			h.Table, h.Column, h.Column, h.Column)
+		res, err := db.Exec(q, secret, mask, secret)
+		if err != nil {
+			return n, fmt.Errorf("%s.%s を伏せられない: %w", h.Table, h.Column, err)
+		}
+		got, _ := res.RowsAffected()
+		n += int(got)
+	}
+	return n, nil
 }
 
 // maskBlob は blob の中身を展開して伏せ、同じ codec で入れ直す。

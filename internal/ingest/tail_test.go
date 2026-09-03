@@ -299,26 +299,23 @@ func TestDeviceNumberChangeIsNotANewFile(t *testing.T) {
 	}
 }
 
-// rotatedFrom は inode と再開点の中身だけで実体の入れ替わりを見る。
-func TestRotationLooksAtInodeAndContent(t *testing.T) {
+// rotatedFrom は**中身だけ**で実体の入れ替わりを見る。inode も dev も見ない。
+func TestRotationLooksAtContentNotInode(t *testing.T) {
 	const sha = "0123456789abcdef"
 	prior := &Prior{Offset: 100, Inode: 2152211, ResumeSHA: sha}
 	same := func() string { return sha }
 
-	if rotatedFrom(prior, prior.Inode, 200, same) {
+	if rotatedFrom(prior, 200, same) {
 		t.Error("何も変わっていないのに世代を進めようとしている")
 	}
-	if !rotatedFrom(prior, prior.Inode+1, 200, same) {
-		t.Error("inode が変わったのに同じファイル扱いしている")
-	}
-	// inode を使い回されても、再開点の中身が違えば気づく。
-	if !rotatedFrom(prior, prior.Inode, 200, func() string { return "ちがう" }) {
+	// 中身が入れ替われば、位置が同じでも気づく。
+	if !rotatedFrom(prior, 200, func() string { return "ちがう" }) {
 		t.Error("中身が入れ替わったのに気づいていない")
 	}
-	if !rotatedFrom(prior, prior.Inode, 50, same) {
+	if !rotatedFrom(prior, 50, same) {
 		t.Error("切り詰めに気づいていない")
 	}
-	if rotatedFrom(nil, 1, 200, same) || rotatedFrom(&Prior{}, 1, 200, same) {
+	if rotatedFrom(nil, 200, same) || rotatedFrom(&Prior{}, 200, same) {
 		t.Error("初回なのに世代を進めようとしている")
 	}
 }

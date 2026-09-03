@@ -6,7 +6,9 @@
 package retain
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"time"
@@ -37,6 +39,7 @@ type Outcome struct {
 	Blobs         int   // 消した blob
 	BytesRemoved  int64 // 実際に落としたバイト数
 	Unrecoverable int   // 元ファイルが無く、作り直せない削除だった件数
+	Columns       int   // 総なめで拾って伏せた、派生列の行数
 
 	// raw_json のバイト位置で持っている所見（sensitive_findings）の面倒。
 	// 位置の土台を崩した以上、崩した側が数えて報告する。
@@ -59,10 +62,12 @@ func Message(db *store.DB, id int64, op Op) (Outcome, error) {
 
 	var srcID sql.NullInt64
 	var off sql.NullInt64
-	var size int64
+	var raw []byte
+	// **消す前に**行の身元を取る。消してからでは取れない。
 	err := db.QueryRow(`
-		select source_file_id, byte_offset, length(raw_json) from messages where id = ?`,
-		id).Scan(&srcID, &off, &size)
+		select source_file_id, byte_offset, raw_json from messages where id = ?`,
+		id).Scan(&srcID, &off, &raw)
+	size := int64(len(raw))
 	if err == sql.ErrNoRows {
 		return out, fmt.Errorf("message %d が無い", id)
 	}
@@ -97,6 +102,7 @@ func Message(db *store.DB, id int64, op Op) (Outcome, error) {
 		SourceFileID: srcID, ByteOffset: off,
 		Reason: op.Reason, Actor: op.Actor, At: now,
 		Bytes: total, Recoverable: recoverable, Note: op.Note,
+		LineSHA256: LineHash(raw),
 	}); err != nil {
 		return out, err
 	}
@@ -233,6 +239,10 @@ type tombstone struct {
 	Bytes        int64
 	Recoverable  bool
 	Note         string
+	// LineSHA256 は元の JSONL の行そのものの sha256。**世代にもバイト位置にも
+	// 依存しない身元。** これが無いと、inode が変わっただけで再取り込みの抑止が
+	// 外れる（2026-09-03 outer gate）。行を持たない削除（blob など）では空。
+	LineSHA256 string
 }
 
 func insertTombstone(tx *sql.Tx, t tombstone) error {
@@ -242,10 +252,10 @@ func insertTombstone(tx *sql.Tx, t tombstone) error {
 	}
 	_, err := tx.Exec(`
 		insert into tombstones(kind, ref, source_file_id, byte_offset,
-			reason, actor, redacted_at, bytes_removed, recoverable, note)
-		values(?,?,?,?,?,?,?,?,?,?)`,
+			reason, actor, redacted_at, bytes_removed, recoverable, note, line_sha256)
+		values(?,?,?,?,?,?,?,?,?,?,?)`,
 		t.Kind, t.Ref, t.SourceFileID, t.ByteOffset,
-		t.Reason, t.Actor, t.At, t.Bytes, rec, nullStr(t.Note))
+		t.Reason, t.Actor, t.At, t.Bytes, rec, nullStr(t.Note), nullStr(t.LineSHA256))
 	return err
 }
 
@@ -254,4 +264,14 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// LineHash は元の JSONL の行の身元。`raw_json` は行とバイト単位で一致する
+// （2026-09-03 実測）ので、そのまま sha256 を取る。空なら空を返す。
+func LineHash(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

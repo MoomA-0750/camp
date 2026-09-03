@@ -1,6 +1,7 @@
 package snapshot_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -144,6 +145,51 @@ func TestNoPlaintextIsLeftOnDisk(t *testing.T) {
 	for _, e := range ents {
 		if e.Name() != filepath.Base(enc) {
 			t.Errorf("余計なファイルが残っている: %s", e.Name())
+		}
+	}
+}
+
+// 暗号化しているあいだ、平文の中間ファイルが他人から読めてはいけない。
+//
+// 2026-09-03 の outer gate で実測: 平文 tmp が mode 644 のまま 264MB・4秒。
+// 暗号文だけ 0600 にしても、そこで M23 の線を越えていた。
+func TestThePlaintextTempIsNeverWorldReadable(t *testing.T) {
+	db := seedDB(t)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "snap.bin")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := snapshot.Create(db, out, []byte("かぎ"))
+		done <- err
+	}()
+
+	// 暗号化が終わるまで、ディレクトリに現れるものを見張る。
+	bad := ""
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bad != "" {
+				t.Error(bad)
+			}
+			return
+		default:
+		}
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			fi, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if fi.Mode().Perm()&0o077 != 0 && bad == "" {
+				bad = fmt.Sprintf("%s が mode %04o で見えた。他人が読める", e.Name(), fi.Mode().Perm())
+			}
 		}
 	}
 }

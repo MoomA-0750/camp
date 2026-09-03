@@ -194,7 +194,8 @@ func Apply(db *store.DB, plan []PlanRow, actor string) (Outcome, error) {
 			SourceFileID: srcID, ByteOffset: off,
 			Reason: p.Policy, Actor: actor, At: now,
 			Bytes: int64(removed), Recoverable: p.Recoverable,
-			Note: "行は残し、読めない部分だけ落とした",
+			Note:       "行は残し、読めない部分だけ落とした",
+			LineSHA256: LineHash(raw),
 		}); err != nil {
 			tx.Rollback()
 			return out, err

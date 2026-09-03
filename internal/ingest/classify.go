@@ -118,22 +118,30 @@ func resumeSHA(path string, offset int64) string {
 // 世代が進んで**コーパス全体が二重に取り込まれた**（33,621行 322MB →
 // 69,630行 529MB）。**再起動のたびにDBが倍になる。**
 //
-// inode だけでは、消して作り直したファイルが同じ番号を再利用したときに
-// 気づけない。そこは resumeSHA（前回の再開点の直前256バイト）が見ている。
-// 中身が違えば必ず食い違うので、identity は inode と中身で足りる。
-func rotatedFrom(prior *Prior, inode, size int64, resume func() string) bool {
+// **inode も見ない（2026-09-03 追加）。** dev と同じ理由で、st_ino も
+// 「同じファイル」の証明にならない。rsync は既定で一時ファイルへ書いて rename
+// するので新しい inode になり、バックアップからの復元や別マシンへの移動も同じ。
+// 中身が1バイトも変わっていないのに世代が上がると、
+//
+//   - その行が全部もう一度 messages へ入る（一意制約が (source_file_id, byte_offset)
+//     なので重複と見なされない。uuid は resume でファイルを跨いで正当に重複するため
+//     一意にできない）
+//   - 古い世代に紐づいた tombstone が効かなくなり、**消したものが戻る**
+//
+// の2つが同時に起きる。2026-09-03 の outer gate で両方とも実測した。
+//
+// 消して作り直したファイルが同じ位置に違う中身を持つ場合は、resumeSHA
+// （前回の再開点の直前256バイト）が食い違う。切り詰めは size で分かる。
+// **identity は中身だけで足りる。**
+func rotatedFrom(prior *Prior, size int64, resume func() string) bool {
 	if prior == nil || prior.Offset <= 0 {
 		return false
 	}
 	switch {
-	case prior.Inode != inode:
-		return true // 別の実体になった
 	case size < prior.Offset:
 		return true // 切り詰められた
 	case resume() != prior.ResumeSHA:
-		// 同じ inode のまま、前より長く書き直された。
-		// size と inode だけ見ていると気づけない。
-		return true
+		return true // 同じ位置に違う中身が来た
 	}
 	return false
 }
@@ -273,7 +281,7 @@ func summarize(root, path string, d fs.DirEntry, prior *Prior) (*FileSummary, er
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		dev, inode = int64(st.Dev), int64(st.Ino)
 	}
-	rotated := rotatedFrom(prior, inode, info.Size(), func() string {
+	rotated := rotatedFrom(prior, info.Size(), func() string {
 		return resumeSHA(path, prior.Offset)
 	})
 	if prior != nil && prior.Offset > 0 {

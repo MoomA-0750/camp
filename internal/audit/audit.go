@@ -122,8 +122,18 @@ func List(db *store.DB, o Opts) ([]Entry, error) {
 
 // Verify は連鎖をたどって、抜けと書き換えを探す。
 //
-// トリガは DROP TRIGGER で外せる。このファイルを持っている者は sqlite3 で
-// 何でもできる。**止められないので、気づけるようにする。**
+// **どこまで言えるかを正確に書く（2026-09-03 訂正）。**
+// ここで検出できるのは「行を消した／書き換えたが、連鎖を張り直さなかった」場合だけ。
+// 連鎖は公開されている列だけの SHA-256 なので、DB を書ける者は
+//
+//	トリガを DROP → 行を DELETE → 連鎖を全部計算し直す → トリガを再作成
+//
+// で通せる。実測で `campd audit -verify` も `campd doctor` も ok を返した。
+// つまりこれは **アプリ経由の誤操作・事故を拒む器** であって、
+// 機械を握った相手に対する証跡ではない。
+//
+// 本当の守りは権限境界のほう（M25.5）。監査される側が DB へ届かなければ、
+// 「連鎖を張り直す」経路そのものが無くなる。
 func Verify(db *store.DB) (checked int, err error) {
 	rows, err := db.Query(`
 		select id, at, actor, action, coalesce(target,''), coalesce(session_id,''),

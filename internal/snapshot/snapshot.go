@@ -64,13 +64,27 @@ func Create(db *store.DB, out string, key []byte) (Info, error) {
 		return info, fmt.Errorf("%s は既にある。上書きしない", out)
 	}
 
-	tmp := out + ".plain.tmp"
-	_ = os.Remove(tmp)
-	// VACUUM INTO はファイルが存在すると失敗する。作らせる。
+	// **平文の中間ファイルを、他人が読める場所に置かない。**
+	// VACUUM INTO が作るファイルの mode は umask 次第で、実測（2026-09-03）では
+	// 0644 だった。暗号文だけ 0600 にしても、暗号化している数秒のあいだ
+	// 264MB の平文が誰でも読める状態で置かれる（M23 が引いた線をそこで越える）。
+	// ファイル自身の mode は VACUUM INTO に指定できないので、**0700 の
+	// 専用ディレクトリの中に閉じ込める。**
+	tmpDir, err := os.MkdirTemp(filepath.Dir(out), ".camp-snap-")
+	if err != nil {
+		return info, err
+	}
+	if err := os.Chmod(tmpDir, 0o700); err != nil {
+		os.RemoveAll(tmpDir)
+		return info, err
+	}
+	defer os.RemoveAll(tmpDir)
+	tmp := filepath.Join(tmpDir, "plain.sqlite")
 	if _, err := db.Exec(`VACUUM INTO ?`, tmp); err != nil {
 		return info, fmt.Errorf("スナップショットを取れない: %w", err)
 	}
-	defer os.Remove(tmp)
+	// 念のため、ファイル自体も落としておく（ディレクトリと二重に守る）。
+	_ = os.Chmod(tmp, 0o600)
 
 	src, err := os.Open(tmp)
 	if err != nil {

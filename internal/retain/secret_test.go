@@ -1,6 +1,7 @@
 package retain_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -270,4 +271,102 @@ func TestItRefusesAValueTooShortToBeSafe(t *testing.T) {
 		Reason: "x", Actor: "y"}); err == nil {
 		t.Error("短すぎる値を受け付けた")
 	}
+}
+
+// 伏字化は、派生した列に残った平文も消す。
+//
+// 2026-09-03 の outer gate の実測: `campd redact --apply` が
+// 「走査し直して 0 件。」と表示して終了コード 0 を返す一方、
+// `sessions.first_user_message`（`/api/sessions` が一覧に返す列）と
+// `source_files.summary_json` に平文が残っていた。見ている表が3つだけで、
+// 完了後の確認も同じ3表だったため。
+func TestSecretIsGoneFromDerivedColumnsToo(t *testing.T) {
+	const secret = "derivedleak8888"
+	db := seedFirstMessage(t, secret)
+
+	// 前提の確認: 派生列に本当に写っていること。写っていなければ試験にならない。
+	before := scan(t, db, `select count(*) from sessions
+		where instr(coalesce(first_user_message,''), ?) > 0`, secret)
+	if before == 0 {
+		t.Fatal("sessions.first_user_message に写っていない。この試験は穴を突けていない")
+	}
+
+	if _, err := retain.Secret(db, []byte(secret), retain.Op{
+		Reason: "テスト", Actor: "secret_test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := retain.Sweep(db, []byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := retain.Total(hits); n != 0 {
+		for _, h := range hits {
+			t.Errorf("%s.%s に %d 件残っている", h.Table, h.Column, h.Count)
+		}
+	}
+}
+
+// 総なめは、知っている置き場を数え上げる方式より広い。
+func TestSweepSeesColumnsFindSecretDoesNot(t *testing.T) {
+	const secret = "sweepwider7777"
+	db := seedFirstMessage(t, secret)
+
+	plan, err := retain.FindSecret(db, []byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits, err := retain.Sweep(db, []byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	known := map[string]bool{
+		"messages.raw_json": true, "message_blocks.text": true,
+		"message_blocks.bigrams": true, "blobs.content": true,
+	}
+	extra := 0
+	for _, h := range hits {
+		if !known[h.Table+"."+h.Column] && !retain.FTSShadow(h.Table) {
+			extra++
+			t.Logf("知っている置き場の外: %s.%s %d 件", h.Table, h.Column, h.Count)
+		}
+	}
+	if extra == 0 {
+		t.Fatalf("総なめが広くない。plan=%d 件", plan.Total())
+	}
+}
+
+// seedFirstMessage は、最初の user 発言に値を入れて取り込む。
+// sessions.first_user_message のような**派生列**へ値が流れる形を作るため。
+func seedFirstMessage(t *testing.T, secret string) *store.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "camp.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "-nonexistent-proj")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := ""
+	for i, text := range []string{secret, "続きの話"} {
+		body += fmt.Sprintf(
+			`{"type":"user","uuid":"f-%[1]d","sessionId":"%[2]s","session_id":"r-%[2]s",`+
+				`"timestamp":"2026-09-03T00:0%[1]d:00.000Z","cwd":"/nonexistent/proj",`+
+				`"message":{"role":"user","content":%[3]q}}`+"\n", i, sid, text)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sid+".jsonl"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.Ingest(db, "testhost", root); err != nil {
+		t.Fatal(err)
+	}
+	return db
 }

@@ -254,6 +254,10 @@ func cmdIngest(args []string) error {
 			b.Scanned, b.Captured, b.Known, missingNote(b.Missing))
 	}
 	fmt.Printf("読み飛ばし      %d ファイル（追記なし）\n", res.Unchanged)
+	// 消した行を黙って飛ばさない。数えていたのに、どこにも出していなかった。
+	if res.Suppressed > 0 {
+		fmt.Printf("抑止            %d 行（消した記録があるので取り込まない）\n", res.Suppressed)
+	}
 	fmt.Printf("所要            %s\n", time.Since(started).Round(time.Millisecond))
 	return nil
 }
@@ -467,7 +471,7 @@ func cmdDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
 	verbose := fs.Bool("v", false, "テーブルごとの行数も出す")
-	fix := fs.Bool("fix", false, "実体の消えた元ファイルに missing_at を入れる")
+	fix := fs.Bool("fix", false, "missing_at を入れ、tombstone に行の身元を埋め戻す")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -484,6 +488,18 @@ func cmdDoctor(args []string) error {
 			return err
 		}
 		fmt.Printf("fix   %-24s %d 本に missing_at を入れた\n", "source_files", n)
+
+		// 元ファイルが手元にあるうちに、行そのものの身元を入れておく。
+		// **失われたあとでは二度と埋められない。**
+		filled, skipped, err := retain.BackfillLineHashes(db)
+		if err != nil {
+			return err
+		}
+		detail := fmt.Sprintf("%d 件に行の身元を入れた", filled)
+		if skipped > 0 {
+			detail += fmt.Sprintf("（%d 件は元ファイルが無く埋められない）", skipped)
+		}
+		fmt.Printf("fix   %-24s %s\n", "tombstones", detail)
 	}
 
 	checks, err := db.Doctor()
@@ -1761,9 +1777,25 @@ func cmdRedact(args []string) error {
 	fmt.Printf("  message_blocks.text          %5d 件\n", plan.Blocks)
 	fmt.Printf("  message_blocks.bigrams(FTS)  %5d 件\n", plan.Bigrams)
 	fmt.Printf("  blobs.content(展開後)        %5d 件\n", len(plan.Blobs))
-	fmt.Printf("\n  合計 %d 件\n", plan.Total())
 
-	if plan.Total() == 0 {
+	// **知っている置き場だけを数えない。**2026-09-03 の outer gate まで、
+	// ここで挙げた4か所しか見ておらず、sessions.first_user_message に
+	// 平文が残ったまま「0件」と表示していた。
+	hits, err := retain.Sweep(db, secret)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\n  総なめ（全表・全列）\n")
+	if len(hits) == 0 {
+		fmt.Println("    どの表のどの列にも無い")
+	}
+	for _, h := range hits {
+		fmt.Printf("    %-38s %5d 件\n", h.Table+"."+h.Column, h.Count)
+	}
+	total := retain.Total(hits)
+	fmt.Printf("\n  合計 %d 件\n", total)
+
+	if total == 0 {
 		return nil
 	}
 	if !*apply {
@@ -1775,16 +1807,21 @@ func cmdRedact(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("\n伏せた: messages %d / blocks 作り直し %d / blobs %d / %d バイト\n",
-		out.Messages, out.Blocks, out.Blobs, out.BytesRemoved)
+	fmt.Printf("\n伏せた: messages %d / blocks 作り直し %d / blobs %d / 派生列 %d 行 / %d バイト\n",
+		out.Messages, out.Blocks, out.Blobs, out.Columns, out.BytesRemoved)
 
-	after, err := retain.FindSecret(db, secret)
+	// 確かめ直すのも総なめで。伏せた経路と同じ範囲しか見ないと、
+	// 「見ていないから0件」を「消えたから0件」と取り違える。
+	after, err := retain.Sweep(db, secret)
 	if err != nil {
 		return err
 	}
-	if after.Total() != 0 {
-		return fmt.Errorf("まだ %d 件残っている", after.Total())
+	if n := retain.Total(after); n != 0 {
+		for _, h := range after {
+			fmt.Printf("  残: %-38s %5d 件\n", h.Table+"."+h.Column, h.Count)
+		}
+		return fmt.Errorf("まだ %d 件残っている", n)
 	}
-	fmt.Println("走査し直して 0 件。")
+	fmt.Println("全表・全列を走査し直して 0 件。")
 	return nil
 }

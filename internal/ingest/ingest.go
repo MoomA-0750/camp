@@ -1,7 +1,9 @@
 package ingest
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -615,27 +617,68 @@ type writeCounts struct {
 	Suppressed int // tombstone があるので取り込まなかった行
 }
 
-// suppressedOffsets は、このファイルで「消した」と記録されている位置を返す。
+// suppressedOffsets は、取り込まない行の目印を集める。位置と、行そのものの sha256。
 //
 // tombstone は message_id ではなく (source_file_id, byte_offset) で引く。
 // 行を作り直したら message_id は変わるが、元ファイルの中の位置は変わらないため。
-func suppressedOffsets(db *store.DB, fileID int64) (map[int64]bool, error) {
+type suppression struct {
+	offsets map[int64]bool  // この世代の中での位置
+	lines   map[string]bool // 行そのものの sha256。**世代を越える**
+}
+
+// has は、この行を取り込まないかどうかを返す。
+//
+// 位置は同じ世代の中でしか意味を持たない。ファイルが作り直されると
+// source_files の行が新しくなり、位置での照合は丸ごと外れる
+// （2026-09-03 outer gate で実測。rsync・復元・別マシンへの移動が全部これ）。
+// **行の内容の sha256 は世代にもバイト位置にも依存しない。**
+// JSONL の行は uuid と timestamp を含むので、別内容と衝突することは実質ない。
+func (s suppression) has(off int64, raw []byte) bool {
+	if s.offsets[off] {
+		return true
+	}
+	if len(raw) == 0 || len(s.lines) == 0 {
+		return false
+	}
+	sum := sha256.Sum256(raw)
+	return s.lines[hex.EncodeToString(sum[:])]
+}
+
+func suppressedOffsets(db *store.DB, fileID int64) (suppression, error) {
+	out := suppression{offsets: map[int64]bool{}, lines: map[string]bool{}}
 	rows, err := db.Query(`
 		select byte_offset from tombstones
 		 where source_file_id = ? and byte_offset is not null`, fileID)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	defer rows.Close()
-	out := map[int64]bool{}
 	for rows.Next() {
 		var off int64
 		if err := rows.Scan(&off); err != nil {
-			return nil, err
+			return out, err
 		}
-		out[off] = true
+		out.offsets[off] = true
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+
+	// 行の身元は**どのファイルのものでも**引く。同じ行が別のパスへ複製されていても
+	// 「これは消した行だ」は変わらない。
+	hr, err := db.Query(`select line_sha256 from tombstones where line_sha256 is not null`)
+	if err != nil {
+		return out, err
+	}
+	defer hr.Close()
+	for hr.Next() {
+		var h string
+		if err := hr.Scan(&h); err != nil {
+			return out, err
+		}
+		out.lines[h] = true
+	}
+	return out, hr.Err()
 }
 
 func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}) (writeCounts, error) {
@@ -726,7 +769,7 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	// 前回の位置から読む。ファイル全体を読み直して古い行を捨てる書き方だと、
 	// 2行の追記のために165MBを走査することになる。
 	res, walkErr := WalkFileFrom(f.Path, offset, func(l *Line) error {
-		if suppressed[l.Offset] {
+		if suppressed.has(l.Offset, l.Raw) {
 			cnt.Suppressed++
 			return nil
 		}

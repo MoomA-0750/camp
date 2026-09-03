@@ -135,12 +135,14 @@ func (db *DB) Doctor() ([]Check, error) {
 
 	// 監査ログ。追記専用が守られているか、連鎖が切れていないか。
 	//
-	// トリガは DROP TRIGGER で外せる。**止められないので、気づけるようにする。**
+	// トリガは DROP TRIGGER で外せ、連鎖も張り直せる（2026-09-03 実測）。
+	// ここで見えるのは「事故が起きていないこと」まで。
+	// 改竄を止めるのは権限境界であって、この2項目ではない。
 	tr, err := db.AuditTriggers()
 	if err != nil {
 		add("audit 追記専用", err, "")
 	} else {
-		detail := "書き換えも削除も拒む"
+		detail := "アプリ経由の書き換えと削除は拒む"
 		if len(tr) > 0 {
 			err = fmt.Errorf("トリガが外れている: %s", strings.Join(tr, ", "))
 		}
@@ -148,7 +150,7 @@ func (db *DB) Doctor() ([]Check, error) {
 	}
 
 	n, err := db.AuditChain()
-	add("audit 連鎖", err, fmt.Sprintf("%d 行が繋がっている", n))
+	add("audit 連鎖", err, fmt.Sprintf("%d 行が繋がっている（張り直された改竄は見えない）", n))
 
 	pv, err := db.ParserVersions()
 	if err != nil {
