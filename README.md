@@ -8,7 +8,9 @@ Claude Codeのセッションと会話履歴をCLI側の都合から独立して
 
 ## ステータス
 
-**Phase 2 完了（M17〜M20）。**Phase 0（M0〜M12）＋Phase 1（M13〜M16）＋プラン残量の記録（D-022）は済み。2026-09-01にリポジトリ作成。
+**Phase 2 完了（M17〜M20）＋ outer gate の指摘を反映済み（2026-09-03）。**Phase 0（M0〜M12）＋Phase 1（M13〜M16）＋プラン残量の記録（D-022）は済み。2026-09-01にリポジトリ作成。
+
+次は **Phase 2.5（保持設計）→ Phase 3（セッション駆動・ローカルまで）**。計画は `dev/active/phase2.5-plan.md` と `dev/active/phase3-plan.md`、判断の経緯は `dev/active/review-phase2-outer-gate.md`。
 
 2026-09-01に4方向の評価（取り込み層の実証・プロトコルの実証・Obsidian置き換えの実現可能性・codexによる独立レビュー）を経てフェーズを再構成した。受け入れ条件と、実装して初めて分かったことは `dev/done/phase0-plan.md`。
 
