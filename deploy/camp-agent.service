@@ -1,0 +1,37 @@
+[Unit]
+Description=Camp — 実行面。本人のユーザーで claude を起こす
+Documentation=file:%h/Documents/git-cloned/camp/dev/active/phase3-plan.md
+After=default.target
+
+# **これは user unit。** system unit にしてはいけない。
+#
+# campd（camp ユーザー）は ProtectHome=read-only が掛かっていて、`claude` が
+# 書く ~/.claude/ に手が届かない（2026-09-04 実測。dev/active/phase3-baseline.md）。
+# だから起こす役は本人のユーザーで動く必要がある。
+#
+# 入れ方:
+#   systemctl --user enable --now camp-agent.service
+#   （loginctl enable-linger は install-boundary.sh が済ませている）
+
+[Service]
+Type=simple
+# 実体は root のもの。**リポジトリ内の ./campd を指してはいけない。**
+ExecStart=/usr/local/bin/campd agent
+
+# 制御口。campd が RuntimeDirectory=camp で作る /run/camp の中。
+Environment=CAMP_AGENT_SOCK=/run/camp/agent.sock
+Environment=CAMP_CLAUDE_BIN=%h/.local/bin/claude
+
+# campd が居ないと繋げない。落ちても諦めずに待つ。
+Restart=always
+RestartSec=10s
+
+# **DB には触らない。** 触る口をコードが持っていないことは
+# internal/session の TestTheExecutionSideHasNoWayToTouchTheDatabase で見ている。
+# ここでは念のため、開ける必要が無いものを開けなくしておく。
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

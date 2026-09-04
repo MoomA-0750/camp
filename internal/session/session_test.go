@@ -1,0 +1,663 @@
+package session
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/MoomA-0750/camp/internal/store"
+)
+
+func newDB(t *testing.T) *store.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "camp.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// fakeClaude は stream-json を最小限だけ喋る子。本物を呼ばずに状態機械を回す。
+func fakeClaude(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "fake-claude")
+	body := `#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"fake-1"}'
+while IFS= read -r line; do
+  case "$line" in
+    *interrupt*) echo '{"type":"result","subtype":"aborted","session_id":"fake-1"}' ;;
+    *'"type":"user"'*) echo '{"type":"result","subtype":"success","session_id":"fake-1"}' ;;
+  esac
+done
+exit 0
+`
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// wire は supervisor と実行面を本物の socket で繋ぐ。
+func wire(t *testing.T, db *store.DB) (*Supervisor, *Agent) {
+	t.Helper()
+	s := New(db)
+	return s, attach(t, s, fakeClaude(t))
+}
+
+// attach は既にある supervisor に実行面を繋ぐ。campd の再起動を模すのに使う。
+func attach(t *testing.T, s *Supervisor, claude string) *Agent {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "a.sock")
+	c, err := s.Listen(sock, "", os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go c.Serve()
+	t.Cleanup(func() { c.Close() })
+
+	a := NewAgent(sock, claude)
+	a.Scope = false // テストで systemd に触らない
+	if err := a.Dial("test"); err != nil {
+		t.Fatal(err)
+	}
+	go a.Run()
+	t.Cleanup(func() { a.conn.Close() })
+
+	waitFor(t, 3*time.Second, func() bool { return s.AgentConnected() })
+	return a
+}
+
+func waitFor(t *testing.T, d time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%v 待っても起きなかった", d)
+}
+
+func state(t *testing.T, db *store.DB, id string) string {
+	t.Helper()
+	r, err := get(db, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r.State
+}
+
+// ---------------------------------------------------------------- 所有権
+
+// **pid の使い回しで他人のプロセスを掴まない。**
+//
+// 起動時刻を1つずらすだけで「別のもの」と判定できなければ、pid が回ってきた
+// ときに無関係なプロセスを自分の子だと思い込む——止めれば他人を殺す。
+func TestPIDReuseCannotStealAnotherProcess(t *testing.T) {
+	self := os.Getpid()
+	st, err := Starttime(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot := BootID()
+
+	if alive, known := (Owner{PID: self, Started: st, BootID: boot}).Alive(); !alive || !known {
+		t.Fatal("自分自身を生きていると判定できていない")
+	}
+	// 同じ pid、違う起動時刻＝同じ番号を取った別のプロセス。
+	alive, known := (Owner{PID: self, Started: st + 1, BootID: boot}).Alive()
+	if alive {
+		t.Fatal("pid だけで判定している。使い回された pid を掴む")
+	}
+	if !known {
+		t.Fatal("判定できたはずなのに「分からない」と言っている")
+	}
+}
+
+// 再起動を跨いだら、起動時刻は比べる意味を失う。
+func TestARebootMakesEveryOldPIDStale(t *testing.T) {
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	alive, known := (Owner{PID: self, Started: st, BootID: "00000000-0000-0000-0000-000000000000"}).Alive()
+	if alive {
+		t.Fatal("boot_id を見ていない。再起動前の pid を生きていると答える")
+	}
+	if !known {
+		t.Fatal("再起動を跨いだことは分かるはず")
+	}
+}
+
+// **「見ていないから居ない」を「居ないから居ない」と読ませない。**
+func TestUnknownLivenessIsNotReportedAsAbsent(t *testing.T) {
+	old := procRoot
+	procRoot = filepath.Join(t.TempDir(), "no-proc")
+	defer func() { procRoot = old }()
+
+	// stat が読めない（ディレクトリごと無い）。ENOENT なので「居ない」と答えるのが正しい。
+	if alive, known := (Owner{PID: 1, Started: 1, BootID: ""}).Alive(); alive || !known {
+		t.Fatalf("居ない pid の扱いがおかしい: alive=%v known=%v", alive, known)
+	}
+	// 起動時刻を持っていないものは、比べようがない＝分からない。
+	procRoot = old
+	if _, known := (Owner{PID: os.Getpid(), Started: 0, BootID: ""}).Alive(); known {
+		t.Fatal("比べる相手が無いのに「分かった」と答えている")
+	}
+}
+
+// ---------------------------------------------------------------- 再起動後の照合
+
+// campd を落として再起動したとき、幽霊と孤児を**両方**見つける。
+func TestRestartFindsBothGhostsAndOrphans(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+
+	// 孤児: 生きているプロセス（このテスト自身）を指す行。
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	mustInsert(t, db, "orphan", StateRunning, self, st, BootID())
+
+	// 幽霊: もう居ないプロセスを指す行。
+	dead := exec.Command("true")
+	if err := dead.Run(); err != nil {
+		t.Fatal(err)
+	}
+	mustInsert(t, db, "ghost", StateRunning, dead.Process.Pid, 1, BootID())
+
+	ghosts, orphans, unknown, err := s.Reconcile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ghosts != 1 || orphans != 1 || unknown != 0 {
+		t.Fatalf("幽霊=%d 孤児=%d 不明=%d（1/1/0 のはず）", ghosts, orphans, unknown)
+	}
+	if got := state(t, db, "orphan"); got != StateOrphaned {
+		t.Fatalf("孤児が %s になっている。**まだ動いているものを「終わった」と書かない**", got)
+	}
+	if got := state(t, db, "ghost"); got != StateExited {
+		t.Fatalf("幽霊が %s のまま", got)
+	}
+}
+
+func mustInsert(t *testing.T, db *store.DB, id, st string, pid int, started uint64, boot string) {
+	t.Helper()
+	if err := insert(db, Record{
+		ID: id, Cwd: "/tmp", State: st, RequestedBy: "test",
+		CreatedAt: now(), UpdatedAt: now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`update runtime_sessions set state=?, pid=?, proc_started=?, boot_id=? where id=?`,
+		st, pid, started, boot, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------- 実行面
+
+// 1本のセッションが starting→idle→running→idle→exited を通る。
+func TestOneSessionRunsThroughTheStateMachine(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+
+	rec, err := s.Start("test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != StateStarting {
+		t.Fatalf("最初は starting のはず: %s", rec.State)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	if err := s.Input(rec.ID, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	// result が返れば idle に戻る。
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	// 子が名乗った id が結びついている。**これが無いと記録と繋がらない。**
+	r, _ := get(db, rec.ID)
+	if r.ClaudeID != "fake-1" {
+		t.Fatalf("claude_id が結びついていない: %q", r.ClaudeID)
+	}
+	if r.PID == 0 || r.Started == 0 {
+		t.Fatalf("所有権が書かれていない: pid=%d started=%d", r.PID, r.Started)
+	}
+
+	if err := s.Stop(rec.ID, StopTerminate); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, func() bool { return state(t, db, rec.ID) == StateExited })
+}
+
+// **合鍵が無ければ、他のセッションのフレームを流し込めない。**
+func TestTheTokenStopsCrossSessionMixups(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+
+	rec, err := s.Start("test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	if _, ok := s.check(Msg{Session: rec.ID, Token: "でたらめ"}); ok {
+		t.Fatal("違う合鍵で通っている")
+	}
+	if _, ok := s.check(Msg{Session: rec.ID}); ok {
+		t.Fatal("合鍵なしで通っている")
+	}
+	if _, ok := s.check(Msg{Session: "知らない id", Token: "でたらめ"}); ok {
+		t.Fatal("知らないセッションが通っている")
+	}
+}
+
+// 待っていない承認には答えられない。二度答えることもできない。
+func TestAnApprovalCanOnlyBeAnsweredOnce(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, _ := s.Start("test", t.TempDir())
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	if err := s.Approve(rec.ID, "req-1", "allow", ""); err == nil {
+		t.Fatal("待っていない承認に答えられてしまった")
+	}
+	s.mu.Lock()
+	s.live[rec.ID].asked["req-1"] = true
+	s.mu.Unlock()
+
+	if err := s.Approve(rec.ID, "req-1", "allow", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(rec.ID, "req-1", "deny", ""); err == nil {
+		t.Fatal("同じ承認に二度答えられてしまった")
+	}
+}
+
+// 実行面は同時に1つだけ。**2つ繋げると、どちらが本物か campd が決められない。**
+func TestASecondExecutionSideIsRefused(t *testing.T) {
+	db := newDB(t)
+	s, a := wire(t, db)
+
+	b := NewAgent(a.Sock, a.Claude)
+	b.Scope = false
+	if err := b.Dial("test-2"); err != nil {
+		t.Fatal(err)
+	}
+	defer b.conn.Close()
+	err := b.Run()
+	if err == nil || !strings.Contains(err.Error(), "既に繋がっている") {
+		t.Fatalf("2つ目が断られていない: %v", err)
+	}
+	if !s.AgentConnected() {
+		t.Fatal("1つ目まで落ちている")
+	}
+}
+
+// 実行面が落ちたら、走っていたものは**孤児**になる。「終わった」ではない。
+func TestLosingTheExecutionSideOrphansInsteadOfBuries(t *testing.T) {
+	db := newDB(t)
+	s, a := wire(t, db)
+	rec, _ := s.Start("test", t.TempDir())
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	a.conn.Close()
+	waitFor(t, 5*time.Second, func() bool { return !s.AgentConnected() })
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateOrphaned })
+
+	if err := s.Input(rec.ID, "x"); err == nil {
+		t.Fatal("実行面が居ないのに入力を受けている")
+	}
+	// 後始末（子は生きているので明示的に止める）
+	a.stopAll("テストの後始末")
+}
+
+func TestStartingWithoutAnExecutionSideIsRefused(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	if _, err := s.Start("test", t.TempDir()); err == nil {
+		t.Fatal("実行面が無いのに起こせてしまった")
+	}
+}
+
+func TestTooManyAtOnceIsRefused(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	s.SetMaxConcurrent(1)
+	if _, err := s.Start("test", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Start("test", t.TempDir()); err == nil {
+		t.Fatal("上限を越えて起こせてしまった")
+	}
+}
+
+// cwd は実パスで見る。symlink 越しでも同じ場所を指す。
+func TestCwdIsResolvedThroughSymlinks(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveCwd(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := filepath.EvalSymlinks(real)
+	if got != want {
+		t.Fatalf("symlink を解いていない: %s（%s のはず）", got, want)
+	}
+	if _, err := resolveCwd("relative/path"); err == nil {
+		t.Fatal("相対パスが通っている")
+	}
+	f := filepath.Join(real, "file")
+	os.WriteFile(f, nil, 0o600)
+	if _, err := resolveCwd(f); err == nil {
+		t.Fatal("ファイルを cwd にできている")
+	}
+}
+
+// ---------------------------------------------------------------- 時間切れ
+
+func TestIdleAndLongTurnsAreCollected(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, _ := s.Start("test", t.TempDir())
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	// 時計を進める代わりに、待つ長さをゼロにする。
+	s.IdleAfter = 0
+	s.Tick()
+	waitFor(t, 5*time.Second, func() bool {
+		st := state(t, db, rec.ID)
+		return st == StateStopping || st == StateExited
+	})
+}
+
+func TestAStartThatNeverReportsIsGivenUp(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	// 実行面が居ることにするが、何も返さない。
+	s.agent = &agentConn{c: nopConn{}, who: "test"}
+	s.StartAfter = 0
+	rec, err := s.Start("test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Tick()
+	if got := state(t, db, rec.ID); got != StateExited {
+		t.Fatalf("起動が確認できないまま放置されている: %s", got)
+	}
+}
+
+// nopConn は書き込みを捨てるだけの接続。
+type nopConn struct{}
+
+func (nopConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (nopConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (nopConn) Close() error                     { return nil }
+func (nopConn) SetDeadline(time.Time) error      { return nil }
+func (nopConn) SetReadDeadline(time.Time) error  { return nil }
+func (nopConn) SetWriteDeadline(time.Time) error { return nil }
+func (nopConn) LocalAddr() net.Addr              { return nopAddr{} }
+func (nopConn) RemoteAddr() net.Addr             { return nopAddr{} }
+
+type nopAddr struct{}
+
+func (nopAddr) Network() string { return "nop" }
+func (nopAddr) String() string  { return "nop" }
+
+// ---------------------------------------------------------------- 分割そのもの
+
+// **実行面は DB へ触る口を持たない。**
+//
+// 分割の全部がこれ1つに掛かっているので、コードの形として確かめる。
+// agent.go が store を import した時点で、この分割は意味を失う。
+func TestTheExecutionSideHasNoWayToTouchTheDatabase(t *testing.T) {
+	b, err := os.ReadFile("agent.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"internal/store", "database/sql", "modernc.org/sqlite"} {
+		if strings.Contains(string(b), bad) {
+			t.Fatalf("agent.go が %s を参照している。**実行面に DB を持たせない**", bad)
+		}
+	}
+}
+
+func TestFrameKindsAreFoldedTheSameWayTheProbeDid(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`{"type":"system","subtype":"init"}`, "system/init"},
+		{`{"type":"control_request","request":{"subtype":"can_use_tool"}}`, "control_request/can_use_tool"},
+		{`{"type":"result"}`, "result"},
+		{`{"type":"rate_limit_event"}`, "rate_limit_event"},
+		{`{}`, "?"},
+	}
+	for _, c := range cases {
+		var f map[string]any
+		if err := jsonUnmarshal(c.in, &f); err != nil {
+			t.Fatal(err)
+		}
+		if got := FrameKind(f); got != c.want {
+			t.Errorf("%s → %s（%s のはず）", c.in, got, c.want)
+		}
+	}
+}
+
+func jsonUnmarshal(s string, v any) error {
+	return jsonDecode([]byte(s), v)
+}
+
+func TestStateNamesAreClosed(t *testing.T) {
+	for _, s := range []string{StateStarting, StateIdle, StateRunning, StateStopping, StateExited, StateOrphaned} {
+		if !validState(s) {
+			t.Errorf("%s が知らない状態になっている", s)
+		}
+	}
+	if validState("走ってる") {
+		t.Error("知らない状態が通っている")
+	}
+	if err := insert(newDB(t), Record{ID: "x", Cwd: "/", State: "でたらめ", RequestedBy: "t"}); err == nil {
+		t.Error("知らない状態のまま書けてしまった")
+	}
+	_ = fmt.Sprint()
+}
+
+// ---------------------------------------------------------------- 本物で通す
+
+// 本物の `claude` を1本起こして、承認まで含めて通す。
+//
+// 既定では走らない（トークンを使うので）。走らせるときは
+//
+//	CAMP_E2E_CLAUDE=1 go test ./internal/session/ -run RealClaude -v
+//
+// **偽物だけで済ませない理由**: 承認要求は本物の CLI が出すもので、
+// 偽物に出させると「自分で書いた形が自分で読める」ことしか確かめられない。
+func TestARealClaudeSessionRunsEndToEnd(t *testing.T) {
+	if os.Getenv("CAMP_E2E_CLAUDE") == "" {
+		t.Skip("CAMP_E2E_CLAUDE=1 のときだけ走らせる（本物を呼ぶ）")
+	}
+	bin := os.Getenv("CAMP_CLAUDE_BIN")
+	if bin == "" {
+		bin = os.Getenv("HOME") + "/.local/bin/claude"
+	}
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("claude が無い: %v", err)
+	}
+
+	db := newDB(t)
+	s := New(db)
+	sock := filepath.Join(t.TempDir(), "a.sock")
+	c, err := s.Listen(sock, "", os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go c.Serve()
+	defer c.Close()
+
+	a := NewAgent(sock, bin)
+	a.Scope = true // **孫まで包む。本物でこそ確かめる意味がある**
+	if err := a.Dial("e2e"); err != nil {
+		t.Fatal(err)
+	}
+	go a.Run()
+	defer a.conn.Close()
+	waitFor(t, 3*time.Second, func() bool { return s.AgentConnected() })
+
+	work := t.TempDir()
+	rec, err := s.Start("e2e", work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop(rec.ID, StopTerminate)
+	waitFor(t, 30*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	if err := s.Input(rec.ID, "Write a file named hello.txt containing exactly `hi` in the current directory, then say done."); err != nil {
+		t.Fatal(err)
+	}
+
+	// 承認は**1ターンに何度でも来る。**（2026-09-04 実測。最初この test は
+	// 1回だけ答えて止まった。1つ答えて終わりにすると、2つ目で子が待ち続ける。）
+	// 画面も列として扱う必要がある——M28 の受け入れ条件に効く。
+	answered := 0
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			for _, req := range s.Pending(rec.ID) {
+				if err := s.Approve(rec.ID, req, "allow", ""); err == nil {
+					answered++
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	waitFor(t, 180*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(work, "hello.txt"))
+		return err == nil
+	})
+	waitFor(t, 180*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if answered == 0 {
+		t.Fatal("承認が一度も来ていない。**来なければ、この設計は成り立っていない**")
+	}
+	t.Logf("承認を %d 回答えた", answered)
+
+	r, _ := get(db, rec.ID)
+	if r.ClaudeID == "" {
+		t.Fatal("子が名乗った session_id を結びつけていない")
+	}
+	if r.Scope == "" {
+		t.Fatal("scope で包んでいない。孫まで止められない")
+	}
+	// scope が本当に居たか。**「包んだつもり」を確かめる。**
+	cg := "/sys/fs/cgroup/user.slice/user-" + fmt.Sprint(os.Getuid()) +
+		".slice/user@" + fmt.Sprint(os.Getuid()) + ".service/app.slice/" + r.Scope
+	if _, err := os.Stat(cg); err != nil {
+		t.Errorf("scope の cgroup が見つからない（%s）: %v", cg, err)
+	}
+	t.Logf("claude_id=%s pid=%d scope=%s", r.ClaudeID, r.PID, r.Scope)
+
+	if err := s.Stop(rec.ID, StopTerminate); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 60*time.Second, func() bool { return state(t, db, rec.ID) == StateExited })
+	if _, err := os.Stat(cg); err == nil {
+		t.Error("止めたのに cgroup が残っている")
+	}
+}
+
+// campd を落として起こし直したとき、**生きている子を「終わった」と書かない。**
+//
+// 単体の Reconcile とは別に、本当に走っている子で確かめる。ここが逆になると、
+// 画面には「終わった」と出ているのに、プロセスは動き続けることになる。
+func TestARestartWhileAChildIsAliveMarksItOrphanAndThenReapsIt(t *testing.T) {
+	db := newDB(t)
+	s1, a1 := wire(t, db)
+
+	rec, err := s1.Start("test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	r, _ := get(db, rec.ID)
+	if alive, known := r.Owner().Alive(); !alive || !known {
+		t.Fatal("そもそも子が生きていない")
+	}
+
+	// campd が落ちた（実行面と子はそのまま）。
+	s2 := New(db)
+	ghosts, orphans, unknown, err := s2.Reconcile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orphans != 1 || ghosts != 0 || unknown != 0 {
+		t.Fatalf("幽霊=%d 孤児=%d 不明=%d（0/1/0 のはず）", ghosts, orphans, unknown)
+	}
+	if got := state(t, db, rec.ID); got != StateOrphaned {
+		t.Fatalf("%s になっている。**生きているものを埋めてはいけない**", got)
+	}
+
+	// 古い実行面を落として、新しいのを繋ぐ。孤児は始末される。
+	a1.conn.Close()
+	attach(t, s2, a1.Claude)
+	waitFor(t, 10*time.Second, func() bool { return state(t, db, rec.ID) == StateExited })
+
+	r, _ = get(db, rec.ID)
+	if alive, _ := r.Owner().Alive(); alive {
+		t.Fatal("exited と書いたのにプロセスが生きている")
+	}
+	if !strings.Contains(r.ExitReason, "孤児") {
+		t.Fatalf("何があったか分からない終わり方: %q", r.ExitReason)
+	}
+}
+
+// **始末したという申告を、そのまま信じない。**
+//
+// 実行面は本人のユーザーで動くので、嘘を言える。生きているものを「止めた」と
+// 言われたら、campd は /proc を見て食い違いを記録する。
+func TestAFalseReapIsCaughtByLookingAtProc(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	mustInsert(t, db, "liar", StateOrphaned, self, st, BootID())
+
+	s.dispatchForTest(Msg{T: MsgReaped, Session: "liar", Reason: "止めた（嘘）"})
+
+	if got := state(t, db, "liar"); got == StateExited {
+		t.Fatal("生きているのに「終わった」と書いた。申告を鵜呑みにしている")
+	}
+	rows, err := db.Query(`select detail_json from audit where action='session.reap'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var found bool
+	for rows.Next() {
+		var d string
+		rows.Scan(&d)
+		if strings.Contains(d, "まだ生きている") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("食い違いが監査ログに残っていない")
+	}
+}

@@ -1,0 +1,413 @@
+package session
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/MoomA-0750/camp/internal/audit"
+)
+
+// Control は実行面と話す口。
+//
+// 報告口（internal/report）が一方通行の追記専用なのに対し、こちらは双方向。
+// **だからこそ、繋げる相手を絞る。** socket は 0660 で campreport グループ、
+// さらに uid を指定して照合する。名乗りは見ない（SO_PEERCRED で決める）。
+type Control struct {
+	s        *Supervisor
+	ln       net.Listener
+	path     string
+	allowUID int
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// agentConn は繋がっている実行面。**同時に1つだけ。**
+//
+// 2つ繋げると、どちらが本物かを campd が決められない（両方とも同じ uid で
+// 動いている）。先に繋いだほうを本物として、あとは断る。
+type agentConn struct {
+	c   net.Conn
+	who string
+	mu  sync.Mutex
+}
+
+func (a *agentConn) send(m Msg) error {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if len(b) > maxLine {
+		return fmt.Errorf("送る行が長すぎる（%d バイト）", len(b))
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_, err = a.c.Write(append(b, '\n'))
+	return err
+}
+
+// Listen は制御口を開く。allowUID が 0 以上ならその uid 以外を断る。
+func (s *Supervisor) Listen(path, group string, allowUID int) (*Control, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, err
+	}
+	if len(path) >= 108 {
+		return nil, fmt.Errorf(
+			"制御口のパスが長すぎる（%d バイト、上限 107）: %s", len(path), path)
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		os.Remove(path)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	if group != "" {
+		if err := regroupSock(dir, path, group); err != nil {
+			ln.Close()
+			os.Remove(path)
+			return nil, err
+		}
+	}
+	return &Control{s: s, ln: ln, path: path, allowUID: allowUID}, nil
+}
+
+func regroupSock(dir, path, group string) error {
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		return fmt.Errorf("グループ %s が無い: %w", group, err)
+	}
+	gid, err := strconv.Atoi(g.Gid)
+	if err != nil {
+		return err
+	}
+	for _, p := range []string{dir, path} {
+		if err := os.Chown(p, -1, gid); err != nil {
+			return fmt.Errorf("%s を %s のものにできない: %w", p, group, err)
+		}
+	}
+	return os.Chmod(dir, 0o750)
+}
+
+// Addr は開いている socket のパス。
+func (c *Control) Addr() string { return c.path }
+
+// Close は口を閉じる。
+func (c *Control) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	err := c.ln.Close()
+	os.Remove(c.path)
+	return err
+}
+
+// Serve は受け付け続ける。
+func (c *Control) Serve() error {
+	for {
+		conn, err := c.ln.Accept()
+		if err != nil {
+			c.mu.Lock()
+			closed := c.closed
+			c.mu.Unlock()
+			if closed {
+				return nil
+			}
+			return err
+		}
+		go c.handle(conn)
+	}
+}
+
+func (c *Control) handle(conn net.Conn) {
+	defer conn.Close()
+
+	uid, pid, err := peerUID(conn)
+	if err != nil {
+		writeMsg(conn, Msg{T: MsgError, Error: "呼び出し元を確かめられない"})
+		return
+	}
+	if c.allowUID >= 0 && int(uid) != c.allowUID {
+		writeMsg(conn, Msg{T: MsgError, Error: "この uid は実行面になれない"})
+		c.s.audit("", "agent.connect", fmt.Sprintf("uid:%d", uid),
+			"許された uid ではない", audit.Denied)
+		return
+	}
+	who := fmt.Sprintf("uid:%d pid:%d", uid, pid)
+
+	a := &agentConn{c: conn, who: who}
+
+	// **最初の1行は hello でなければならない。** 名乗る前に指示は受けない。
+	sc := bufio.NewScanner(conn)
+	sc.Buffer(make([]byte, 0, 64*1024), maxLine)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if !sc.Scan() {
+		return
+	}
+	var hello Msg
+	if err := json.Unmarshal(sc.Bytes(), &hello); err != nil || hello.T != MsgHello {
+		writeMsg(conn, Msg{T: MsgError, Error: "最初に hello が要る"})
+		return
+	}
+
+	c.s.mu.Lock()
+	if c.s.agent != nil {
+		c.s.mu.Unlock()
+		writeMsg(conn, Msg{T: MsgError, Error: "実行面は既に繋がっている"})
+		c.s.audit("", "agent.connect", who, "既に繋がっているので断った", audit.Denied)
+		return
+	}
+	c.s.agent = a
+	c.s.mu.Unlock()
+
+	c.s.audit("", "agent.connect", who, "実行面が繋がった（version="+hello.Version+"）", audit.OK)
+	a.send(Msg{T: MsgWelcome})
+	c.reapOrphans(a)
+
+	defer c.dropAgent(a)
+
+	for {
+		// 繋ぎっぱなしで黙っているだけの接続を許さない。
+		conn.SetReadDeadline(time.Now().Add(2 * idleHeartbeat))
+		if !sc.Scan() {
+			return
+		}
+		var m Msg
+		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
+			a.send(Msg{T: MsgError, Error: "読めない行"})
+			continue
+		}
+		c.dispatch(a, m)
+	}
+}
+
+// idleHeartbeat は実行面が生きていることを示す間隔。
+const idleHeartbeat = 30 * time.Second
+
+// dropAgent は実行面が落ちたときの後始末。
+//
+// **子は死んでいない。** 見張る者だけが居なくなったので、走っていたものは
+// 孤児になる。「終わった」とは書かない。
+func (c *Control) dropAgent(a *agentConn) {
+	c.s.mu.Lock()
+	if c.s.agent != a {
+		c.s.mu.Unlock()
+		return
+	}
+	c.s.agent = nil
+	ids := make([]string, 0, len(c.s.live))
+	for id := range c.s.live {
+		ids = append(ids, id)
+	}
+	c.s.live = map[string]*liveSession{}
+	c.s.mu.Unlock()
+
+	c.s.audit("", "agent.disconnect", a.who,
+		fmt.Sprintf("実行面が落ちた。見張っていたのは %d 本", len(ids)), audit.Error)
+	for _, id := range ids {
+		_ = setState(c.s.db, id, StateOrphaned)
+		c.s.audit(id, "session.orphan", "", "実行面が落ちた", audit.Error)
+	}
+}
+
+// reapOrphans は前回の残りを実行面に始末してもらう。
+func (c *Control) reapOrphans(a *agentConn) {
+	rows, err := listLive(c.s.db)
+	if err != nil {
+		return
+	}
+	for _, r := range rows {
+		if r.State != StateOrphaned {
+			continue
+		}
+		a.send(Msg{T: MsgReap, Session: r.ID, PID: r.PID,
+			Started: r.Started, BootID: r.BootID, Scope: r.Scope})
+	}
+}
+
+func (c *Control) dispatch(a *agentConn, m Msg) {
+	s := c.s
+	switch m.T {
+	case MsgStarted:
+		ls, ok := s.check(m)
+		if !ok {
+			a.send(Msg{T: MsgError, Session: m.Session, Error: "知らないセッション"})
+			return
+		}
+		// **実行面の言う pid を鵜呑みにしない。** campd 自身が /proc を読んで
+		// 起動時刻を確かめる。読めない環境では「確かめられなかった」と記録する
+		// ——「見ていないから合っている」にはしない。
+		o := Owner{PID: m.PID, Started: m.Started, BootID: m.BootID}
+		if st, err := Starttime(m.PID); err == nil {
+			if st != m.Started {
+				s.audit(m.Session, "session.started", strconv.Itoa(m.PID),
+					fmt.Sprintf("実行面の言う起動時刻(%d)が /proc(%d) と違う", m.Started, st),
+					audit.Error)
+				o.Started = st // **自分で読んだほうを採る**
+			}
+		} else {
+			s.audit(m.Session, "session.started", strconv.Itoa(m.PID),
+				"起動時刻を自分で確かめられなかった: "+err.Error(), audit.Error)
+		}
+		if o.BootID == "" {
+			o.BootID = BootID()
+		}
+
+		s.mu.Lock()
+		ls.rec.State = StateIdle
+		ls.rec.PID, ls.rec.Started, ls.rec.BootID, ls.rec.Scope = o.PID, o.Started, o.BootID, m.Scope
+		ls.last = s.Now()
+		s.mu.Unlock()
+
+		_ = setOwner(s.db, m.Session, o, m.Scope)
+		s.audit(m.Session, "session.started", strconv.Itoa(m.PID),
+			"scope="+m.Scope, audit.OK)
+
+	case MsgFrame:
+		ls, ok := s.check(m)
+		if !ok {
+			return
+		}
+		s.mu.Lock()
+		ls.last = s.Now()
+		switch m.Kind {
+		case "result":
+			// ターンが終わった。次の入力を受けられる。
+			if ls.rec.State == StateRunning {
+				ls.rec.State = StateIdle
+			}
+			ls.turn = time.Time{}
+		case "control_request/can_use_tool":
+			if m.ReqID != "" {
+				ls.asked[m.ReqID] = true
+			}
+		}
+		s.mu.Unlock()
+
+		if m.Kind == "result" {
+			_ = setState(s.db, m.Session, StateIdle)
+		}
+		if m.ClaudeID != "" {
+			_ = setClaudeID(s.db, m.Session, m.ClaudeID)
+		}
+		if m.Kind == "control_request/can_use_tool" {
+			s.audit(m.Session, "tool.ask", m.Text, m.ReqID, audit.OK)
+		}
+
+	case MsgExited:
+		if _, ok := s.check(m); !ok {
+			return
+		}
+		s.mu.Lock()
+		delete(s.live, m.Session)
+		s.mu.Unlock()
+		_ = finish(s.db, m.Session, m.Code, m.Reason)
+		out := audit.OK
+		if m.Code != 0 {
+			out = audit.Error
+		}
+		s.audit(m.Session, "session.exit", strconv.Itoa(m.Code), m.Reason, out)
+
+	case MsgFailed:
+		if _, ok := s.check(m); !ok {
+			return
+		}
+		s.fail(m.Session, m.Error)
+
+	case MsgReaped:
+		// **始末したという申告を、そのまま信じない。** /proc を見る。
+		r, err := get(s.db, m.Session)
+		if err != nil {
+			return
+		}
+		alive, known := r.Owner().Alive()
+		switch {
+		case alive:
+			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID),
+				"始末したと言われたが、まだ生きている", audit.Error)
+		case !known:
+			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID),
+				"始末したと言われたが、確かめられなかった", audit.Error)
+		default:
+			_ = finish(s.db, m.Session, m.Code, "孤児を始末した: "+m.Reason)
+			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, audit.OK)
+		}
+
+	case MsgPing:
+		// 生きている合図。何もしない（読み取りの期限が延びるだけ）。
+
+	case MsgHello:
+		a.send(Msg{T: MsgError, Error: "hello は1回だけ"})
+
+	default:
+		a.send(Msg{T: MsgError, Error: "知らない種類: " + m.T})
+	}
+}
+
+// check は「そのセッションを、その合鍵で触ってよいか」。
+//
+// **合鍵が防ぐのは取り違えだけ。** 同じユーザーで動く者はメモリから鍵を読めるので、
+// なりすましは防げない。ここで止まるのは、鍵を持っていない別のセッションの
+// 承認に答えることと、起こしてもいないセッションのフレームを流し込むこと。
+func (s *Supervisor) check(m Msg) (*liveSession, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ls := s.live[m.Session]
+	if ls == nil {
+		return nil, false
+	}
+	if m.Token == "" || m.Token != ls.token {
+		return nil, false
+	}
+	return ls, true
+}
+
+func writeMsg(c net.Conn, m Msg) {
+	b, _ := json.Marshal(m)
+	c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	c.Write(append(b, '\n'))
+}
+
+// peerUID は接続の向こう側を、名乗りではなくカーネルから取る。
+func peerUID(c net.Conn) (uid uint32, pid int32, err error) {
+	uc, ok := c.(*net.UnixConn)
+	if !ok {
+		return 0, 0, fmt.Errorf("unix socket ではない")
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return 0, 0, err
+	}
+	var cred *syscall.Ucred
+	var cerr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, cerr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+	}); err != nil {
+		return 0, 0, err
+	}
+	if cerr != nil {
+		return 0, 0, cerr
+	}
+	return cred.Uid, cred.Pid, nil
+}
+
+// dispatchForTest はテストから1通だけ流し込む。実行面を用意せずに済ませる。
+func (s *Supervisor) dispatchForTest(m Msg) {
+	c := &Control{s: s}
+	c.dispatch(&agentConn{c: nil, who: "test"}, m)
+}

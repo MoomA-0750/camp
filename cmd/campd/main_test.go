@@ -170,3 +170,18 @@ func TestPermissionDeniedExplainsItself(t *testing.T) {
 		t.Errorf("権限の話ではないのにグループの説明をしている: %s", got)
 	}
 }
+
+// `campd agent` は DB を開かない。**幽霊DBのガードに巻き込まれてはいけない。**
+//
+// M25.5 で同じ形の事故を起こした（ガードが campd report と statusLine を
+// 止めた）。実行面は本人のユーザーで動き、そこに DB は無いのが正しい。
+func TestTheExecutionSideIsNotBlockedByTheGhostGuard(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such.sqlite")
+	if err := checkNotAGhostDB("agent", "", missing); err != nil {
+		t.Fatalf("実行面が止められている: %v", err)
+	}
+	// 一方、DB を読むものは今までどおり止まる。
+	if err := checkNotAGhostDB("runtime", "", missing); err == nil {
+		t.Fatal("DB を読むのに止まっていない")
+	}
+}

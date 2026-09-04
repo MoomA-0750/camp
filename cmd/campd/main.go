@@ -20,6 +20,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/retain"
 	"github.com/MoomA-0750/camp/internal/search"
 	"github.com/MoomA-0750/camp/internal/secrets"
+	"github.com/MoomA-0750/camp/internal/session"
 	"github.com/MoomA-0750/camp/internal/snapshot"
 	"github.com/MoomA-0750/camp/internal/store"
 	"github.com/MoomA-0750/camp/internal/thread"
@@ -111,6 +113,10 @@ func run(args []string) error {
 		return cmdSecrets(rest)
 	case "serve":
 		return cmdServe(rest)
+	case "agent":
+		return cmdAgent(rest)
+	case "runtime":
+		return cmdRuntime(rest)
 	case "passwd":
 		return cmdPasswd(rest)
 	case "vault":
@@ -157,6 +163,8 @@ usage:
   campd secrets [-list]   認証情報らしい場所を記録して並べる（何も書き換えない）
   campd passwd            ログインパスワードを設定する（開いている口は全部閉じる）
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
+  campd agent             実行面。本人のユーザーで claude を起こす（DBには触らない）
+  campd runtime           Camp が起こしたセッションの台帳を読む
   campd login-url         使い捨てのログインURLを1本出す（開発中の入口）
   campd vault scan  [DIR] Vault を歩いて内訳を出す（DBには書かない）
   campd vault index [DIR] Vault を索引する（Vault側には一切書かない）
@@ -597,7 +605,7 @@ func checkNotAGhostDB(cmd, sub, path string) error {
 	case "migrate", "passwd", "version", "help", "":
 		return nil
 	// DB を開かないもの。**止める理由が無い。**
-	case "report", "scan":
+	case "report", "scan", "agent":
 		return nil
 	}
 	// `limits record` は DB を開けなければ自分で報告口へ回す。
@@ -994,6 +1002,8 @@ func cmdServe(args []string) error {
 	secure := fs.Bool("secure-cookie", false, "Cookie に Secure を付ける（TLS 終端の後ろに置くとき）")
 	sock := fs.String("report-sock", defaultReportSock(), "追記専用の報告口（空なら開かない）")
 	sockGroup := fs.String("report-group", os.Getenv("CAMP_REPORT_GROUP"), "報告口を持たせるグループ（空なら変えない）")
+	agentSock := fs.String("agent-sock", defaultAgentSock(), "実行面と話す制御口（空なら開かない）")
+	maxConc := fs.Int("max-sessions", 4, "同時に走らせるセッションの上限")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1019,8 +1029,20 @@ func cmdServe(args []string) error {
 			allow = append(allow, o)
 		}
 	}
+	// **Camp が起こしたセッションを見張る側。** 起こす当人はここには居ない
+	// （camp ユーザーでは `claude` を起こせない。dev/active/phase3-baseline.md）。
+	sup := session.New(db)
+	sup.SetMaxConcurrent(*maxConc)
+	// 落ちている間に何が起きたかを、起き抜けに突き合わせる。
+	if g, o, u, err := sup.Reconcile(); err != nil {
+		return fmt.Errorf("前回の残りを照合できない: %w", err)
+	} else if g+o+u > 0 {
+		fmt.Printf("前回の残り  幽霊 %d / 孤児 %d / 判定できず %d\n", g, o, u)
+	}
+
 	srv, err := httpapi.New(db, httpapi.Options{
 		Addr: *addr, WebDir: *web, Origins: allow, SecureCookie: *secure,
+		Sessions: sup,
 	})
 	if err != nil {
 		return err
@@ -1047,6 +1069,24 @@ func cmdServe(args []string) error {
 		go rl.Serve()
 		fmt.Printf("報告口    %s（追記だけ。読み出しも書き換えも命令が無い）\n", rl.Addr())
 	}
+
+	// **実行面と話す口。** 報告口が一方通行の追記専用なのに対し、こちらは双方向。
+	// だから繋げる相手を uid で絞る。
+	if *agentSock != "" {
+		uid, why := agentUID()
+		cl, err := sup.Listen(*agentSock, *sockGroup, uid)
+		if err != nil {
+			return fmt.Errorf("制御口を開けない: %w", err)
+		}
+		defer cl.Close()
+		go cl.Serve()
+		fmt.Printf("制御口    %s（実行面は uid=%d だけ / %s）\n", cl.Addr(), uid, why)
+	}
+
+	// 時間切れの回収。
+	supDone := make(chan struct{})
+	defer close(supDone)
+	go sup.Run(supDone, 30*time.Second)
 
 	// Ctrl-C で受け付けをやめ、走っている要求を待つ。
 	stop := make(chan os.Signal, 1)
@@ -2168,4 +2208,121 @@ func whyDenied(sock string, err error) string {
   セッションからは繋がらない。
     確認: id -nG | tr ' ' '\n' | grep %s
     直す: sudo usermod -aG %s $USER   （そのあとログインし直す）`, want, want, want)
+}
+
+// defaultAgentSock は実行面と話す制御口の場所。報告口と同じ置き場に開く。
+func defaultAgentSock() string {
+	if p := os.Getenv("CAMP_AGENT_SOCK"); p != "" {
+		return p
+	}
+	if fi, err := os.Stat("/run/camp"); err == nil && fi.IsDir() {
+		return "/run/camp/agent.sock"
+	}
+	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
+		return filepath.Join(d, "camp-agent.sock")
+	}
+	return ""
+}
+
+// agentUID は「実行面になってよい uid」を決める。
+//
+// **推測しない。** 明示された値 > 会話記録の持ち主 > 指定なし、の順で見て、
+// どれで決まったかを呼び出し側が言えるようにする。
+func agentUID() (uid int, why string) {
+	if v := os.Getenv("CAMP_AGENT_UID"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n, "CAMP_AGENT_UID"
+		}
+	}
+	p := os.Getenv("CAMP_CLAUDE_PROJECTS")
+	if p == "" {
+		p = defaultClaudeProjects()
+	}
+	if fi, err := os.Stat(p); err == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			return int(st.Uid), "会話記録の持ち主（" + p + "）"
+		}
+	}
+	return -1, "指定なし（グループに入っている者は誰でも）"
+}
+
+// cmdAgent は実行面。**本人のユーザーで動き、`claude` を起こすことだけをする。**
+//
+// campd は camp ユーザーで動き ProtectHome=read-only が掛かっているので、
+// `claude` が書く ~/.claude/ に手が届かない（2026-09-04 実測。
+// dev/active/phase3-baseline.md 4節）。だから起こす役はこちらに居る。
+//
+// **DB は開かない。開く口を持たない。**
+func cmdAgent(args []string) error {
+	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
+	sock := fs.String("sock", defaultAgentSock(), "制御口のパス")
+	claudeBin := fs.String("claude", defaultClaudeBin(), "claude の実体")
+	scope := fs.Bool("scope", true, "systemd の transient scope で包む（孫まで止めるため）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *sock == "" {
+		return fmt.Errorf("制御口の場所が決まらない。-sock か CAMP_AGENT_SOCK で指す")
+	}
+	if _, err := os.Stat(*claudeBin); err != nil {
+		return fmt.Errorf("claude が見つからない（%s）: %w", *claudeBin, err)
+	}
+
+	a := session.NewAgent(*sock, *claudeBin)
+	a.Scope = *scope
+	if err := a.Dial(Version); err != nil {
+		return fmt.Errorf("%s%s", err, whyDenied(*sock, err))
+	}
+	fmt.Printf("実行面    %s へ繋いだ\nclaude    %s\nscope     %v\n",
+		*sock, *claudeBin, *scope)
+	fmt.Println("**DB には触らない。** 起こす・渡す・止める、それだけ。")
+	return a.Run()
+}
+
+// defaultClaudeBin は `claude` の実体。PATH の別名ではなく実体を指す。
+func defaultClaudeBin() string {
+	if p := os.Getenv("CAMP_CLAUDE_BIN"); p != "" {
+		return p
+	}
+	if p, err := exec.LookPath("claude"); err == nil {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local/bin/claude")
+	}
+	return "claude"
+}
+
+// cmdRuntime は Camp が起こしたセッションの台帳を見る。**読むだけ。**
+func cmdRuntime(args []string) error {
+	fs := flag.NewFlagSet("runtime", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	n := fs.Int("n", 20, "最大件数")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	rows, err := session.List(db, *n)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("まだ1本も起こしていない。")
+		return nil
+	}
+	for _, r := range rows {
+		fmt.Printf("%-10s %-9s pid=%-7d %s\n  cwd=%s\n",
+			firstN(r.ID, 8), r.State, r.PID, r.CreatedAt, r.Cwd)
+		if r.ClaudeID != "" {
+			fmt.Printf("  claude=%s\n", r.ClaudeID)
+		}
+		if r.ExitReason != "" {
+			fmt.Printf("  終わり=%s\n", r.ExitReason)
+		}
+	}
+	return nil
 }

@@ -133,3 +133,32 @@ Proサブスクで動くことの確認が3つ取れた:
 - ターン中の SIGINT
 - `hook_callback` の往復
 - `can_use_tool` の任意フィールド、`request_user_dialog`、`initialize` のオプション一覧は**バイナリに埋め込まれた Zod スキーマから読んだもので、実行して確かめてはいない**
+
+---
+
+## 9. 2.1.260 での再確認（2026-09-04）
+
+上は 2.1.252 の実測。Phase 3 の着手前に、いま入っている版で同じことが言えるかを
+測り直した（`dev/scripts/probe_session.py`、記録は `dev/active/phase3-baseline.md`）。
+
+**変わっていなかった。** `--permission-prompt-tool stdio` も `get_usage` も
+`get_context_usage` も `rate_limit_event` も、`system/init` がターンごとに出ることも同じ。
+
+新しく分かったことが2つある。
+
+**(a) `rate_limit_info` は上に書いたより広い。** 実測で
+`status` / `overageStatus` / `overageDisabledReason` / `isUsingOverage` が付いていた。
+超過枠を使っているかどうかが分かるので、残量表示に使える。
+
+**(b) 承認は1ターンに何度でも来る。**
+
+これは実際に踏んで気づいた。M26 の e2e テストを「承認が1つ来たら答えて、あとは
+result を待つ」形で書いたら、`can_use_tool` が2つ来て、2つ目に誰も答えないまま
+子が待ち続け、2分の待ちが空振りした。
+
+> **UI は待ち行列として作る。** 「いま出ている承認」を1つだけ持つ形にすると、
+> 同じ止まり方をする。M28 の受け入れ条件に入れた。
+
+頻度そのものは低い。3回の工具呼び出しのうち承認が要ったのは1回で、
+`Bash(id -un)` と `Read` は読み取り専用 fastpath を通った。**どれが来るかは
+予測できない**ので、設計は変わらず「来たら出す」。

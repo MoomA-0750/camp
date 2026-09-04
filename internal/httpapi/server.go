@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoomA-0750/camp/internal/session"
 	"github.com/MoomA-0750/camp/internal/store"
 	"github.com/MoomA-0750/camp/web"
 )
@@ -31,6 +32,9 @@ type Options struct {
 	// SecureCookie は Cookie に Secure を付けるか。TLS 終端の後ろに置くときだけ true。
 	SecureCookie bool
 	Log          *slog.Logger
+	// Sessions があれば /api/runtime を開く。無ければ開かない
+	// （campd serve 以外の入口から、うっかり実行面を生やさないため）。
+	Sessions *session.Supervisor
 }
 
 // Server は Camp の HTTP サーバー。
@@ -47,12 +51,13 @@ type Server struct {
 	throttle     throttle
 	log          *slog.Logger
 	views        viewCache
+	sessions     *session.Supervisor
 }
 
 // New はハンドラを組み立てる。
 func New(db *store.DB, o Options) (*Server, error) {
 	s := &Server{db: db, opts: o, mux: http.NewServeMux(),
-		secureCookie: o.SecureCookie, log: o.Log}
+		secureCookie: o.SecureCookie, log: o.Log, sessions: o.Sessions}
 	if s.log == nil {
 		s.log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
@@ -93,6 +98,7 @@ func New(db *store.DB, o Options) (*Server, error) {
 	s.static = http.FileServer(http.FS(s.assets))
 
 	s.routes()
+	s.runtimeRoutes()
 	return s, nil
 }
 
