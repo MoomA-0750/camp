@@ -2270,13 +2270,14 @@ func cmdAgent(args []string) error {
 
 	a := session.NewAgent(*sock, *claudeBin)
 	a.Scope = *scope
-	if err := a.Dial(Version); err != nil {
+	fmt.Printf("実行面    %s\nclaude    %s\nscope     %v\n落とし先  %s\n",
+		*sock, *claudeBin, *scope, a.LogDir)
+	fmt.Println("**DB には触らない。** 起こす・渡す・止める、それだけ。")
+	// 繋ぎ直しながら動き続ける。**campd の入れ替えで子を殺さない。**
+	if err := a.Serve(Version); err != nil {
 		return fmt.Errorf("%s%s", err, whyDenied(*sock, err))
 	}
-	fmt.Printf("実行面    %s へ繋いだ\nclaude    %s\nscope     %v\n",
-		*sock, *claudeBin, *scope)
-	fmt.Println("**DB には触らない。** 起こす・渡す・止める、それだけ。")
-	return a.Run()
+	return nil
 }
 
 // defaultClaudeBin は `claude` の実体。PATH の別名ではなく実体を指す。

@@ -177,6 +177,9 @@ func (c *Control) handle(conn net.Conn) {
 
 	c.s.audit("", "agent.connect", who, "実行面が繋がった（version="+hello.Version+"）", audit.OK)
 	a.send(Msg{T: MsgWelcome})
+	// **引き取り直しが先。** 先に孤児を始末すると、実行面がまだ抱えている
+	// 子まで殺してしまう（campd を入れ替えるたびにセッションが飛ぶ）。
+	c.readopt(hello.Held)
 	c.reapOrphans(a)
 
 	defer c.dropAgent(a)
@@ -225,6 +228,50 @@ func (c *Control) dropAgent(a *agentConn) {
 	}
 }
 
+// readopt は実行面がまだ抱えている子を引き取り直す。
+//
+// **名乗りをそのまま信じない。** pid と起動時刻は campd が /proc で確かめる。
+// 確かめられなければ引き取らない——「たぶん生きている」で台帳を進めない。
+func (c *Control) readopt(held []Held) {
+	s := c.s
+	for _, h := range held {
+		r, err := get(s.db, h.ID)
+		if err != nil {
+			s.audit(h.ID, "session.readopt", "", "台帳に無い", audit.Error)
+			continue
+		}
+		if r.State == StateExited {
+			s.audit(h.ID, "session.readopt", "", "台帳では終わっている", audit.Error)
+			continue
+		}
+		o := Owner{PID: h.PID, Started: h.Started, BootID: h.BootID}
+		alive, known := o.Alive()
+		if !known {
+			s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
+				"生死を確かめられないので引き取らない", audit.Error)
+			continue
+		}
+		if !alive {
+			s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
+				"抱えていると言われたが、そのプロセスは居ない", audit.Error)
+			continue
+		}
+		s.mu.Lock()
+		if s.live[h.ID] != nil {
+			s.mu.Unlock()
+			continue
+		}
+		r.State = StateIdle
+		r.PID, r.Started, r.BootID, r.Scope = o.PID, o.Started, o.BootID, h.Scope
+		s.live[h.ID] = &liveSession{rec: r, token: h.Token, last: s.Now(),
+			asked: map[string]bool{}}
+		s.mu.Unlock()
+		_ = setOwner(s.db, h.ID, o, h.Scope)
+		s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
+			"実行面がまだ抱えていたので引き取り直した", audit.OK)
+	}
+}
+
 // reapOrphans は前回の残りを実行面に始末してもらう。
 func (c *Control) reapOrphans(a *agentConn) {
 	rows, err := listLive(c.s.db)
@@ -233,6 +280,13 @@ func (c *Control) reapOrphans(a *agentConn) {
 	}
 	for _, r := range rows {
 		if r.State != StateOrphaned {
+			continue
+		}
+		// 引き取り直したものは孤児ではない。
+		c.s.mu.Lock()
+		adopted := c.s.live[r.ID] != nil
+		c.s.mu.Unlock()
+		if adopted {
 			continue
 		}
 		a.send(Msg{T: MsgReap, Session: r.ID, PID: r.PID,
@@ -305,8 +359,15 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		if m.ClaudeID != "" {
 			_ = setClaudeID(s.db, m.Session, m.ClaudeID)
 		}
-		if m.Kind == "control_request/can_use_tool" {
-			s.audit(m.Session, "tool.ask", m.Text, m.ReqID, audit.OK)
+		if m.Kind == "control_request/can_use_tool" && m.ReqID != "" {
+			// **待ちを DB に置く。** campd を入れ替えても、誰が何を訊かれて
+			// いたかが消えないように。
+			if err := ask(s.db, m.Session, m.ReqID, m.Text, string(m.Frame), s.Now()); err != nil {
+				s.audit(m.Session, "tool.ask", m.Text,
+					"承認の記録に失敗: "+err.Error(), audit.Error)
+			} else {
+				s.audit(m.Session, "tool.ask", m.Text, m.ReqID, audit.OK)
+			}
 		}
 
 	case MsgExited:
@@ -317,6 +378,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		delete(s.live, m.Session)
 		s.mu.Unlock()
 		_ = finish(s.db, m.Session, m.Code, m.Reason)
+		s.CloseApprovals(m.Session)
 		out := audit.OK
 		if m.Code != 0 {
 			out = audit.Error

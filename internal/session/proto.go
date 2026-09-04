@@ -61,6 +61,21 @@ type Msg struct {
 
 	// hello / welcome
 	Version string `json:"version,omitempty"`
+	// Held は実行面がいま抱えている子。**campd を入れ替えても殺さないため。**
+	Held []Held `json:"held,omitempty"`
+}
+
+// Held は実行面が抱えている子1つ。campd はこれを見て引き取り直す。
+//
+// **中身をそのまま信じない。** pid と起動時刻は campd が /proc で確かめる。
+type Held struct {
+	ID      string `json:"id"`
+	Token   string `json:"token"`
+	PID     int    `json:"pid"`
+	Started uint64 `json:"proc_started"`
+	BootID  string `json:"boot_id"`
+	Scope   string `json:"scope"`
+	State   string `json:"state"`
 }
 
 // 実行面 → campd

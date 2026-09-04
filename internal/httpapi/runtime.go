@@ -31,6 +31,7 @@ func (s *Server) runtimeRoutes() {
 	m.HandleFunc("POST /api/runtime/{id}/stop", s.handleRuntimeStop)
 	m.HandleFunc("POST /api/runtime/{id}/approve", s.handleRuntimeApprove)
 	m.HandleFunc("GET /api/runtime/{id}/log", s.handleRuntimeLog)
+	m.HandleFunc("GET /api/runtime/{id}/approvals", s.handleRuntimeApprovals)
 	m.HandleFunc("GET /api/runtime/{id}/stream", s.handleRuntimeStream)
 }
 
@@ -213,4 +214,19 @@ func (s *Server) handleRuntimeStream(w http.ResponseWriter, r *http.Request) {
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// handleRuntimeApprovals は待っている承認を出す。
+//
+// **画面を閉じて開き直しても見える。** 待ちは DB にあり、campd のメモリには無い。
+// `?all=1` で答え済みのぶんも含めた履歴。
+func (s *Server) handleRuntimeApprovals(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if r.URL.Query().Get("all") != "" {
+		rows, err := session.ApprovalHistory(s.db, id, atoi(r.URL.Query().Get("limit")))
+		s.respond(w, r, rows, err)
+		return
+	}
+	rows, err := s.sessions.Waiting(id)
+	s.respond(w, r, rows, err)
 }

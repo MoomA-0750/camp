@@ -235,15 +235,20 @@ func (s *Supervisor) Approve(id, reqID, behavior, message string) error {
 		s.mu.Unlock()
 		return ErrNoAgent
 	}
-	// **二重に答えさせない。** 同じ承認へ2回答えると、2回目は宙に浮く。
-	if !ls.asked[reqID] {
-		s.mu.Unlock()
-		return fmt.Errorf("その承認は待っていない: %s", reqID)
-	}
 	delete(ls.asked, reqID)
 	ls.last = s.Now()
 	token := ls.token
 	s.mu.Unlock()
+
+	// **二重に答えさせない。** 判定は DB で行う（campd を入れ替えても効く）。
+	// 同じ承認へ2回答えると、2回目は子に届かず宙に浮く。
+	first, err := answer(s.db, id, reqID, behavior, ByUser, s.Now())
+	if err != nil {
+		return approvalError("記録", err)
+	}
+	if !first {
+		return fmt.Errorf("その承認はもう答えてある（または待っていない）: %s", reqID)
+	}
 
 	outcome := audit.OK
 	if behavior == "deny" {
@@ -256,19 +261,22 @@ func (s *Supervisor) Approve(id, reqID, behavior, message string) error {
 	})
 }
 
-// Pending は待っている承認の一覧。
+// Pending は待っている承認の request_id。**DB から読む。**
 func (s *Supervisor) Pending(id string) []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ls := s.live[id]
-	if ls == nil {
+	rows, err := openApprovals(s.db, id)
+	if err != nil {
 		return nil
 	}
-	out := make([]string, 0, len(ls.asked))
-	for k := range ls.asked {
-		out = append(out, k)
+	out := make([]string, 0, len(rows))
+	for _, a := range rows {
+		out = append(out, a.RequestID)
 	}
 	return out
+}
+
+// Waiting は待っている承認を中身つきで返す。画面はこれを出す。
+func (s *Supervisor) Waiting(id string) ([]Approval, error) {
+	return openApprovals(s.db, id)
 }
 
 // Live は今見張っているセッションの写し。
@@ -295,7 +303,18 @@ func (s *Supervisor) fail(id, reason string) {
 	delete(s.live, id)
 	s.mu.Unlock()
 	_ = finish(s.db, id, -1, reason)
+	s.CloseApprovals(id)
 	s.audit(id, "session.exit", "", reason, audit.Error)
+}
+
+// CloseApprovals は宙に浮いた承認を閉じる。**待っていたものを残さない。**
+func (s *Supervisor) CloseApprovals(id string) {
+	n, err := closeOpen(s.db, id, s.Now())
+	if err != nil || n == 0 {
+		return
+	}
+	s.audit(id, "tool.approve", "",
+		fmt.Sprintf("セッションが終わったので %d 件を拒否として閉じた", n), audit.Denied)
 }
 
 // Tick は時間切れを回収する。呼ぶ側が周期を決める（テストでは直接呼ぶ）。
@@ -325,6 +344,32 @@ func (s *Supervisor) Tick() {
 		}
 	}
 	s.mu.Unlock()
+
+	// **期限切れを、期限切れとして答える。**
+	// 放っておくと `claude` 自身のパーク期限（5分）で子が勝手に諦め、
+	// 何が起きたか分からない記録になる。
+	if late, err := expired(s.db, s.Now()); err == nil {
+		for _, a := range late {
+			if ok, err := answer(s.db, a.SessionID, a.RequestID, "deny", ByTimeout, s.Now()); err != nil || !ok {
+				continue
+			}
+			s.audit(a.SessionID, "tool.approve", a.Tool,
+				"期限切れ。拒否として扱った", audit.Timeout)
+			s.mu.Lock()
+			ls, agent := s.live[a.SessionID], s.agent
+			token := ""
+			if ls != nil {
+				delete(ls.asked, a.RequestID)
+				token = ls.token
+			}
+			s.mu.Unlock()
+			if agent != nil && token != "" {
+				agent.send(Msg{T: MsgApprove, Session: a.SessionID, Token: token,
+					ReqID: a.RequestID, Behavior: "deny",
+					Text: "期限切れ（Camp が待てる時間を過ぎた）"})
+			}
+		}
+	}
 
 	for _, a := range dead {
 		s.fail(a.id, a.why)

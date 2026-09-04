@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -273,9 +274,9 @@ func TestAnApprovalCanOnlyBeAnsweredOnce(t *testing.T) {
 	if err := s.Approve(rec.ID, "req-1", "allow", ""); err == nil {
 		t.Fatal("待っていない承認に答えられてしまった")
 	}
-	s.mu.Lock()
-	s.live[rec.ID].asked["req-1"] = true
-	s.mu.Unlock()
+	if err := ask(db, rec.ID, "req-1", "Write", `{"tool_name":"Write"}`, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.Approve(rec.ID, "req-1", "allow", ""); err != nil {
 		t.Fatal(err)
@@ -844,4 +845,239 @@ func TestTailNeverReturnsMoreThanAsked(t *testing.T) {
 	if len(lines) > maxTailLines {
 		t.Fatalf("%d 件返した（上限 %d）", len(lines), maxTailLines)
 	}
+}
+
+// ---------------------------------------------------------------- 承認（M28）
+
+// **待っている承認は campd を入れ替えても消えない。**
+//
+// 承認要求が来ると子は答えるまで止まる。待ちが campd のメモリにしか無いと、
+// 入れ替えた瞬間に「誰が何を訊かれていたか」が消えて、子だけが待ち続ける。
+func TestAWaitingApprovalSurvivesCampdRestarting(t *testing.T) {
+	db := newDB(t)
+	s1, a := wire(t, db)
+
+	rec, err := s1.Start("test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := ask(db, rec.ID, "req-9", "Write", `{"tool_name":"Write"}`, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// campd が入れ替わる。実行面と子はそのまま。
+	a.conn.Close()
+	waitFor(t, 5*time.Second, func() bool { return !s1.AgentConnected() })
+
+	s2 := New(db)
+	if _, _, _, err := s2.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	// 実行面が繋ぎ直す（抱えている子を名乗る）。
+	sock := filepath.Join(t.TempDir(), "b.sock")
+	c2, err := s2.Listen(sock, "", os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go c2.Serve()
+	t.Cleanup(func() { c2.Close() })
+	a.Sock = sock
+	if err := a.Dial("test-again"); err != nil {
+		t.Fatal(err)
+	}
+	go a.Run()
+	waitFor(t, 5*time.Second, func() bool { return s2.AgentConnected() })
+
+	// **子が殺されていない。** 引き取り直されて、また入力を受けられる。
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if got := s2.Pending(rec.ID); len(got) != 1 || got[0] != "req-9" {
+		t.Fatalf("待っている承認が見えない: %v", got)
+	}
+	w, err := s2.Waiting(rec.ID)
+	if err != nil || len(w) != 1 || w[0].Tool != "Write" {
+		t.Fatalf("何を訊かれているかが分からない: %+v (%v)", w, err)
+	}
+	if err := s2.Approve(rec.ID, "req-9", "allow", ""); err != nil {
+		t.Fatalf("引き取り直したのに答えられない: %v", err)
+	}
+	if err := s2.Input(rec.ID, "まだ話せる"); err != nil {
+		t.Fatalf("引き取り直したのに入力できない: %v", err)
+	}
+}
+
+// 期限切れは**拒否として**扱い、そう記録する。
+func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, _ := s.Start("test", t.TempDir())
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	// 期限を過去にして置く。
+	past := time.Now().Add(-2 * parkLimit)
+	if err := ask(db, rec.ID, "req-old", "Bash", `{"tool_name":"Bash"}`, past); err != nil {
+		t.Fatal(err)
+	}
+	s.Tick()
+
+	if got := s.Pending(rec.ID); len(got) != 0 {
+		t.Fatalf("期限切れがまだ待っている: %v", got)
+	}
+	hist, err := ApprovalHistory(db, rec.ID, 10)
+	if err != nil || len(hist) != 1 {
+		t.Fatalf("履歴が読めない: %+v (%v)", hist, err)
+	}
+	if hist[0].Behavior != "deny" || hist[0].Reason != ByTimeout {
+		t.Fatalf("期限切れの扱いが違う: behavior=%s reason=%s", hist[0].Behavior, hist[0].Reason)
+	}
+	if !auditHas(t, db, "tool.approve", "期限切れ") {
+		t.Fatal("期限切れが監査ログに残っていない")
+	}
+}
+
+// セッションが終わったら、宙に浮いた承認を閉じる。
+func TestApprovalsDoNotStayWaitingAfterTheSessionEnds(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, _ := s.Start("test", t.TempDir())
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := ask(db, rec.ID, "req-x", "Write", "{}", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Stop(rec.ID, StopTerminate); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, func() bool { return state(t, db, rec.ID) == StateExited })
+	waitFor(t, 5*time.Second, func() bool { return len(s.Pending(rec.ID)) == 0 })
+
+	hist, _ := ApprovalHistory(db, rec.ID, 10)
+	if len(hist) != 1 || hist[0].Reason != BySessionEnd {
+		t.Fatalf("閉じ方が違う: %+v", hist)
+	}
+}
+
+// 承認は**列**。1つだけ持つ形にすると、2つ目で子が待ち続ける
+// （2026-09-04 に本物で実際に踏んだ）。
+func TestApprovalsAreAQueueNotASingleSlot(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, _ := s.Start("test", t.TempDir())
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	for _, id := range []string{"r1", "r2", "r3"} {
+		if err := ask(db, rec.ID, id, "Write", "{}", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := s.Pending(rec.ID); len(got) != 3 {
+		t.Fatalf("待っているのが %d 件（3 件のはず）", len(got))
+	}
+	for _, id := range []string{"r1", "r2", "r3"} {
+		if err := s.Approve(rec.ID, id, "allow", ""); err != nil {
+			t.Fatalf("%s に答えられない: %v", id, err)
+		}
+	}
+	if got := s.Pending(rec.ID); len(got) != 0 {
+		t.Fatalf("答えたのに残っている: %v", got)
+	}
+}
+
+func auditHas(t *testing.T, db *store.DB, action, needle string) bool {
+	t.Helper()
+	rows, err := db.Query(`select coalesce(detail_json,'') from audit where action=?`, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		rows.Scan(&d)
+		if strings.Contains(d, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// **抱えているという名乗りを、そのまま信じない。**
+//
+// 実行面は本人のユーザーで動くので、何とでも言える。居ないプロセスを
+// 「まだ抱えている」と名乗られて引き取ってしまうと、台帳には走っていると
+// 出たまま、実体が無いセッションが残る。
+func TestAFalseClaimOfHoldingASessionIsNotReadopted(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	sock := filepath.Join(t.TempDir(), "a.sock")
+	c, err := s.Listen(sock, "", os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go c.Serve()
+	t.Cleanup(func() { c.Close() })
+
+	// もう居ないプロセスを指す行を置く。
+	dead := exec.Command("true")
+	if err := dead.Run(); err != nil {
+		t.Fatal(err)
+	}
+	mustInsert(t, db, "claimed", StateRunning, dead.Process.Pid, 1, BootID())
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	hello, _ := json.Marshal(Msg{T: MsgHello, Version: "liar", Held: []Held{{
+		ID: "claimed", Token: "でたらめ", PID: dead.Process.Pid,
+		Started: 1, BootID: BootID(),
+	}}})
+	conn.Write(append(hello, '\n'))
+
+	waitFor(t, 3*time.Second, func() bool { return s.AgentConnected() })
+	waitFor(t, 3*time.Second, func() bool {
+		return auditHasSilent(db, "session.readopt", "そのプロセスは居ない")
+	})
+	if len(s.Live()) != 0 {
+		t.Fatal("居ないプロセスを引き取ってしまった")
+	}
+	if got := state(t, db, "claimed"); got == StateIdle {
+		t.Fatal("台帳が idle に戻っている。実体が無いのに走っていることになる")
+	}
+}
+
+// 起動時刻が食い違う名乗りも引き取らない（pid が回ってきただけ）。
+func TestAReadoptWithTheWrongStartTimeIsRefused(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	mustInsert(t, db, "reused", StateRunning, self, st, BootID())
+
+	c := &Control{s: s}
+	c.readopt([]Held{{ID: "reused", Token: "t", PID: self, Started: st + 1, BootID: BootID()}})
+	if len(s.Live()) != 0 {
+		t.Fatal("起動時刻が違うのに引き取った。pid の使い回しを掴む")
+	}
+	// 正しい起動時刻なら引き取る。
+	c.readopt([]Held{{ID: "reused", Token: "t", PID: self, Started: st, BootID: BootID()}})
+	if len(s.Live()) != 1 {
+		t.Fatal("正しい名乗りを引き取れていない")
+	}
+}
+
+func auditHasSilent(db *store.DB, action, needle string) bool {
+	rows, err := db.Query(`select coalesce(detail_json,'') from audit where action=?`, action)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		rows.Scan(&d)
+		if strings.Contains(d, needle) {
+			return true
+		}
+	}
+	return false
 }

@@ -84,23 +84,85 @@ func scopeName(id string) string { return "camp-session-" + id + ".scope" }
 var debugFrames = os.Getenv("CAMP_AGENT_DEBUG") != ""
 
 // Dial は制御口へ繋いで hello を送る。
+//
+// **いま抱えている子を名乗る。** campd を入れ替えたときに、走っている
+// セッションを殺さずに引き取り直してもらうため。
 func (a *Agent) Dial(version string) error {
 	c, err := net.Dial("unix", a.Sock)
 	if err != nil {
 		return fmt.Errorf("制御口へ繋げない（%s）: %w", a.Sock, err)
 	}
 	a.conn = c
-	if err := a.send(Msg{T: MsgHello, Version: version}); err != nil {
+	if err := a.send(Msg{T: MsgHello, Version: version, Held: a.held()}); err != nil {
 		c.Close()
 		return err
 	}
 	return nil
 }
 
-// Run は campd の指示を受け続ける。接続が切れるまで戻らない。
-func (a *Agent) Run() error {
-	defer a.stopAll("制御口が切れた")
+// held はいま抱えている子の一覧。
+func (a *Agent) held() []Held {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]Held, 0, len(a.kids))
+	for id, k := range a.kids {
+		k.mu.Lock()
+		dead := k.dead
+		k.mu.Unlock()
+		if dead || k.cmd.Process == nil {
+			continue
+		}
+		pid := k.cmd.Process.Pid
+		st, _ := Starttime(pid)
+		out = append(out, Held{ID: id, Token: k.token, PID: pid,
+			Started: st, BootID: BootID(), Scope: k.scope, State: StateIdle})
+	}
+	return out
+}
 
+// Serve は繋ぎ直しながら動き続ける。**campd の入れ替えで子を殺さない。**
+//
+// ただし見張る者が居ないまま走らせ続けもしない。orphanGrace を過ぎたら止める
+// ——誰も見ていないセッションが、承認を待ったまま延々と残るのが一番悪い。
+func (a *Agent) Serve(version string) error {
+	lost := time.Time{}
+	for {
+		if err := a.Dial(version); err != nil {
+			if lost.IsZero() {
+				lost = time.Now()
+			}
+			if n := len(a.held()); n > 0 && time.Since(lost) > orphanGrace {
+				fmt.Fprintf(os.Stderr,
+					"camp agent: campd が %v 戻らない。抱えている %d 本を止める\n",
+					orphanGrace, n)
+				a.stopAll("campd が戻らない")
+			}
+			time.Sleep(reconnectWait)
+			continue
+		}
+		lost = time.Time{}
+		fmt.Fprintf(os.Stderr, "camp agent: %s へ繋いだ（抱えている子 %d 本）\n",
+			a.Sock, len(a.held()))
+		if err := a.Run(); err != nil {
+			return err // 断られた（uid 違い・2つ目）。繋ぎ直しても同じ
+		}
+		fmt.Fprintln(os.Stderr, "camp agent: 制御口が切れた。子は殺さずに繋ぎ直す")
+		time.Sleep(reconnectWait)
+	}
+}
+
+const (
+	reconnectWait = 3 * time.Second
+	// orphanGrace は campd が戻るのを待つ長さ。
+	orphanGrace = 10 * time.Minute
+)
+
+// Run は campd の指示を受け続ける。接続が切れるまで戻らない。
+// Run は campd の指示を受け続ける。接続が切れたら nil を返す。
+//
+// **切れても子は殺さない。** 殺すのは Serve が見切りをつけたときだけ
+// （campd の入れ替えは数秒で終わるので、そこで殺すと毎回セッションが飛ぶ）。
+func (a *Agent) Run() error {
 	done := make(chan struct{})
 	defer close(done)
 	go a.heartbeat(done)
@@ -279,6 +341,11 @@ func (a *Agent) drain(k *child, r io.Reader) {
 			if req, ok := f["request"].(map[string]any); ok {
 				if n, ok := req["tool_name"].(string); ok {
 					m.Text = n
+				}
+				// **何を承認しようとしているかは、画面に出さないと答えられない。**
+				// 承認要求だけは中身を渡す（他のフレームは種類だけ）。
+				if b, err := json.Marshal(req); err == nil && len(b) <= maxApprovalDetail {
+					m.Frame = b
 				}
 			}
 		}
