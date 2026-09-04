@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MoomA-0750/camp/internal/store"
 )
 
 // Phase 3 の outer gate。**「動くこと」だけを見ない。**
@@ -754,5 +756,211 @@ func TestAnIdlePollDoesNotTouchTheFiles(t *testing.T) {
 	if err != nil || gap || len(lines) != 0 {
 		t.Fatalf("空振りの問い合わせでファイルを開いている: %d 行 gap=%v err=%v",
 			len(lines), gap, err)
+	}
+}
+
+// **同時に叩いても、監査ログの連鎖が壊れない。**
+//
+// 監査ログは1行前のハッシュを取り込む。書き手が同時に走ると、連鎖が
+// 途切れたり枝分かれしたりしうる——そうなると「改竄に気づく」仕組みが
+// そこで死ぬ。SetMaxOpenConns(1) に頼っているので、実際に確かめる。
+func TestTheAuditChainSurvivesConcurrency(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	s.SetMaxConcurrent(6)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec, err := s.Start("test", allowHere(t, db))
+			if err != nil {
+				return
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				r, _ := get(db, rec.ID)
+				if r.State == StateIdle {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			for j := 0; j < 5; j++ {
+				s.Input(rec.ID, "go")
+				ask(db, rec.ID, fmt.Sprintf("r%d", j), "Write", "{}", time.Now())
+				s.Approve(rec.ID, fmt.Sprintf("r%d", j), "allow", "")
+			}
+			s.Stop(rec.ID, StopTerminate)
+		}()
+	}
+	wg.Wait()
+	time.Sleep(500 * time.Millisecond)
+
+	if ok, n, err := auditChainOK(db); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatalf("%d 行目で連鎖が切れている", n)
+	} else {
+		t.Logf("%d 行、連鎖は繋がっている", n)
+	}
+}
+
+// auditChainOK は prev_hash が1行前の hash と繋がっているかを見る。
+func auditChainOK(db *store.DB) (bool, int, error) {
+	rows, err := db.Query(`select prev_hash, hash from audit order by id`)
+	if err != nil {
+		return false, 0, err
+	}
+	defer rows.Close()
+	prev, n := "", 0
+	for rows.Next() {
+		var p, h string
+		if err := rows.Scan(&p, &h); err != nil {
+			return false, n, err
+		}
+		n++
+		if n == 1 {
+			prev = h
+			continue
+		}
+		if p != prev {
+			return false, n, nil
+		}
+		prev = h
+	}
+	return true, n, rows.Err()
+}
+
+// **実行面から DB を太らせられない。**
+//
+// 2026-09-04 の outer gate で見つけた欠陥。上限が無いと 5,756 フレーム/秒で
+// 承認要求を流し込め、3.5秒で approvals 2万行・audit 2万行・DB 13MB になった。
+// 監査ログは保持ポリシーの対象外なので、そのまま溜まり続ける。
+// M25.5 で報告口に対して見つけたのと同じ形が、新しい口で再発していた。
+//
+// **最初はフレームそのものを絞ろうとして、間違えた。** よく喋る子（実測
+// 18,000 フレーム/秒）のセッションで制御口が切れる——子が饒舌だからという
+// 理由で見張りを切るのは、防いでいるものより悪い。絞るのは DB に行が
+// 増える経路だけにした。
+func TestTheExecutionSideCannotInflateTheDatabase(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, err := s.Start("test", allowHere(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	s.mu.Lock()
+	tok := s.live[rec.ID].token
+	s.mu.Unlock()
+
+	var before int
+	db.QueryRow(`select count(*) from audit`).Scan(&before)
+
+	const n = 20000
+	frame, _ := json.Marshal(map[string]any{"tool_name": "Write"})
+	for i := 0; i < n; i++ {
+		s.dispatchForTest(Msg{T: MsgFrame, Session: rec.ID, Token: tok,
+			Kind:  "control_request/can_use_tool",
+			ReqID: fmt.Sprintf("flood-%d", i), Text: "Write", Frame: frame})
+	}
+
+	var approvals, after int
+	db.QueryRow(`select count(*) from approvals`).Scan(&approvals)
+	db.QueryRow(`select count(*) from audit`).Scan(&after)
+	grew := after - before
+	t.Logf("%d 件を流し込んで approvals %d 行 / audit +%d 行", n, approvals, grew)
+	if approvals > maxOpenApprovals {
+		t.Fatalf("approvals が %d 行（上限 %d）", approvals, maxOpenApprovals)
+	}
+	if grew > maxAuditPerMin+8 {
+		t.Fatalf("監査ログが %d 行増えた（1分あたりの上限 %d）", grew, maxAuditPerMin)
+	}
+}
+
+// **よく喋る子で見張りが切れない。**（上の直しで一度壊した形）
+func TestAChattyChildDoesNotLoseItsSupervisor(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	a := attach(t, s, noisyClaude(t, 4000))
+	a.LogDir = t.TempDir()
+	rec, err := s.Start("test", allowHere(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := s.Input(rec.ID, "go"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 60*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if !s.AgentConnected() {
+		t.Fatal("よく喋ったせいで制御口が切れた")
+	}
+}
+
+// 待っている承認の数にも上限がある（ゆっくり流し込まれても溜まらない）。
+func TestOpenApprovalsAreCapped(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, err := s.Start("test", allowHere(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	s.mu.Lock()
+	tok := s.live[rec.ID].token
+	s.mu.Unlock()
+
+	for i := 0; i < maxOpenApprovals*3; i++ {
+		s.dispatchForTest(Msg{T: MsgFrame, Session: rec.ID, Token: tok,
+			Kind:  "control_request/can_use_tool",
+			ReqID: fmt.Sprintf("a-%d", i), Text: "Write"})
+	}
+	got := pending(t, s, rec.ID)
+	if len(got) > maxOpenApprovals {
+		t.Fatalf("待っている承認が %d 件（上限 %d）", len(got), maxOpenApprovals)
+	}
+	if !auditHasSilent(db, "tool.ask", "越えたので記録しない") {
+		t.Fatal("上限に達したことが記録に残っていない")
+	}
+	t.Logf("%d 件で頭打ち（上限 %d）", len(got), maxOpenApprovals)
+}
+
+// 承認以外の経路でも、実行面から監査ログを太らせられない。
+//
+// 承認には別の上限（同時に待てる数）が掛かっているので、そちらだけ塞いでも
+// **「溢れた」の報告のような、何度でも送れるもの**が残る。
+func TestOtherAgentPathsCannotInflateTheAuditLog(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, err := s.Start("test", allowHere(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	s.mu.Lock()
+	tok := s.live[rec.ID].token
+	s.mu.Unlock()
+
+	var before int
+	db.QueryRow(`select count(*) from audit`).Scan(&before)
+	for i := 0; i < 5000; i++ {
+		s.dispatchForTest(Msg{T: MsgDropped, Session: rec.ID, Token: tok, Dropped: int64(i)})
+	}
+	var after int
+	db.QueryRow(`select count(*) from audit`).Scan(&after)
+	grew := after - before
+	t.Logf("5000 件の「溢れた」報告で監査ログが %d 行増えた", grew)
+	if grew > maxAuditPerMin+4 {
+		t.Fatalf("監査ログが %d 行増えた（1分あたりの上限 %d）", grew, maxAuditPerMin)
+	}
+	if grew == 0 {
+		t.Fatal("1行も残っていない。**黙って捨ててはいけない**")
+	}
+	// **抑えたこと自体が記録に残る。** 残さないと、あとから
+	// 「その分は起きなかった」と読める。
+	if !auditHasSilent(db, "session.log_dropped", "しばらく記録しない") {
+		t.Fatal("記録を抑えたことが、どこにも残っていない")
 	}
 }

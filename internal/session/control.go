@@ -329,7 +329,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		s.mu.Unlock()
 
 		_ = setOwner(s.db, m.Session, o, m.Scope)
-		s.audit(m.Session, "session.started", strconv.Itoa(m.PID),
+		s.auditFromAgent(m.Session, "session.started", strconv.Itoa(m.PID),
 			"scope="+m.Scope, audit.OK)
 
 	case MsgFrame:
@@ -360,14 +360,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			_ = setClaudeID(s.db, m.Session, m.ClaudeID)
 		}
 		if m.Kind == "control_request/can_use_tool" && m.ReqID != "" {
-			// **待ちを DB に置く。** campd を入れ替えても、誰が何を訊かれて
-			// いたかが消えないように。
-			if err := ask(s.db, m.Session, m.ReqID, m.Text, string(m.Frame), s.Now()); err != nil {
-				s.audit(m.Session, "tool.ask", m.Text,
-					"承認の記録に失敗: "+err.Error(), audit.Error)
-			} else {
-				s.audit(m.Session, "tool.ask", m.Text, m.ReqID, audit.OK)
-			}
+			s.recordAsk(m)
 		}
 
 	case MsgExited:
@@ -419,7 +412,8 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		}
 		// **溢れて捨てたことを記録に残す。** 画面に出ない範囲があることは、
 		// あとから「無かった」と読み違えられる。
-		s.audit(m.Session, "session.log_dropped", "",
+		// ただし、これも実行面が何度でも起こせるので枠の中で。
+		s.auditFromAgent(m.Session, "session.log_dropped", "",
 			fmt.Sprintf("落とし先が溢れて %d 件捨てた", m.Dropped), audit.Error)
 
 	case MsgPing:
@@ -431,6 +425,31 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 	default:
 		a.send(Msg{T: MsgError, Error: "知らない種類: " + m.T})
 	}
+}
+
+// recordAsk は承認要求を DB に残す。**ここが実行面から DB を太らせる本線**
+// なので、2つの上限を掛ける——同時に待てる数と、1分あたりの記録の数。
+//
+// 待ちを DB に置くのは、campd を入れ替えても「誰が何を訊かれていたか」が
+// 消えないようにするため。
+func (s *Supervisor) recordAsk(m Msg) {
+	if open, err := openApprovals(s.db, m.Session); err != nil {
+		s.audit(m.Session, "tool.ask", m.Text,
+			"待っている承認を数えられない: "+err.Error(), audit.Error)
+		return
+	} else if len(open) >= maxOpenApprovals {
+		if _, first := s.mayRecord(m.Session); first {
+			s.audit(m.Session, "tool.ask", m.Text,
+				fmt.Sprintf("待っている承認が %d 件を越えたので記録しない",
+					maxOpenApprovals), audit.Denied)
+		}
+		return
+	}
+	if err := ask(s.db, m.Session, m.ReqID, m.Text, string(m.Frame), s.Now()); err != nil {
+		s.audit(m.Session, "tool.ask", m.Text, "承認の記録に失敗: "+err.Error(), audit.Error)
+		return
+	}
+	s.auditFromAgent(m.Session, "tool.ask", m.Text, m.ReqID, audit.OK)
 }
 
 // check は「そのセッションを、その合鍵で触ってよいか」。

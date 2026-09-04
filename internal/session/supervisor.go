@@ -29,6 +29,10 @@ type Supervisor struct {
 	// waits は実行面へ投げた問い合わせの返事待ち。request_id で対応づける。
 	waits map[string]chan Msg
 
+	// budgets はセッションごとの「記録してよい件数」。
+	// 実行面が起こす audit の増え方を押さえる。
+	budgets map[string]*budget
+
 	// テストで時間を進めるために差し替える。
 	Now func() time.Time
 	// テストで待たずに済ませるために差し替える。
@@ -55,6 +59,7 @@ func New(db *store.DB) *Supervisor {
 		db:         db,
 		live:       map[string]*liveSession{},
 		waits:      map[string]chan Msg{},
+		budgets:    map[string]*budget{},
 		maxConc:    defaultMaxConcurrent,
 		Now:        time.Now,
 		IdleAfter:  idleTimeout,
@@ -457,6 +462,23 @@ func (s *Supervisor) Run(done <-chan struct{}, every time.Duration) {
 	}
 }
 
+// auditFromAgent は**実行面が起こした**記録を残す。枠を使い切っていれば残さない。
+//
+// campd 自身が起こす記録（起動を決めた・許可リストを見た）は絞らない。
+// 絞るのは、境界の外から何度でも起こせるものだけ。
+func (s *Supervisor) auditFromAgent(id, action, target, detail, outcome string) {
+	ok, first := s.mayRecord(id)
+	if ok {
+		s.audit(id, action, target, detail, outcome)
+		return
+	}
+	if first {
+		s.audit(id, action, target,
+			fmt.Sprintf("1分あたり %d 件を越えたので、しばらく記録しない", maxAuditPerMin),
+			audit.Denied)
+	}
+}
+
 func (s *Supervisor) audit(id, action, target, detail, outcome string) {
 	_, _ = audit.Append(s.db, audit.Entry{
 		Actor: "campd", Action: action, Target: target,
@@ -548,6 +570,40 @@ func (s *Supervisor) Tail(id string, since int64, limit int) (TailResult, error)
 		// **返ってこないことを「空」と読まない。**
 		return TailResult{}, errors.New("実行面が返事をしない")
 	}
+}
+
+// budget は1セッションぶんの記録の枠。
+type budget struct {
+	window time.Time
+	n      int
+	// said は「枠を使い切った」を1度だけ記録するための印。
+	said bool
+}
+
+// mayRecord は、このセッションについてまだ記録してよいかを返す。
+//
+// 使い切ったときは false を返し、**そのことを1度だけ記録する**
+// （黙って捨てると「見ていないから0」になる）。
+func (s *Supervisor) mayRecord(id string) (ok, firstRefusal bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.budgets[id]
+	if b == nil {
+		b = &budget{window: s.Now()}
+		s.budgets[id] = b
+	}
+	if s.Now().Sub(b.window) >= time.Minute {
+		b.window, b.n, b.said = s.Now(), 0, false
+	}
+	if b.n >= maxAuditPerMin {
+		if !b.said {
+			b.said = true
+			return false, true
+		}
+		return false, false
+	}
+	b.n++
+	return true, false
 }
 
 // deliver は返事を待っている者へ渡す。
