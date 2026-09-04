@@ -273,6 +273,19 @@ func cmdIngest(args []string) error {
 			b.Scanned, b.Captured, b.Known, missingNote(b.Missing))
 	}
 	fmt.Printf("読み飛ばし      %d ファイル（追記なし）\n", res.Unchanged)
+	// **読めなかったものを黙って飛ばさない。**
+	// ACL が配り直される前の新しいセッションがここに来る。次の回で拾えるが、
+	// 何本落ちているかは出す。ずっと減らなければ ACL の配り直しが止まっている。
+	if n := len(res.Unreadable); n > 0 {
+		fmt.Printf("読めない        %d ファイル（権限。次の ACL 配り直しのあと拾う）\n", n)
+		for i, p := range res.Unreadable {
+			if i == 3 {
+				fmt.Printf("                ほか %d 本\n", n-3)
+				break
+			}
+			fmt.Printf("                %s\n", p)
+		}
+	}
 	// 消した行を黙って飛ばさない。数えていたのに、どこにも出していなかった。
 	if res.Suppressed > 0 {
 		fmt.Printf("抑止            %d 行（消した記録があるので取り込まない）\n", res.Suppressed)
@@ -365,7 +378,7 @@ func cmdSearch(args []string) error {
 			label += ":" + h.ToolName
 		}
 		fmt.Printf("%s  %-22s %s\n  %s\n  session %s  score %.1f\n\n",
-			shortTime(h.Timestamp), label, title, h.Snippet, h.SessionID[:8], h.Score)
+			shortTime(h.Timestamp), label, title, h.Snippet, firstN(h.SessionID, 8), h.Score)
 	}
 	fmt.Printf("%d 件 / %s\n", len(hits), time.Since(started).Round(time.Millisecond))
 	return nil
@@ -434,7 +447,7 @@ func cmdThread(args []string) error {
 		if t.Repaired > 0 {
 			fragmented++
 		}
-		fmt.Printf("%s  %s\n", id[:8], t.Describe())
+		fmt.Printf("%s  %s\n", firstN(id, 8), t.Describe())
 		for i, n := range t.Order {
 			if i >= *show {
 				break
@@ -663,7 +676,7 @@ func cmdFiles(args []string) error {
 			name = r.AbsPath
 		}
 		fmt.Printf("%s  %-13s %-12s %s\n", short(r.At), r.Op, r.Origin, name)
-		fmt.Printf("    session %s  turn %s", r.SessionID[:8], firstN(r.MessageUUID, 8))
+		fmt.Printf("    session %s  turn %s", firstN(r.SessionID, 8), firstN(r.MessageUUID, 8))
 		if r.Title != "" {
 			fmt.Printf("  %s", r.Title)
 		}
@@ -680,6 +693,9 @@ func short(ts string) string {
 	return ts
 }
 
+// firstN は先頭 n 文字（バイト）。**短い文字列で落ちない。**
+// 2026-09-04: campd search が session_id を h.SessionID[:8] で切っていて、
+// 短い id を持つ行があると panic した。表示のために落ちてはいけない。
 func firstN(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -771,7 +787,7 @@ func cmdBackup(args []string) error {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "# %s\n# %s v%d  session %s  %d bytes%s\n",
-			b.AbsPath, short(b.At), b.Version, b.SessionID[:8], b.Size, missingMark(b.Missing))
+			b.AbsPath, short(b.At), b.Version, firstN(b.SessionID, 8), b.Size, missingMark(b.Missing))
 		_, err = os.Stdout.Write(body)
 		return err
 	}
@@ -798,7 +814,7 @@ func cmdBackup(args []string) error {
 		}
 		fmt.Printf("%6d  %s  v%-3d %8s  %s%s\n",
 			b.ID, short(b.At), b.Version, humanBytes(b.Size), name, missingMark(b.Missing))
-		fmt.Printf("        session %s  %s\n", b.SessionID[:8], b.Title)
+		fmt.Printf("        session %s  %s\n", firstN(b.SessionID, 8), b.Title)
 	}
 	return nil
 }
@@ -894,7 +910,7 @@ func cmdSecrets(args []string) error {
 			mark = f.Verdict
 		}
 		fmt.Printf("%4d  %-20s %-14s msg %d  %s  %s\n",
-			f.ID, f.Pattern, mark, f.MessageID, short(f.At), f.SessionID[:8])
+			f.ID, f.Pattern, mark, f.MessageID, short(f.At), firstN(f.SessionID, 8))
 		fmt.Printf("      %s\n", firstN(f.Context, 200))
 	}
 	fmt.Printf("\n%d 件。判定は campd secrets -ok <ID> [-verdict 文字列]\n", len(rows))
@@ -1888,6 +1904,10 @@ func cmdRedact(args []string) error {
 		fmt.Println("    どの表のどの列にも無い")
 	}
 	for _, h := range hits {
+		if h.Unknown {
+			fmt.Printf("    %-38s 数えられない（%s）\n", h.Table+"."+h.Column, h.Why)
+			continue
+		}
 		fmt.Printf("    %-38s %5d 件\n", h.Table+"."+h.Column, h.Count)
 	}
 	total := retain.Total(hits)
@@ -1916,7 +1936,15 @@ func cmdRedact(args []string) error {
 	}
 	if n := retain.Total(after); n != 0 {
 		for _, h := range after {
+			if h.Unknown {
+				fmt.Printf("  ?: %-38s 数えられない（%s）\n", h.Table+"."+h.Column, h.Why)
+				continue
+			}
 			fmt.Printf("  残: %-38s %5d 件\n", h.Table+"."+h.Column, h.Count)
+		}
+		if u := retain.Unknowns(after); len(u) > 0 {
+			return fmt.Errorf("%d 件残っているか、数えられない列が %d ある。0件とは言えない",
+				n-len(u), len(u))
 		}
 		return fmt.Errorf("まだ %d 件残っている", n)
 	}

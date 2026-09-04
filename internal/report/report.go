@@ -62,8 +62,12 @@ type Listener struct {
 	ln   net.Listener
 	path string
 
-	mu     sync.Mutex
-	closed bool
+	sem chan struct{} // 同時接続の枠
+
+	mu       sync.Mutex
+	closed   bool
+	window   time.Time // 全体の流量を測る窓
+	inWindow int
 }
 
 // Listen は socket を開く。
@@ -101,7 +105,24 @@ func Listen(db *store.DB, path, group string) (*Listener, error) {
 			return nil, err
 		}
 	}
-	return &Listener{db: db, ln: ln, path: path}, nil
+	return &Listener{
+		db: db, ln: ln, path: path,
+		sem: make(chan struct{}, maxConns),
+	}, nil
+}
+
+// allow は全体の流量に空きがあるかを見る。**接続をまたいで数える。**
+func (l *Listener) allow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if time.Since(l.window) >= time.Second {
+		l.window, l.inWindow = time.Now(), 0
+	}
+	if l.inWindow >= maxTotalPerSec {
+		return false
+	}
+	l.inWindow++
+	return true
 }
 
 // regroup は socket と親ディレクトリを共有グループのものにする。
@@ -138,7 +159,17 @@ func (l *Listener) Serve() error {
 			}
 			return err
 		}
-		go l.handle(c)
+		// 枠が空いていなければ、その場で断って閉じる。**受けたまま溜め込まない。**
+		select {
+		case l.sem <- struct{}{}:
+			go func() {
+				defer func() { <-l.sem }()
+				l.handle(c)
+			}()
+		default:
+			writeReply(c, Reply{Error: "接続が多すぎる"})
+			c.Close()
+		}
 	}
 }
 
@@ -168,7 +199,13 @@ func (l *Listener) handle(c net.Conn) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	var n int
 	window := time.Now()
-	for sc.Scan() {
+	for {
+		// **黙って握ったままの接続を許さない。**
+		// 何も送らずに繋ぎっぱなしにするだけで枠を占有できてしまう。
+		c.SetReadDeadline(time.Now().Add(maxIdle))
+		if !sc.Scan() {
+			return
+		}
 		if time.Since(window) >= time.Second {
 			window, n = time.Now(), 0
 		}
@@ -176,6 +213,10 @@ func (l *Listener) handle(c net.Conn) {
 		if n > maxPerSec {
 			writeReply(c, Reply{Error: "速すぎる。1秒あたりの上限を越えた"})
 			return
+		}
+		if !l.allow() {
+			writeReply(c, Reply{Error: "全体の流量が上限に達している"})
+			continue
 		}
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -202,6 +243,14 @@ const (
 	maxField  = 4096      // action / target / session の1つあたり
 	maxDetail = 64 * 1024 // detail_json
 	maxPerSec = 100       // 1接続あたりの追記
+	maxConns  = 64        // 同時接続
+	maxIdle   = 60 * time.Second
+
+	// **全体の上限。接続ごとの上限だけでは意味が無い。**
+	// 2026-09-04 の outer gate で実測: 8接続から 160 件/秒、1時間で約
+	// 576,000 行。監査ログは保持ポリシーの対象外なので溜まり続け、
+	// 本物の記録が埋まる。境界の外は信用しない側なので、全体で絞る。
+	maxTotalPerSec = 20
 )
 
 func (l *Listener) append(who string, e Event) (int64, error) {

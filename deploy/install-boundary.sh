@@ -43,6 +43,11 @@ usermod -aG campreport "$HUMAN"
 usermod -aG campreport camp
 echo "  $HUMAN と camp を campreport に入れた（反映には再ログインが要る）"
 
+# ACL の配り直しは user 側の timer で回る。**ログアウトすると止まる**ので、
+# linger を有効にしておく。止まると新しい会話が camp から読めないままになる。
+loginctl enable-linger "$HUMAN" || true
+echo "  linger を有効にした（ログアウト中も ACL を配り直す）"
+
 echo "== 3. 実体を root のものにする =="
 install -o root -g root -m 0755 "$REPO/campd" /usr/local/bin/campd
 echo "  /usr/local/bin/campd（$HUMAN からは差し替えられない）"

@@ -12,6 +12,14 @@ bad() { echo "  NG    $*"; ng=$((ng+1)); }
 echo "== 1. 境界（$HUMAN から届くか）=="
 sudo -u "$HUMAN" cat $DB >/dev/null 2>&1 && bad "DBが読めてしまう" || ok "DBに届かない"
 sudo -u "$HUMAN" test -w $C && bad "実体を差し替えられる" || ok "実体を差し替えられない"
+# **ファイルだけ見ても足りない。** 親ディレクトリが書けるなら rename で差し替えられる。
+for d in /usr/local/bin /usr/local /usr; do
+	sudo -u "$HUMAN" test -w "$d" && bad "$d が書けるので実体を rename で差し替えられる" \
+		|| ok "$d は書けない"
+done
+loginctl show-user "$HUMAN" -p Linger 2>/dev/null | grep -q "Linger=yes" \
+	&& ok "linger 有効（ログアウト中も ACL を配り直す）" \
+	|| bad "linger が無効。ログアウト中に ACL の配り直しが止まる"
 # sqlite3 で開こうとする検査は置かない。**通る理由が権限とは限らない**
 # （このDBは fts5 の仮想表を持つので、fts5 の無いビルドでは権限に関係なく落ちる）。
 # 代わりに、権限だけを見る。

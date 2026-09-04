@@ -34,6 +34,7 @@ type Result struct {
 	Missing     int           // 今回の走査で消えていたファイル（行は残す）
 	Unchanged   int           // 追記が無く、要約を再利用して読み飛ばしたファイル
 	Suppressed  int           // tombstone があるので取り込まなかった行
+	Unreadable  []string      // 権限で開けなかったファイル
 	Orphans     []string      // 親が見つからず stub に落としたサイドカー候補
 }
 
@@ -49,6 +50,7 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	res.Unreadable = corpus.Unreadable
 	for _, f := range corpus.Files {
 		if p, ok := prior[f.Path]; ok && p.Offset > 0 && p.Offset == f.EndOffset {
 			res.Unchanged++

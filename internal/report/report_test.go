@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -249,5 +250,99 @@ func TestLimitsCanCrossButNothingElseCan(t *testing.T) {
 		if n != 0 {
 			t.Errorf("socket 経由で %s が %d 行になった", tbl, n)
 		}
+	}
+}
+
+// 接続ごとの上限だけでは足りない。**全体で絞る。**
+//
+// 2026-09-04 の outer gate で実測: 8接続から 160 件/秒、1時間で約 576,000 行。
+// 監査ログは保持ポリシーの対象外なので溜まり続け、本物の記録が埋まる。
+func TestManyConnectionsCannotOutrunTheGlobalLimit(t *testing.T) {
+	db := newDB(t)
+	l := listen(t, db)
+
+	const conns = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	accepted, refused := 0, 0
+
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := net.Dial("unix", l.Addr())
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			sc := bufio.NewScanner(c)
+			deadline := time.Now().Add(900 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if _, err := c.Write([]byte(`{"action":"flood"}` + "\n")); err != nil {
+					return
+				}
+				if !sc.Scan() {
+					return
+				}
+				var r report.Reply
+				json.Unmarshal(sc.Bytes(), &r)
+				mu.Lock()
+				if r.OK {
+					accepted++
+				} else {
+					refused++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 1秒に満たない窓なので、上限の2倍を越えたら「全体で絞れていない」。
+	if accepted > 2*20 {
+		t.Errorf("1秒足らずで %d 件通した。全体の上限が効いていない（断り %d）", accepted, refused)
+	}
+	if refused == 0 {
+		t.Error("1件も断っていない。上限に当たっていない")
+	}
+}
+
+// 何も送らずに繋ぎっぱなしにするだけで枠を埋められない。
+func TestIdleConnectionsCannotHogEverySlot(t *testing.T) {
+	db := newDB(t)
+	l := listen(t, db)
+
+	var held []net.Conn
+	defer func() {
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	// 枠より多く繋ぐ。溢れた分はその場で断られて閉じられる。
+	for i := 0; i < 80; i++ {
+		c, err := net.Dial("unix", l.Addr())
+		if err != nil {
+			break
+		}
+		held = append(held, c)
+	}
+
+	// 断られた接続は閉じられているので、新しい接続はまだ通る……とは限らない。
+	// ここで確かめたいのは「サーバーが生きていること」。
+	c, err := net.Dial("unix", l.Addr())
+	if err != nil {
+		t.Fatalf("枠を埋められてサーバーが応答しない: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.Write([]byte(`{"action":"alive"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	sc := bufio.NewScanner(c)
+	if !sc.Scan() {
+		t.Fatal("返事が無い。握られたままの接続で詰まっている")
+	}
+	if !strings.Contains(sc.Text(), `"ok"`) && !strings.Contains(sc.Text(), "多すぎる") {
+		t.Errorf("予期しない返事: %s", sc.Text())
 	}
 }

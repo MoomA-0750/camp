@@ -303,7 +303,13 @@ func List(db *store.DB, onlyUnreviewed, reveal bool) ([]Finding, error) {
 			return nil, err
 		}
 		if f.Blob != "" {
-			f.Where = "blob " + f.Blob[:12]
+			// 表示のために落ちない。sha256 は 64 文字のはずだが、
+			// 「はず」で切らない（2026-09-04 に search が同じ形で panic した）。
+			n := len(f.Blob)
+			if n > 12 {
+				n = 12
+			}
+			f.Where = "blob " + f.Blob[:n]
 		} else {
 			f.Where = "msg " + strconv.FormatInt(f.MessageID, 10)
 			f.Context = contextAround(raw, f.Offset, f.Length, reveal)

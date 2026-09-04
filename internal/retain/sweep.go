@@ -14,6 +14,10 @@ type Hit struct {
 	Table  string
 	Column string
 	Count  int
+
+	// Unknown は「数えられなかった」。**0件とは違う。**
+	Unknown bool
+	Why     string
 }
 
 // Sweep は既知の値が**どの表のどの列に**残っているかを総なめで数える。
@@ -42,7 +46,10 @@ func Sweep(db *store.DB, secret []byte) ([]Hit, error) {
 		for _, c := range cols {
 			n, err := countIn(db, t, c, secret)
 			if err != nil {
-				return nil, err
+				// 数えられない列は「無い」ではなく「分からない」。
+				// 呼ぶ側が 0 件と読み違えないよう、必ず表に出す。
+				out = append(out, Hit{Table: t, Column: c, Unknown: true, Why: err.Error()})
+				continue
 			}
 			if n > 0 {
 				out = append(out, Hit{Table: t, Column: c, Count: n})
@@ -58,13 +65,29 @@ func Sweep(db *store.DB, secret []byte) ([]Hit, error) {
 	return out, nil
 }
 
-// Total は総件数。
+// Total は総件数。**数えられなかった列は 1 件以上あるものとして数える。**
+// 「見ていないから 0」を「無いから 0」と読ませない。
 func Total(hits []Hit) int {
 	n := 0
 	for _, h := range hits {
+		if h.Unknown {
+			n++
+			continue
+		}
 		n += h.Count
 	}
 	return n
+}
+
+// Unknowns は数えられなかった列だけを返す。
+func Unknowns(hits []Hit) []Hit {
+	var out []Hit
+	for _, h := range hits {
+		if h.Unknown {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // FTSShadow は FTS5 が自分で管理する影の表かどうか。
@@ -118,13 +141,17 @@ func columnsOf(db *store.DB, table string) ([]string, error) {
 }
 
 // countIn は1つの列を数える。gzip の中も見る。
+//
+// **数えられなかったことを「0件」にしない。**
+// 2026-09-04 の outer gate の指摘。走査の失敗を 0 に潰すと、総なめは
+// 「秘密が残っていないこと」の検知器ではなくなる（見ていないから 0 なのを、
+// 無いから 0 と読む）。数えられない列は Unknown として持ち上げる。
 func countIn(db *store.DB, table, col string, secret []byte) (int, error) {
 	// instr は BLOB でも TEXT でも効く。まずそれで大きく削る。
 	var n int
 	q := fmt.Sprintf(`select count(*) from %q where instr(coalesce(%q, ''), ?) > 0`, table, col)
 	if err := db.QueryRow(q, secret).Scan(&n); err != nil {
-		// 型が合わない列（数値だけの列など）は 0 件として扱う。
-		return 0, nil
+		return 0, err
 	}
 	if FTSShadow(table) {
 		return n, nil
@@ -133,7 +160,7 @@ func countIn(db *store.DB, table, col string, secret []byte) (int, error) {
 	// gzip で入っている列は展開して見る。blobs.content がこれに当たる。
 	gz, err := countGzip(db, table, col, secret)
 	if err != nil {
-		return n, nil
+		return n, err
 	}
 	return n + gz, nil
 }

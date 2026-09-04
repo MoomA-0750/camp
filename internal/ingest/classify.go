@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -165,6 +166,10 @@ type Corpus struct {
 	Root  string
 	Files []*FileSummary
 
+	// Unreadable は権限で開けなかったファイル。**黙って落とさず、数えて返す。**
+	// ACL が配り直される前の新しいセッションが主にここに来る。
+	Unreadable []string
+
 	// runOwner は session_id -> それを書いた会話の SessionID。
 	// resume サイドカーの親を引くのに使う。
 	runOwner map[string]string
@@ -186,7 +191,24 @@ func Survey(root string, prior map[string]*Prior) (*Corpus, error) {
 	}
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		// **1本読めないだけで全部を落とさない。**
+		//
+		// M25.5 で campd は専用ユーザーになり、会話記録は ACL で読ませている。
+		// ACL は持ち主の権限で定期的に配り直すので、**新しいセッションの
+		// ファイルは、次の配り直しまで camp から読めない**。そこで
+		// walk ごと落としていたため、1本の新しいファイルが
+		// 取り込み全体を止めていた（2026-09-04 の outer gate で再現）。
+		// しかも失敗は journal にしか出ないので、**黙って止まる。**
+		//
+		// 読めないものは数えて飛ばし、Corpus に持って上へ伝える。
 		if err != nil {
+			if errors.Is(err, fs.ErrPermission) {
+				c.Unreadable = append(c.Unreadable, path)
+				return nil
+			}
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil // 歩いている最中に消えた
+			}
 			return err
 		}
 		if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
@@ -194,6 +216,13 @@ func Survey(root string, prior map[string]*Prior) (*Corpus, error) {
 		}
 		fsum, err := summarize(root, path, d, prior[path])
 		if err != nil {
+			if errors.Is(err, fs.ErrPermission) {
+				c.Unreadable = append(c.Unreadable, path)
+				return nil
+			}
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		c.Files = append(c.Files, fsum)

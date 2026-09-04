@@ -39,6 +39,14 @@ var windowLen = map[string]time.Duration{
 // 呼び出し側はこれを失敗として扱わない。
 var ErrNoWindows = errors.New("rate_limits が入っていない")
 
+// 入力に置く蓋。**境界の外から叩ける入口なので、素直に信じない。**
+const (
+	maxKinds   = 8
+	maxKindLen = 64
+	maxAhead   = 400 * 24 * time.Hour
+	maxBehind  = 400 * 24 * time.Hour
+)
+
 // statusLineInput は statusLine コマンドが stdin で受け取る JSON のうち、
 // ここで使う部分だけ。知らないキーは無視する。
 type statusLineInput struct {
@@ -70,6 +78,15 @@ func Record(db *store.DB, r io.Reader, agent, source string) ([]Reading, error) 
 	if len(in.RateLimits) == 0 {
 		return nil, ErrNoWindows
 	}
+	// **中身を確かめてから書く。**
+	// M25.5 で、この入口は境界の外（人間のユーザー＝信用しない側）から
+	// socket 越しに叩けるようになった。kind は map の任意キーで、
+	// (agent, kind, ends_at, source) ごとに1行増えるので、
+	// 種類と時刻を変えて送るだけで usage_windows をいくらでも太らせられる
+	// （2026-09-04 の outer gate の指摘）。窓の数と値に蓋をする。
+	if len(in.RateLimits) > maxKinds {
+		return nil, fmt.Errorf("窓が多すぎる（%d 種類、上限 %d）", len(in.RateLimits), maxKinds)
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	out := []Reading{}
@@ -78,7 +95,17 @@ func Record(db *store.DB, r io.Reader, agent, source string) ([]Reading, error) 
 			// spend_limit のように値が来ないことがある。黙って飛ばす。
 			continue
 		}
+		if len(kind) > maxKindLen {
+			continue // 名前で膨らませない
+		}
+		if *w.UsedPercentage < 0 || *w.UsedPercentage > 100 {
+			continue // 割合でないものは窓にしない
+		}
 		ends := time.Unix(*w.ResetsAt, 0).UTC()
+		// 遠すぎる先・過ぎすぎた過去は、窓を無限に増やすための値でしかない。
+		if ends.After(time.Now().Add(maxAhead)) || ends.Before(time.Now().Add(-maxBehind)) {
+			continue
+		}
 		endsAt := ends.Format(time.RFC3339)
 		var startedAt any
 		if d, ok := windowLen[kind]; ok {

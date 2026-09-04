@@ -130,3 +130,20 @@ func TestLimitsPrefersTheDaemonOverAStrayLocalDB(t *testing.T) {
 		t.Errorf("どちらも無いときは報告口を試すべきだが %s", got)
 	}
 }
+
+// 表示のための切り出しで落ちない。
+//
+// 2026-09-04 の outer gate で `campd search` が panic した。
+// session_id はファイル名から来ることがあり、8文字より短いと
+// `h.SessionID[:8]` が範囲外になる。**表示のために落ちてはいけない。**
+func TestShorteningNeverPanics(t *testing.T) {
+	for _, s := range []string{"", "a", "good4", "12345678", "1234567890abcdef", "日本語"} {
+		got := firstN(s, 8)
+		if len(got) > 8 {
+			t.Errorf("firstN(%q,8) = %q。長すぎる", s, got)
+		}
+		if len(s) <= 8 && got != s {
+			t.Errorf("firstN(%q,8) = %q。短いものはそのまま返すべき", s, got)
+		}
+	}
+}

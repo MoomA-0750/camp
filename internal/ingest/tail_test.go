@@ -319,3 +319,80 @@ func TestRotationLooksAtContentNotInode(t *testing.T) {
 		t.Error("初回なのに世代を進めようとしている")
 	}
 }
+
+// 1本読めないだけで、取り込み全体を落とさない。
+//
+// M25.5 で campd は専用ユーザーになり、会話記録は ACL で読ませている。
+// ACL は持ち主の権限で定期的に配り直すので、**新しいセッションのファイルは
+// 次の配り直しまで camp から読めない**。そこで walk ごと落ちていたため、
+// 新しいファイルが1本あるだけで取り込みが全部止まっていた
+// （2026-09-04 の outer gate で再現）。失敗は journal にしか出ないので黙って止まる。
+func TestOneUnreadableFileDoesNotStopTheRest(t *testing.T) {
+	db := newTestDB(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "-proj")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	if err := os.WriteFile(filepath.Join(dir, sid+".jsonl"),
+		[]byte(convoLines(sid, 0, 3)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocked := filepath.Join(dir, "11111111-2222-4333-8444-555555555555.jsonl")
+	if err := os.WriteFile(blocked, []byte(convoLines("x", 0, 1)), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Ingest(db, "h", root)
+	if err != nil {
+		t.Fatalf("1本読めないだけで落ちた: %v", err)
+	}
+	if n := count(t, db, `select count(*) from messages`); n != 3 {
+		t.Errorf("messages %d。読める3行は入るべき", n)
+	}
+	if len(res.Unreadable) != 1 {
+		t.Errorf("読めなかったファイルを %d 本として報告している。1本のはず", len(res.Unreadable))
+	}
+
+	// 読めるようになったら、次の回で拾う。
+	if err := os.Chmod(blocked, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Ingest(db, "h", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Unreadable) != 0 {
+		t.Errorf("読めるようになったのに %d 本を落としている", len(res.Unreadable))
+	}
+	if n := count(t, db, `select count(*) from messages`); n != 4 {
+		t.Errorf("messages %d。あとから読めた1行も入るべき", n)
+	}
+
+	// ディレクトリごと読めない場合も同じ。新しいプロジェクトの
+	// ディレクトリは ACL が配り直されるまで camp から辿れない。
+	shut := filepath.Join(root, "-locked")
+	if err := os.MkdirAll(shut, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shut, "22222222-3333-4444-8555-666666666666.jsonl"),
+		[]byte(convoLines("y", 0, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shut, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(shut, 0o755) })
+
+	res, err = Ingest(db, "h", root)
+	if err != nil {
+		t.Fatalf("ディレクトリが1つ読めないだけで落ちた: %v", err)
+	}
+	if len(res.Unreadable) == 0 {
+		t.Error("読めなかったディレクトリを報告していない")
+	}
+	if n := count(t, db, `select count(*) from messages`); n != 4 {
+		t.Errorf("messages %d。既にある4行は保たれるべき", n)
+	}
+}
