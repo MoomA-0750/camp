@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -962,5 +963,242 @@ func TestOtherAgentPathsCannotInflateTheAuditLog(t *testing.T) {
 	// 「その分は起きなかった」と読める。
 	if !auditHasSilent(db, "session.log_dropped", "しばらく記録しない") {
 		t.Fatal("記録を抑えたことが、どこにも残っていない")
+	}
+}
+
+// ---------------------------------------------------------------- codex の指摘
+
+// **台帳が知っている pid と違うものを名乗ったら引き取らない。**
+//
+// 見ないと、偽の実行面が自分の持つ生きた pid を名乗って他人のセッションの行を
+// 乗っ取れる。そのあと偽の exited や承認要求を campd 自身に書かせられる。
+func TestReadoptRefusesAPIDTheLedgerDoesNotKnow(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	// 台帳は別の pid を覚えている。
+	mustInsert(t, db, "sess", StateRunning, 999999, 12345, BootID())
+
+	c := &Control{s: s}
+	c.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st, BootID: BootID()}})
+	if len(s.Live()) != 0 {
+		t.Fatal("台帳と違う pid を名乗って引き取られた")
+	}
+	if !auditHasSilent(db, "session.readopt", "台帳の pid") {
+		t.Fatal("食い違いが記録に残っていない")
+	}
+}
+
+// **scope 名を名乗らせない。** これは systemctl --user stop に渡る。
+func TestReadoptRefusesAForeignScopeName(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	mustInsert(t, db, "sess", StateRunning, self, st, BootID())
+
+	c := &Control{s: s}
+	c.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st,
+		BootID: BootID(), Scope: "dbus.service"}})
+
+	r, _ := get(db, "sess")
+	if r.Scope == "dbus.service" {
+		t.Fatal("知らない unit 名を台帳に入れた。**止めろと言われたら本当に止める**")
+	}
+	if !auditHasSilent(db, "session.readopt", "知らない scope") {
+		t.Fatal("名乗りを断ったことが記録に残っていない")
+	}
+	// 正しい名前なら通る。
+	s2 := New(db)
+	c2 := &Control{s: s2}
+	c2.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st,
+		BootID: BootID(), Scope: scopeName("sess")}})
+	r, _ = get(db, "sess")
+	if r.Scope != scopeName("sess") {
+		t.Fatalf("正しい scope 名が入っていない: %q", r.Scope)
+	}
+}
+
+// **ターンの途中で引き取ったら、idle と言わない。**
+//
+// idle にすると、応答生成中の子に入力を重ねて送れる。
+func TestReadoptKeepsARunningTurnRunning(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	mustInsert(t, db, "sess", StateRunning, self, st, BootID())
+
+	c := &Control{s: s}
+	c.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st,
+		BootID: BootID(), State: StateRunning}})
+	if got := state(t, db, "sess"); got != StateRunning {
+		t.Fatalf("%s で引き取った。ターン中の子に入力を重ねられる", got)
+	}
+	if err := s.Input("sess", "x"); err == nil {
+		t.Fatal("ターン中なのに入力を受けた")
+	}
+	// 何も言われなければ running 側に倒す（分からないときに idle にしない）。
+	s2 := New(db)
+	(&Control{s: s2}).readopt([]Held{{ID: "sess", Token: "t", PID: self,
+		Started: st, BootID: BootID()}})
+	if got := state(t, db, "sess"); got != StateRunning {
+		t.Fatalf("状態を名乗られなかったのに %s にした", got)
+	}
+}
+
+// **「届かなかった」を「起きなかった」と確定しない。**
+//
+// 途中まで書けていれば子は起きている。exited と書くと、あとから来る started も
+// 繋ぎ直しの名乗りも弾いてしまい、生きた子が台帳から外れる。
+func TestAFailedStartSendDoesNotBuryAPossiblyLiveChild(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	s.agent = &agentConn{c: brokenConn{}, who: "test"}
+	rec, err := s.Start("test", allowHere(t, db))
+	if err == nil {
+		t.Fatal("送れないのに成功した")
+	}
+	if rec.ID == "" {
+		t.Fatal("id を返していない。あとから来た started と結びつけられない")
+	}
+	if got := state(t, db, rec.ID); got != StateStarting {
+		t.Fatalf("%s にした。**生きているかもしれない子を埋めた**", got)
+	}
+	if len(s.Live()) != 1 {
+		t.Fatal("live から外した。あとから来る started を弾いてしまう")
+	}
+}
+
+// 書けない接続。
+type brokenConn struct{ nopConn }
+
+func (brokenConn) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// **届かなかった承認を「答えた」ことにしない。**
+//
+// DB だけ回答済みにすると、子は待ったまま、画面は答えたと出て、
+// 同じ承認へ答え直すこともできなくなる。
+func TestAnUndeliverableApprovalGoesBackToWaiting(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, err := s.Start("test", allowHere(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// 実行面を「書けない」ものに差し替える。
+	s.mu.Lock()
+	s.agent = &agentConn{c: brokenConn{}, who: "test"}
+	s.mu.Unlock()
+
+	if err := s.Approve(rec.ID, "r", "allow", ""); err == nil {
+		t.Fatal("届いていないのに成功した")
+	}
+	if got := pending(t, s, rec.ID); len(got) != 1 {
+		t.Fatalf("待ちに戻っていない: %v", got)
+	}
+	if !auditHasSilent(db, "tool.approve", "待ちに戻した") {
+		t.Fatal("戻したことが記録に残っていない")
+	}
+}
+
+// **書けなかったのに数えを進めない。**
+//
+// 進めると、途中まで書かれた行が次の行と繋がって壊れ、Tail はそれを黙って
+// 飛ばす——欠番なのに gap が立たない。
+func TestAFailedWriteDoesNotAdvanceTheCursor(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	if _, err := lg.Append("assistant", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, before, _ := lg.Stats()
+
+	// 書けなくする。
+	lg.mu.Lock()
+	lg.f.Close()
+	lg.mu.Unlock()
+
+	if _, err := lg.Append("assistant", []byte(`{}`)); err == nil {
+		t.Fatal("閉じたファイルに書けたことになっている")
+	}
+	if _, after, _ := lg.Stats(); after != before {
+		t.Fatalf("番号が %d → %d に進んだ", before, after)
+	}
+	if !lg.Broken() {
+		t.Fatal("壊れたことを覚えていない")
+	}
+	// 以後「飛んでいない」とは言えない。
+	if _, gap, _ := lg.Tail(before, 10); !gap {
+		t.Fatal("壊れたあとに gap を立てていない")
+	}
+}
+
+// 落とした件数は、実行面を起こし直しても 0 に戻らない。
+func TestTheDroppedCountSurvivesAReopen(t *testing.T) {
+	old := maxLogBytes
+	maxLogBytes = 1024
+	defer func() { maxLogBytes = old }()
+
+	dir := t.TempDir()
+	lg, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		lg.Append("assistant", []byte(`{"pad":"`+strings.Repeat("x", 60)+`"}`))
+	}
+	_, _, dropped := lg.Stats()
+	if dropped == 0 {
+		t.Skip("まだ2回転していない")
+	}
+	lg.Close()
+
+	again, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if _, _, got := again.Stats(); got != dropped {
+		t.Fatalf("落とした件数が %d → %d に戻った", dropped, got)
+	}
+}
+
+// **上限は競合で越えられない。**
+func TestTheConcurrencyLimitHoldsUnderARace(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	s.SetMaxConcurrent(2)
+	dirs := make([]string, 12)
+	for i := range dirs {
+		dirs[i] = allowHere(t, db)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	started := 0
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := s.Start("test", dirs[i]); err == nil {
+				mu.Lock()
+				started++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if started > 2 {
+		t.Fatalf("上限 2 に対して %d 本起こした", started)
 	}
 }

@@ -69,6 +69,14 @@ func answer(db *store.DB, sessionID, reqID, behavior, reason string, now time.Ti
 	return n > 0, err
 }
 
+// reopen は答えを取り消して待ちに戻す。**子へ届かなかったときだけ。**
+func reopen(db *store.DB, sessionID, reqID string) error {
+	_, err := db.Exec(`
+		update approvals set answered_at=null, behavior=null, reason=null
+		where session_id=? and request_id=?`, sessionID, reqID)
+	return err
+}
+
 // openApprovals はまだ答えていないものを返す。session が空なら全部。
 //
 // **DB から読む。** campd のメモリから読むと、入れ替えた瞬間に

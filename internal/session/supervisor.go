@@ -51,6 +51,8 @@ type liveSession struct {
 	turn time.Time
 	// asked は待っている承認。M28 で画面に出す。
 	asked map[string]bool
+	// logBroken は落とし先へ書けなくなったか。画面に出す。
+	logBroken bool
 }
 
 // New は supervisor を作る。
@@ -136,6 +138,17 @@ func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
 		return Record{}, err
 	}
 
+	id := newID()
+	token := newID() + newID()
+	t := s.Now().UTC()
+	rec := Record{
+		ID: id, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
+		CreatedAt: t.Format(time.RFC3339), UpdatedAt: t.Format(time.RFC3339),
+	}
+
+	// **枠は数えたその場で押さえる。**
+	// 数えてから錠を外して、それから live に入れると、同時に来た要求が
+	// 全部同じ空き枠を見て、上限を越えて起こしてしまう。
 	s.mu.Lock()
 	if s.agent == nil {
 		s.mu.Unlock()
@@ -149,30 +162,29 @@ func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
 		return Record{}, err
 	}
 	agent := s.agent
+	s.live[id] = &liveSession{rec: rec, token: token, last: s.Now(), asked: map[string]bool{}}
 	s.mu.Unlock()
 
-	id := newID()
-	token := newID() + newID()
-	t := s.Now().UTC()
-	rec := Record{
-		ID: id, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
-		CreatedAt: t.Format(time.RFC3339), UpdatedAt: t.Format(time.RFC3339),
-	}
 	// **起こす前に書く。** 起こしてから書くと、その隙に campd が落ちたときに
 	// 誰も知らない子が残る。
 	if err := insert(s.db, rec); err != nil {
+		s.mu.Lock()
+		delete(s.live, id)
+		s.mu.Unlock()
 		return Record{}, err
 	}
-
-	s.mu.Lock()
-	s.live[id] = &liveSession{rec: rec, token: token, last: s.Now(), asked: map[string]bool{}}
-	s.mu.Unlock()
 
 	s.audit(id, "session.start", real, "実行面へ起動を依頼した", audit.OK)
 
 	if err := agent.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root}); err != nil {
-		s.fail(id, "実行面へ届かなかった: "+err.Error())
-		return Record{}, err
+		// **「届かなかった」を「起きなかった」と確定しない。**
+		// 途中まで書けていれば実行面は子を起こしている。ここで exited と
+		// 書くと、あとから来る started も、繋ぎ直しの名乗りも弾いてしまい、
+		// 生きた子が台帳から外れる。starting のまま残し、started が来なければ
+		// 起動猶予（Tick）で閉じる。
+		s.audit(id, "session.start", real,
+			"実行面へ届いたか分からない: "+err.Error(), audit.Error)
+		return rec, err
 	}
 	return rec, nil
 }
@@ -263,15 +275,29 @@ func (s *Supervisor) Approve(id, reqID, behavior, message string) error {
 		return fmt.Errorf("その承認はもう答えてある（または待っていない）: %s", reqID)
 	}
 
+	if err := agent.send(Msg{
+		T: MsgApprove, Session: id, Token: token,
+		ReqID: reqID, Behavior: behavior, Text: message,
+	}); err != nil {
+		// **届かなかったなら、答えたことにしない。**
+		// DB だけ「回答済み」にすると、子は待ったまま、画面は答えたと出て、
+		// 同じ承認へ答え直すこともできなくなる。
+		if err2 := reopen(s.db, id, reqID); err2 != nil {
+			s.audit(id, "tool.approve", reqID,
+				"届かず、戻すのにも失敗した: "+err2.Error(), audit.Error)
+		} else {
+			s.audit(id, "tool.approve", reqID,
+				"実行面へ届かなかったので待ちに戻した: "+err.Error(), audit.Error)
+		}
+		return fmt.Errorf("実行面へ届かなかった: %w", err)
+	}
+
 	outcome := audit.OK
 	if behavior == "deny" {
 		outcome = audit.Denied
 	}
 	s.audit(id, "tool.approve", reqID, message, outcome)
-	return agent.send(Msg{
-		T: MsgApprove, Session: id, Token: token,
-		ReqID: reqID, Behavior: behavior, Text: message,
-	})
+	return nil
 }
 
 // Pending は待っている承認の request_id。**DB から読む。**
@@ -392,9 +418,14 @@ func (s *Supervisor) Tick() {
 			}
 			s.mu.Unlock()
 			if agent != nil && token != "" {
-				agent.send(Msg{T: MsgApprove, Session: a.SessionID, Token: token,
+				if err := agent.send(Msg{T: MsgApprove, Session: a.SessionID, Token: token,
 					ReqID: a.RequestID, Behavior: "deny",
-					Text: "期限切れ（Camp が待てる時間を過ぎた）"})
+					Text: "期限切れ（Camp が待てる時間を過ぎた）"}); err != nil {
+					// 届かなくても、期限が切れたこと自体は動かない。
+					// ただし**子には伝わっていない**ので、そう書く。
+					s.audit(a.SessionID, "tool.approve", a.Tool,
+						"期限切れの拒否が子へ届いていない: "+err.Error(), audit.Error)
+				}
 			}
 		}
 	}

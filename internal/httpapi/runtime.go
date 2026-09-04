@@ -174,6 +174,15 @@ func (s *Server) handleRuntimeStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// **読まない相手に、いつまでも書こうとしない。**
+	// 期限が無いと、受け取らないクライアントで Write が詰まり、
+	// goroutine と枠が返らない（切っても気づけない）。
+	rc := http.NewResponseController(w)
+	deadline := func() {
+		rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	}
+	deadline()
+
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
@@ -191,6 +200,7 @@ func (s *Server) handleRuntimeStream(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-tick.C:
 		}
+		deadline()
 		res, err := s.sessions.Tail(id, since, 200)
 		if err != nil {
 			fmt.Fprintf(w, "event: error\ndata: %s\n\n", jsonString(err.Error()))

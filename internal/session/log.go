@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,6 +39,9 @@ type Log struct {
 	// outer gate で実測: 満杯（約17,000行）の落とし先で 59ms/回。SSE は
 	// 300ms ごとに叩くので、読み手1人でコアの2割を使う計算になる。
 	curMarks, prevMarks []mark
+
+	// broken は途中まで書いてしまったか。**以後の答えは信用できない。**
+	broken bool
 }
 
 // mark は seq とその行の先頭バイト位置。
@@ -105,12 +109,36 @@ func OpenLog(dir, id string) (*Log, error) {
 	if fi, err := os.Stat(l.path(0)); err == nil {
 		l.size = fi.Size()
 	}
+	l.dropped = l.readDropped()
 	f, err := os.OpenFile(l.path(0), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	l.f = f
 	return l, nil
+}
+
+// metaPath は世代をまたいで持ち越す数の置き場。
+//
+// **落とした件数はファイルの中には無い。** 消したのだから当たり前で、
+// だからこそ別に残さないと、実行面を起こし直した瞬間に 0 に戻る
+// ——画面には「飛んでいる」と出るのに「何件飛んだか」は 0、になる。
+func (l *Log) metaPath() string {
+	return filepath.Join(l.dir, l.id+".dropped")
+}
+
+func (l *Log) readDropped() int64 {
+	b, err := os.ReadFile(l.metaPath())
+	if err != nil {
+		return 0
+	}
+	var n int64
+	fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &n)
+	return n
+}
+
+func (l *Log) writeDropped() {
+	os.WriteFile(l.metaPath(), []byte(fmt.Sprintf("%d\n", l.dropped)), 0o600)
 }
 
 func (l *Log) path(gen int) string {
@@ -161,8 +189,10 @@ func (l *Log) Append(kind string, frame []byte) (int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.seq++
-	ln := Line{Seq: l.seq, At: time.Now().UTC().Format(time.RFC3339Nano), Kind: kind}
+	// **番号は書けてから確定する。** 先に進めると、失敗した行のぶんだけ
+	// 番号が飛び、読み手のカーソルは「そこには何も無かった」と読む。
+	next := l.seq + 1
+	ln := Line{Seq: next, At: time.Now().UTC().Format(time.RFC3339Nano), Kind: kind}
 	if len(frame) > 0 {
 		ln.Frame = json.RawMessage(frame)
 	}
@@ -177,16 +207,28 @@ func (l *Log) Append(kind string, frame []byte) (int64, error) {
 			return 0, err
 		}
 	}
+	n, err := l.f.Write(b)
+	if err != nil || n != len(b) {
+		// **書けなかったのに数えを進めない。**
+		// 進めると、途中まで書かれた行が次の行と繋がって壊れ、
+		// scanFile も Tail もそれを黙って飛ばす——欠番なのに gap が立たない。
+		l.size += int64(n)
+		l.broken = true
+		if err == nil {
+			err = fmt.Errorf("落とし先へ %d バイトのうち %d しか書けなかった", len(b), n)
+		}
+		return 0, err
+	}
 	if l.curCount%markEvery == 0 {
 		l.curMarks = append(l.curMarks, mark{seq: ln.Seq, off: l.size})
 	}
-	n, err := l.f.Write(b)
 	l.size += int64(n)
 	if l.curCount == 0 {
 		l.curFirst = ln.Seq
 	}
 	l.curCount++
-	return ln.Seq, err
+	l.seq = next
+	return ln.Seq, nil
 }
 
 // rotate は世代を1つ進める。**溢れたぶんは数えてから捨てる。**
@@ -195,6 +237,7 @@ func (l *Log) rotate() error {
 		return err
 	}
 	l.dropped += l.prevCount
+	l.writeDropped()
 	os.Remove(l.path(1))
 	if err := os.Rename(l.path(0), l.path(1)); err != nil && !os.IsNotExist(err) {
 		return err
@@ -223,6 +266,13 @@ func (l *Log) Stats() (oldest, newest, dropped int64) {
 	return oldest, l.seq, l.dropped
 }
 
+// Broken は途中まで書いてしまったか。
+func (l *Log) Broken() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.broken
+}
+
 // Tail は since より後ろを返す。
 //
 // 第2の戻り値は「読み手のカーソルより前に落としたものがあるか」。
@@ -235,6 +285,13 @@ func (l *Log) Tail(since int64, limit int) (lines []Line, gap bool, err error) {
 	if since+1 < oldest {
 		gap = true
 	}
+	// 途中まで書いた行がある。**以後「飛んでいない」とは言えない。**
+	l.mu.Lock()
+	if l.broken {
+		gap = true
+	}
+	l.mu.Unlock()
+
 	// **何も無いなら、ファイルを開かない。**
 	// SSE は 300ms ごとに聞きに来る。その大半は「まだ無い」の答えになる。
 	if since >= newest && !gap {
@@ -283,6 +340,12 @@ func (l *Log) Tail(since int64, limit int) (lines []Line, gap bool, err error) {
 			break
 		}
 	}
+	// **読んでいる間に世代が回ったかもしれない。**
+	// 開く前の oldest では「飛んでいない」だったのに、読み終えたときには
+	// もう消えている、ということが起きる。読み終えてから見直す。
+	if after, _, _ := l.Stats(); since+1 < after {
+		gap = true
+	}
 	return lines, gap, nil
 }
 
@@ -303,6 +366,7 @@ func (l *Log) Remove() {
 	l.Close()
 	os.Remove(l.path(0))
 	os.Remove(l.path(1))
+	os.Remove(l.metaPath())
 }
 
 // DefaultLogDir は落とし先。**本人のユーザーの領域**に置く（実行面が書く）。

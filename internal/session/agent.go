@@ -55,6 +55,12 @@ type child struct {
 	pending map[string]chan []byte
 	mu      sync.Mutex
 	dead    bool
+	// turn は「入力を渡してから result が返るまで」。
+	// **campd の引き取り直しに要る**——idle と言ってしまうと、応答生成中の
+	// 子に入力を重ねて送られる。
+	turn bool
+	// logBroken は落とし先へ書けなくなったか。**黙って続けない。**
+	logBroken bool
 }
 
 // NewAgent は実行面を作る。
@@ -125,8 +131,14 @@ func (a *Agent) held() []Held {
 		}
 		pid := k.cmd.Process.Pid
 		st, _ := Starttime(pid)
+		k.mu.Lock()
+		state := StateIdle
+		if k.turn {
+			state = StateRunning
+		}
+		k.mu.Unlock()
 		out = append(out, Held{ID: id, Token: k.token, PID: pid,
-			Started: st, BootID: BootID(), Scope: k.scope, State: StateIdle})
+			Started: st, BootID: BootID(), Scope: k.scope, State: state})
 	}
 	return out
 }
@@ -277,6 +289,25 @@ func (a *Agent) start(m Msg) {
 	pid := cmd.Process.Pid
 	st, _ := Starttime(pid)
 
+	// **照合したパスと、実際に降りた場所が同じか。**
+	//
+	// 照合してから exec するまでの間に、ディレクトリを rename や symlink で
+	// 差し替えられると、同じ文字列が別の場所を指しうる（TOCTOU）。
+	// 起こしたあとに /proc/<pid>/cwd を読めば、実際どこに居るかが分かる。
+	// 違えば、その場で止める。
+	if where, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
+		if !under(where, m.Root) {
+			cmd.Process.Kill()
+			a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
+				Error: fmt.Sprintf("起こした先が許した場所の外だった（%s）。止めた", where)})
+			return
+		}
+	} else {
+		// 読めなかったことを「合っていた」と読ませない。
+		fmt.Fprintf(os.Stderr,
+			"camp agent: %s の実際の cwd を確かめられない: %v\n", m.Session[:8], err)
+	}
+
 	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
 		pending: map[string]chan []byte{}}
 	if a.Scope {
@@ -287,7 +318,12 @@ func (a *Agent) start(m Msg) {
 	if lg, err := OpenLog(a.LogDir, m.Session); err == nil {
 		k.log = lg
 	} else {
+		// **campd にも言う。** stderr にしか出さないと、画面は
+		// 「フレームは来ているのに中身が無い」を「中身が無かった」と読む。
+		k.logBroken = true
 		fmt.Fprintf(os.Stderr, "camp agent: 落とし先を開けない（%v）。フレームは残らない\n", err)
+		a.send(Msg{T: MsgDropped, Session: m.Session, Token: m.Token, Dropped: -1,
+			Error: "落とし先を開けない: " + err.Error()})
 	}
 	a.mu.Lock()
 	a.kids[m.Session] = k
@@ -355,12 +391,27 @@ func (a *Agent) drain(k *child, r io.Reader) {
 		// **読み手より先に、必ず落とす。** ここが読み手待ちになると子が詰まる。
 		if k.log != nil {
 			if _, err := k.log.Append(kind, line); err != nil {
+				// **一度でも書けなくなったら、そう言う。**
+				// 黙って続けると、落とし先には穴があるのに gap も立たない。
 				fmt.Fprintf(os.Stderr, "camp agent: 落とせない: %v\n", err)
+				k.mu.Lock()
+				first := !k.logBroken
+				k.logBroken = true
+				k.mu.Unlock()
+				if first {
+					a.send(Msg{T: MsgDropped, Session: k.id, Token: k.token,
+						Dropped: -1, Error: "落とし先へ書けない: " + err.Error()})
+				}
 			}
 			if _, _, d := k.log.Stats(); d > dropped {
 				dropped = d
 				a.send(Msg{T: MsgDropped, Session: k.id, Token: k.token, Dropped: d})
 			}
+		}
+		if kind == "result" {
+			k.mu.Lock()
+			k.turn = false
+			k.mu.Unlock()
 		}
 		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: kind}
 		if s, ok := f["session_id"].(string); ok {
@@ -421,6 +472,9 @@ func (a *Agent) toChild(m Msg, frame []byte) {
 	defer k.mu.Unlock()
 	if k.dead {
 		return
+	}
+	if m.T == MsgInput {
+		k.turn = true // result が返るまでターン中
 	}
 	k.stdin.Write(append(frame, '\n'))
 }

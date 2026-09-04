@@ -244,6 +244,16 @@ func (c *Control) readopt(held []Held) {
 			s.audit(h.ID, "session.readopt", "", "台帳では終わっている", audit.Error)
 			continue
 		}
+		// **台帳が既に知っている pid と一致すること。**
+		// 一致を見ないと、偽の実行面が自分の持つ生きた pid を名乗って、
+		// 他人のセッションの行を乗っ取れる（そのあと偽の exited や
+		// 承認要求を campd 自身に書かせられる）。
+		if r.PID != 0 && (h.PID != r.PID || h.Started != r.Started) {
+			s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
+				fmt.Sprintf("台帳の pid %d/%d と違うものを名乗った", r.PID, r.Started),
+				audit.Denied)
+			continue
+		}
 		o := Owner{PID: h.PID, Started: h.Started, BootID: h.BootID}
 		alive, known := o.Alive()
 		if !known {
@@ -256,20 +266,48 @@ func (c *Control) readopt(held []Held) {
 				"抱えていると言われたが、そのプロセスは居ない", audit.Error)
 			continue
 		}
+		// **scope 名を名乗らせない。** これは後で
+		// `systemctl --user stop <scope>` に渡る。任意の名前を通すと、
+		// 同じユーザーの無関係な unit を止められる。
+		scope := r.Scope
+		if h.Scope != "" {
+			if h.Scope != scopeName(h.ID) {
+				s.audit(h.ID, "session.readopt", h.Scope,
+					"知らない scope 名を名乗ったので採らない", audit.Denied)
+			} else {
+				scope = h.Scope
+			}
+		}
 		s.mu.Lock()
 		if s.live[h.ID] != nil {
 			s.mu.Unlock()
 			continue
 		}
-		r.State = StateIdle
-		r.PID, r.Started, r.BootID, r.Scope = o.PID, o.Started, o.BootID, h.Scope
+		// **ターンの途中かもしれない。** idle と決めてしまうと、応答生成中の
+		// 子に入力を重ねて送れる。実行面が running と言うなら、そのまま扱う
+		// （result が来るまで入力を受けない）。分からないときも running 側に倒す。
+		r.State = StateRunning
+		if h.State == StateIdle {
+			r.State = StateIdle
+		}
+		r.PID, r.Started, r.BootID, r.Scope = o.PID, o.Started, o.BootID, scope
 		s.live[h.ID] = &liveSession{rec: r, token: h.Token, last: s.Now(),
-			asked: map[string]bool{}}
+			turn: turnStartFor(r.State, s.Now()), asked: map[string]bool{}}
 		s.mu.Unlock()
-		_ = setOwner(s.db, h.ID, o, h.Scope)
+		_ = setOwner(s.db, h.ID, o, scope)
+		_ = setState(s.db, h.ID, r.State)
 		s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
-			"実行面がまだ抱えていたので引き取り直した", audit.OK)
+			"実行面がまだ抱えていたので引き取り直した（"+r.State+"）", audit.OK)
 	}
+}
+
+// turnStartFor は running で引き取ったときにターンの起点を入れる。
+// ゼロのままだと、終わらないターンを回収できない。
+func turnStartFor(state string, now time.Time) time.Time {
+	if state == StateRunning {
+		return now
+	}
+	return time.Time{}
 }
 
 // reapOrphans は前回の残りを実行面に始末してもらう。
@@ -413,6 +451,18 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		// **溢れて捨てたことを記録に残す。** 画面に出ない範囲があることは、
 		// あとから「無かった」と読み違えられる。
 		// ただし、これも実行面が何度でも起こせるので枠の中で。
+		if m.Dropped < 0 {
+			// 溢れたのではなく、**落とし先そのものが壊れた**。
+			// 「中身が無い」と「保存できなかった」を混ぜない。
+			s.auditFromAgent(m.Session, "session.log_broken", "",
+				"落とし先へ書けない: "+m.Error, audit.Error)
+			s.mu.Lock()
+			if ls := s.live[m.Session]; ls != nil {
+				ls.logBroken = true
+			}
+			s.mu.Unlock()
+			return
+		}
 		s.auditFromAgent(m.Session, "session.log_dropped", "",
 			fmt.Sprintf("落とし先が溢れて %d 件捨てた", m.Dropped), audit.Error)
 
