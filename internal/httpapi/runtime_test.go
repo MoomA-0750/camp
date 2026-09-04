@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -86,7 +87,7 @@ done
 func TestTheScreenCanStartASessionAndFollowItWithSSE(t *testing.T) {
 	ts, c, _ := runtimeServer(t)
 
-	work := t.TempDir()
+	work := allowDir(t, c, ts)
 	res, err := c.Post(ts.URL+"/api/runtime", "application/json",
 		strings.NewReader(`{"cwd":`+jsonString(work)+`}`))
 	if err != nil {
@@ -181,7 +182,7 @@ func TestTheScreenCanStartASessionAndFollowItWithSSE(t *testing.T) {
 // 落としてあるぶんはカーソルで引ける。
 func TestTheLogIsReadableByCursor(t *testing.T) {
 	ts, c, sup := runtimeServer(t)
-	work := t.TempDir()
+	work := allowDir(t, c, ts)
 	rec, err := sup.Start("test", work)
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +239,96 @@ func TestTheLogIsReadableByCursor(t *testing.T) {
 	}
 }
 
+// allowDir は使い捨てのディレクトリを1つ、API 越しに許可リストへ入れる。
+func allowDir(t *testing.T, c *http.Client, ts *httptest.Server) string {
+	t.Helper()
+	dir := t.TempDir()
+	r, err := c.Post(ts.URL+"/api/allowlist", "application/json",
+		strings.NewReader(`{"path":`+jsonString(dir)+`,"password":"correct horse battery"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != 200 {
+		t.Fatalf("許可リストに入れられない: %s", r.Status)
+	}
+	return dir
+}
+
 func jsonInt(n int64) string {
 	b, _ := json.Marshal(n)
 	return string(b)
+}
+
+// **許可リストの変更にはパスワードが要る。** Cookie だけでは広げられない。
+func TestChangingTheAllowlistNeedsThePasswordAgain(t *testing.T) {
+	ts, c, _ := runtimeServer(t)
+	dir := t.TempDir()
+
+	// Cookie はある。パスワードが無い／違う。
+	for _, body := range []string{
+		`{"path":` + jsonString(dir) + `}`,
+		`{"path":` + jsonString(dir) + `,"password":"ちがう"}`,
+	} {
+		r, err := c.Post(ts.URL+"/api/allowlist", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("パスワード無しで通った（%s）: %s", body, r.Status)
+		}
+	}
+
+	// 正しいパスワードなら通る。
+	r, err := c.Post(ts.URL+"/api/allowlist", "application/json",
+		strings.NewReader(`{"path":`+jsonString(dir)+`,"password":"correct horse battery"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != 200 {
+		t.Fatalf("正しいパスワードで通らない: %s", r.Status)
+	}
+
+	// 読むだけならログイン済みで足りる。
+	g, err := c.Get(ts.URL + "/api/allowlist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Body.Close()
+	var list []struct {
+		Path string `json:"path"`
+	}
+	json.NewDecoder(g.Body).Decode(&list)
+	if len(list) != 1 {
+		t.Fatalf("足したはずのものが見えない: %+v", list)
+	}
+}
+
+// 許可リストの変更は監査ログに残る。**失敗も残る。**
+func TestAllowlistChangesAreRecorded(t *testing.T) {
+	ts, c, _ := runtimeServer(t)
+	dir := t.TempDir()
+	post := func(body string) {
+		r, err := c.Post(ts.URL+"/api/allowlist", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+	}
+	post(`{"path":` + jsonString(dir) + `,"password":"ちがう"}`)
+	post(`{"path":` + jsonString(dir) + `,"password":"correct horse battery"}`)
+
+	g, err := c.Get(ts.URL + "/api/audit?limit=50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Body.Close()
+	b, _ := io.ReadAll(g.Body)
+	for _, want := range []string{"allowlist.reauth", "allowlist.add"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("%s が監査ログに無い", want)
+		}
+	}
 }

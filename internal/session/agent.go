@@ -229,12 +229,18 @@ func (a *Agent) start(m Msg) {
 	// **campd 側でも照合しているが、ここでも見る。** 境界として数えるのは
 	// campd 側だけ（同じユーザーで動く以上、ここの検査は迂回できる）。
 	// それでも、campd の取り違えをそのまま実行しないだけの価値はある。
-	if _, err := resolveCwd(m.Cwd); err != nil {
+	real, err := resolveCwd(m.Cwd)
+	if err != nil {
 		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token, Error: err.Error()})
 		return
 	}
-	cmd := a.Command(m.Session, m.Cwd)
-	cmd.Dir = m.Cwd
+	if m.Root == "" || !under(real, m.Root) {
+		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
+			Error: fmt.Sprintf("許した場所（%s）の外を渡された: %s", m.Root, real)})
+		return
+	}
+	cmd := a.Command(m.Session, real)
+	cmd.Dir = real
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token, Error: err.Error()})

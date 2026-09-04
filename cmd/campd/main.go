@@ -117,6 +117,8 @@ func run(args []string) error {
 		return cmdAgent(rest)
 	case "runtime":
 		return cmdRuntime(rest)
+	case "allow":
+		return cmdAllow(rest)
 	case "passwd":
 		return cmdPasswd(rest)
 	case "vault":
@@ -165,6 +167,7 @@ usage:
   campd serve   [-addr]   HTTP で待ち受ける（認証必須・SPA フォールバックあり）
   campd agent             実行面。本人のユーザーで claude を起こす（DBには触らない）
   campd runtime           Camp が起こしたセッションの台帳を読む
+  campd allow [add|remove] セッションを起こしてよい cwd の許可リスト（既定は deny）
   campd login-url         使い捨てのログインURLを1本出す（開発中の入口）
   campd vault scan  [DIR] Vault を歩いて内訳を出す（DBには書かない）
   campd vault index [DIR] Vault を索引する（Vault側には一切書かない）
@@ -2326,4 +2329,79 @@ func cmdRuntime(args []string) error {
 		}
 	}
 	return nil
+}
+
+// cmdAllow は cwd の許可リストを見る・足す・外す。
+//
+// **既定は deny。** 空なら1本も起こせない。GUI からの変更にはパスワードの
+// 再入力が要るが、こちら（DB を直に開ける側＝camp ユーザー）は要らない
+// ——そこに届く時点で、境界はもう内側にある。
+func cmdAllow(args []string) error {
+	fs := flag.NewFlagSet("allow", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	note := fs.String("note", "", "覚え書き")
+	rest, err := parseAround(fs, args)
+	if err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	sub := ""
+	if len(rest) > 0 {
+		sub = rest[0]
+	}
+	switch sub {
+	case "", "list":
+		rows, err := session.ListAllowed(db)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			fmt.Println("空。**この状態では1本も起こせない**（既定は deny）。")
+			fmt.Println("足すなら: campd allow add <ディレクトリ>")
+			return nil
+		}
+		for _, a := range rows {
+			fmt.Printf("%s\n  足したのは %s（%s）%s\n", a.Path, a.AddedBy, a.AddedAt, a.Note)
+		}
+		return nil
+
+	case "add":
+		if len(rest) < 2 {
+			return fmt.Errorf("ディレクトリを指す: campd allow add <dir>")
+		}
+		a, err := session.AddAllowed(db, rest[1], *note, "cli")
+		if err != nil {
+			return err
+		}
+		audit.Append(db, audit.Entry{Actor: "cli", Action: "allowlist.add",
+			Target: a.Path, Detail: *note, Outcome: audit.OK})
+		fmt.Printf("許した: %s\n", a.Path)
+		return nil
+
+	case "remove", "rm":
+		if len(rest) < 2 {
+			return fmt.Errorf("パスを指す: campd allow remove <path>")
+		}
+		ok, err := session.RemoveAllowed(db, rest[1])
+		if err != nil {
+			return err
+		}
+		out := audit.OK
+		if !ok {
+			out = audit.Error
+		}
+		audit.Append(db, audit.Entry{Actor: "cli", Action: "allowlist.remove",
+			Target: rest[1], Outcome: out})
+		if !ok {
+			return fmt.Errorf("その行は無い（実パスで指す）: %s", rest[1])
+		}
+		fmt.Printf("外した: %s\n", rest[1])
+		return nil
+	}
+	return fmt.Errorf("知らない副命令: %s（list / add / remove）", sub)
 }

@@ -117,9 +117,15 @@ func (s *Supervisor) Reconcile() (ghosts, orphans, unknown int, err error) {
 
 // Start は新しいセッションを起こす。**起こすのは実行面だが、決めるのはここ。**
 func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
-	real, err := resolveCwd(cwd)
+	// **照合するのは campd 側。** 実行面は本人のユーザーで動くので、
+	// そこでの照合は迂回できる。ここが唯一の境界。
+	real, err := CheckCwd(s.db, cwd)
 	if err != nil {
 		s.audit("", "session.start", cwd, err.Error(), audit.Denied)
+		return Record{}, err
+	}
+	root, err := matchedRoot(s.db, real)
+	if err != nil {
 		return Record{}, err
 	}
 
@@ -157,7 +163,7 @@ func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
 
 	s.audit(id, "session.start", real, "実行面へ起動を依頼した", audit.OK)
 
-	if err := agent.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real}); err != nil {
+	if err := agent.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root}); err != nil {
 		s.fail(id, "実行面へ届かなかった: "+err.Error())
 		return Record{}, err
 	}
@@ -499,4 +505,22 @@ func (s *Supervisor) deliver(m Msg) {
 	case ch <- m:
 	default:
 	}
+}
+
+// matchedRoot は real を通した許可リストの行を返す。実行面へ渡して二重に照合させる。
+func matchedRoot(db *store.DB, real string) (string, error) {
+	list, err := ListAllowed(db)
+	if err != nil {
+		return "", err
+	}
+	best := ""
+	for _, a := range list {
+		if under(real, a.Path) && len(a.Path) > len(best) {
+			best = a.Path
+		}
+	}
+	if best == "" {
+		return "", ErrNotAllowed{Path: real}
+	}
+	return best, nil
 }

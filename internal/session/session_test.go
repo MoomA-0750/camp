@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -76,6 +77,18 @@ func attach(t *testing.T, s *Supervisor, claude string) *Agent {
 
 	waitFor(t, 3*time.Second, func() bool { return s.AgentConnected() })
 	return a
+}
+
+// allowHere は使い捨てのディレクトリを1つ作って、許可リストへ入れる。
+// **既定は deny** なので、テストも明示的に許さないと起こせない。
+func allowHere(t *testing.T, db *store.DB) string {
+	t.Helper()
+	dir := t.TempDir()
+	if _, err := AddAllowed(db, dir, "テスト", "test"); err != nil {
+		t.Fatal(err)
+	}
+	real, _ := filepath.EvalSymlinks(dir)
+	return real
 }
 
 func waitFor(t *testing.T, d time.Duration, ok func() bool) {
@@ -212,7 +225,7 @@ func TestOneSessionRunsThroughTheStateMachine(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
 
-	rec, err := s.Start("test", t.TempDir())
+	rec, err := s.Start("test", allowHere(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +260,7 @@ func TestTheTokenStopsCrossSessionMixups(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
 
-	rec, err := s.Start("test", t.TempDir())
+	rec, err := s.Start("test", allowHere(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +281,7 @@ func TestTheTokenStopsCrossSessionMixups(t *testing.T) {
 func TestAnApprovalCanOnlyBeAnsweredOnce(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
-	rec, _ := s.Start("test", t.TempDir())
+	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
 	if err := s.Approve(rec.ID, "req-1", "allow", ""); err == nil {
@@ -310,7 +323,7 @@ func TestASecondExecutionSideIsRefused(t *testing.T) {
 func TestLosingTheExecutionSideOrphansInsteadOfBuries(t *testing.T) {
 	db := newDB(t)
 	s, a := wire(t, db)
-	rec, _ := s.Start("test", t.TempDir())
+	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
 	a.conn.Close()
@@ -327,7 +340,7 @@ func TestLosingTheExecutionSideOrphansInsteadOfBuries(t *testing.T) {
 func TestStartingWithoutAnExecutionSideIsRefused(t *testing.T) {
 	db := newDB(t)
 	s := New(db)
-	if _, err := s.Start("test", t.TempDir()); err == nil {
+	if _, err := s.Start("test", allowHere(t, db)); err == nil {
 		t.Fatal("実行面が無いのに起こせてしまった")
 	}
 }
@@ -336,10 +349,10 @@ func TestTooManyAtOnceIsRefused(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
 	s.SetMaxConcurrent(1)
-	if _, err := s.Start("test", t.TempDir()); err != nil {
+	if _, err := s.Start("test", allowHere(t, db)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Start("test", t.TempDir()); err == nil {
+	if _, err := s.Start("test", allowHere(t, db)); err == nil {
 		t.Fatal("上限を越えて起こせてしまった")
 	}
 }
@@ -374,7 +387,7 @@ func TestCwdIsResolvedThroughSymlinks(t *testing.T) {
 func TestIdleAndLongTurnsAreCollected(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
-	rec, _ := s.Start("test", t.TempDir())
+	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
 	// 時計を進める代わりに、待つ長さをゼロにする。
@@ -392,7 +405,7 @@ func TestAStartThatNeverReportsIsGivenUp(t *testing.T) {
 	// 実行面が居ることにするが、何も返さない。
 	s.agent = &agentConn{c: nopConn{}, who: "test"}
 	s.StartAfter = 0
-	rec, err := s.Start("test", t.TempDir())
+	rec, err := s.Start("test", allowHere(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +529,7 @@ func TestARealClaudeSessionRunsEndToEnd(t *testing.T) {
 	defer a.conn.Close()
 	waitFor(t, 3*time.Second, func() bool { return s.AgentConnected() })
 
-	work := t.TempDir()
+	work := allowHere(t, db)
 	rec, err := s.Start("e2e", work)
 	if err != nil {
 		t.Fatal(err)
@@ -592,7 +605,7 @@ func TestARestartWhileAChildIsAliveMarksItOrphanAndThenReapsIt(t *testing.T) {
 	db := newDB(t)
 	s1, a1 := wire(t, db)
 
-	rec, err := s1.Start("test", t.TempDir())
+	rec, err := s1.Start("test", allowHere(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +715,7 @@ func TestTheChildRunsToTheEndWithNobodyReading(t *testing.T) {
 	a := attach(t, s, noisyClaude(t, 4000)) // 約 4MB。パイプ(64KB)よりずっと大きい
 	a.LogDir = t.TempDir()
 
-	rec, err := s.Start("test", t.TempDir())
+	rec, err := s.Start("test", allowHere(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -729,7 +742,7 @@ func TestASlowReaderNeverStallsTheChild(t *testing.T) {
 	a := attach(t, s, noisyClaude(t, 3000))
 	a.LogDir = t.TempDir()
 
-	rec, _ := s.Start("test", t.TempDir())
+	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
 	stop := make(chan struct{})
@@ -857,7 +870,7 @@ func TestAWaitingApprovalSurvivesCampdRestarting(t *testing.T) {
 	db := newDB(t)
 	s1, a := wire(t, db)
 
-	rec, err := s1.Start("test", t.TempDir())
+	rec, err := s1.Start("test", allowHere(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,7 +923,7 @@ func TestAWaitingApprovalSurvivesCampdRestarting(t *testing.T) {
 func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
-	rec, _ := s.Start("test", t.TempDir())
+	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
 	// 期限を過去にして置く。
@@ -939,7 +952,7 @@ func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
 func TestApprovalsDoNotStayWaitingAfterTheSessionEnds(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
-	rec, _ := s.Start("test", t.TempDir())
+	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 	if err := ask(db, rec.ID, "req-x", "Write", "{}", time.Now()); err != nil {
 		t.Fatal(err)
@@ -962,7 +975,7 @@ func TestApprovalsDoNotStayWaitingAfterTheSessionEnds(t *testing.T) {
 func TestApprovalsAreAQueueNotASingleSlot(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
-	rec, _ := s.Start("test", t.TempDir())
+	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
 	for _, id := range []string{"r1", "r2", "r3"} {
@@ -1080,4 +1093,148 @@ func auditHasSilent(db *store.DB, action, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------- 許可リスト（M29）
+
+// **既定は deny。** 空の許可リストでは何も起こせない。
+//
+// 「まだ設定していない」を「全部許す」と読む実装は、設定を忘れた日に
+// `~/.ssh` でもセッションを起こす。
+func TestAnEmptyAllowlistStartsNothing(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	_, err := s.Start("test", t.TempDir())
+	if err == nil {
+		t.Fatal("空の許可リストで起こせてしまった")
+	}
+	var na ErrNotAllowed
+	if !errors.As(err, &na) || !na.Empty {
+		t.Fatalf("空であることが伝わらない: %v", err)
+	}
+	if !auditHasSilent(db, "session.start", "許可リストが空") {
+		t.Fatal("拒否が監査ログに残っていない")
+	}
+}
+
+// 許した場所の外は起こせない。**拒否も記録に残る。**
+func TestOutsideTheAllowlistIsRefusedAndRecorded(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	allowHere(t, db) // 何か1つ許しておく（空ではない状態にする）
+
+	outside := t.TempDir()
+	if _, err := s.Start("test", outside); err == nil {
+		t.Fatal("許していない場所で起こせてしまった")
+	}
+	if !auditHasSilent(db, "session.start", "許可リストに無い場所") {
+		t.Fatal("拒否が監査ログに残っていない")
+	}
+}
+
+// **`..` で外に出られない。** 実パスに直してから照合する。
+func TestDotDotCannotEscapeTheAllowlist(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	root := allowHere(t, db)
+	inside := filepath.Join(root, "sub")
+	if err := os.Mkdir(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Start("test", inside); err != nil {
+		t.Fatalf("許した場所の下なのに起こせない: %v", err)
+	}
+	// root/sub/../../ は root の親。**許していない。**
+	up := filepath.Join(inside, "..", "..")
+	if _, err := s.Start("test", up); err == nil {
+		t.Fatalf("%s から外へ出られた", up)
+	}
+}
+
+// **symlink で外に出られない。**
+func TestASymlinkCannotEscapeTheAllowlist(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	root := allowHere(t, db)
+	outside := t.TempDir()
+	link := filepath.Join(root, "door")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Start("test", link); err == nil {
+		t.Fatal("symlink 越しに許していない場所へ出られた")
+	}
+}
+
+// **前方一致では通さない。** /x/work を許して /x/workspace が通ってはいけない。
+func TestASiblingWithTheSamePrefixIsNotAllowed(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	workspace := filepath.Join(base, "workspace")
+	for _, d := range []string{work, workspace} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db := newDB(t)
+	if _, err := AddAllowed(db, work, "", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckCwd(db, work); err != nil {
+		t.Fatalf("許した当人が通らない: %v", err)
+	}
+	if _, err := CheckCwd(db, workspace); err == nil {
+		t.Fatal("名前が似ているだけの隣が通った")
+	}
+}
+
+// 実行面も同じ照合をする（campd の取り違えをそのまま実行しない）。
+func TestTheExecutionSideRefusesACwdOutsideTheRootItWasGiven(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	root := allowHere(t, db)
+	outside := t.TempDir()
+
+	s.mu.Lock()
+	agent := s.agent
+	s.mu.Unlock()
+
+	// campd が壊れて、許した場所と違う cwd を渡したことにする。
+	id := newID()
+	if err := insert(db, Record{ID: id, Cwd: outside, State: StateStarting,
+		RequestedBy: "test", CreatedAt: now(), UpdatedAt: now()}); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.live[id] = &liveSession{rec: Record{ID: id, State: StateStarting},
+		token: "tok", last: s.Now(), asked: map[string]bool{}}
+	s.mu.Unlock()
+
+	if err := agent.send(Msg{T: MsgStart, Session: id, Token: "tok",
+		Cwd: outside, Root: root}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, id) == StateExited })
+	r, _ := get(db, id)
+	if !strings.Contains(r.ExitReason, "許した場所") {
+		t.Fatalf("実行面が受け入れてしまった: %q", r.ExitReason)
+	}
+}
+
+// ~/.ssh は許可リストに入っていなければ通らない（inner gate の名指し）。
+func TestTheSSHDirectoryIsNotStartable(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	allowHere(t, db)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("home が分からない")
+	}
+	ssh := filepath.Join(home, ".ssh")
+	if _, err := os.Stat(ssh); err != nil {
+		t.Skip("~/.ssh が無い")
+	}
+	if _, err := s.Start("test", ssh); err == nil {
+		t.Fatal("~/.ssh でセッションを起こせてしまった")
+	}
 }

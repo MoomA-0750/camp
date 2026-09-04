@@ -25,6 +25,10 @@ type Msg struct {
 	// start（campd → 実行面）
 	Cwd  string   `json:"cwd,omitempty"`
 	Argv []string `json:"argv,omitempty"`
+	// Root は cwd を通した許可リストの行。**実行面がもう一度照合する。**
+	// 境界として数えるのは campd 側の照合だけだが、campd の取り違えを
+	// そのまま実行しないだけの価値はある。
+	Root string `json:"root,omitempty"`
 
 	// started（実行面 → campd）
 	PID     int    `json:"pid,omitempty"`
