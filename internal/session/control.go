@@ -348,6 +348,18 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, audit.OK)
 		}
 
+	case MsgTailRes:
+		s.deliver(m)
+
+	case MsgDropped:
+		if _, ok := s.check(m); !ok {
+			return
+		}
+		// **溢れて捨てたことを記録に残す。** 画面に出ない範囲があることは、
+		// あとから「無かった」と読み違えられる。
+		s.audit(m.Session, "session.log_dropped", "",
+			fmt.Sprintf("落とし先が溢れて %d 件捨てた", m.Dropped), audit.Error)
+
 	case MsgPing:
 		// 生きている合図。何もしない（読み取りの期限が延びるだけ）。
 

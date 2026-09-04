@@ -166,7 +166,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// **流し続ける応答は畳まない。** gzip の包みは 1400 バイト溜まるまで
+	// 書き出さないので、SSE を通すと最初のイベントすら届かない。
+	//
+	// 正直に書くと、これと gzipWriter.Flush は**どちらか一方で足りる**
+	// （Flush は未決のとき「畳まない」に倒すので、包んだままでも届く）。
+	// テストが捕まえられるのは両方外したときだけ。それでも両方置くのは、
+	// 片方を消したときに残るのが偶然ではないようにするため。
+	if isStreaming(r.URL.Path) {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
 	withGzip(s.mux.ServeHTTP)(w, r)
+}
+
+func isStreaming(p string) bool {
+	return strings.HasPrefix(p, "/api/runtime/") && strings.HasSuffix(p, "/stream")
 }
 
 // securityHeaders は返すもの全部に付ける。

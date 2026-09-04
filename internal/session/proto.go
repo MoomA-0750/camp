@@ -51,6 +51,14 @@ type Msg struct {
 	Reason string `json:"reason,omitempty"`
 	Error  string `json:"error,omitempty"`
 
+	// tail（campd → 実行面）と tail_result（実行面 → campd）
+	Since   int64  `json:"since,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+	Lines   []Line `json:"lines,omitempty"`
+	Gap     bool   `json:"gap,omitempty"`
+	Seq     int64  `json:"seq,omitempty"`
+	Dropped int64  `json:"dropped,omitempty"`
+
 	// hello / welcome
 	Version string `json:"version,omitempty"`
 }
@@ -64,6 +72,8 @@ const (
 	MsgFailed  = "failed"  // 起こせなかった
 	MsgReaped  = "reaped"  // 孤児を始末した
 	MsgPing    = "ping"    // 生きている。**止まった実行面に気づくため**
+	MsgTailRes = "tail_result"
+	MsgDropped = "dropped" // 溢れて捨てた。**黙って消さない**
 )
 
 // campd → 実行面
@@ -74,6 +84,7 @@ const (
 	MsgStop    = "stop"
 	MsgApprove = "approve"
 	MsgReap    = "reap" // 孤児を始末しろ
+	MsgTail    = "tail" // 画面が要求した範囲だけ寄こせ
 	MsgError   = "error"
 )
 

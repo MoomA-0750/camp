@@ -661,3 +661,187 @@ func TestAFalseReapIsCaughtByLookingAtProc(t *testing.T) {
 		t.Fatal("食い違いが監査ログに残っていない")
 	}
 }
+
+// ---------------------------------------------------------------- 落とし先（M27）
+
+// noisyClaude は1ターンごとに大量に吐く子。**パイプが詰まるかを見るため。**
+func noisyClaude(t *testing.T, perTurn int) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "noisy-claude")
+	body := fmt.Sprintf(`#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"noisy-1"}'
+pad=$(head -c 900 /dev/zero | tr '\0' 'x')
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      i=0
+      while [ $i -lt %d ]; do
+        echo "{\"type\":\"assistant\",\"session_id\":\"noisy-1\",\"pad\":\"$pad\"}"
+        i=$((i+1))
+      done
+      echo '{"type":"result","subtype":"success","session_id":"noisy-1"}'
+      ;;
+  esac
+done
+exit 0
+`, perTurn)
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// **誰も読んでいなくても、子は最後まで走り切る。**
+//
+// これが M27 の受け入れ条件そのもの。読み手が居ないとき stdout が詰まって
+// 子が止まる、という壊れ方は、画面を閉じただけで起きる。
+func TestTheChildRunsToTheEndWithNobodyReading(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	a := attach(t, s, noisyClaude(t, 4000)) // 約 4MB。パイプ(64KB)よりずっと大きい
+	a.LogDir = t.TempDir()
+
+	rec, err := s.Start("test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := s.Input(rec.ID, "go"); err != nil {
+		t.Fatal(err)
+	}
+	// 誰も Tail を呼ばない。それでも result まで届く。
+	waitFor(t, 60*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	res, err := s.Tail(rec.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Newest < 4000 {
+		t.Fatalf("落ちているのが %d 件しかない（4000 件以上のはず）", res.Newest)
+	}
+}
+
+// 遅い読み手が居ても、子は止まらない。
+func TestASlowReaderNeverStallsTheChild(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	a := attach(t, s, noisyClaude(t, 3000))
+	a.LogDir = t.TempDir()
+
+	rec, _ := s.Start("test", t.TempDir())
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // モバイル回線を模した読み手。1回読んでは寝る
+		var since int64
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			r, err := s.Tail(rec.ID, since, 5)
+			if err == nil && len(r.Lines) > 0 {
+				since = r.Lines[len(r.Lines)-1].Seq
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+
+	if err := s.Input(rec.ID, "go"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 60*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+}
+
+// 溢れたら古いほうから落とす。**落としたことを言う。**
+func TestTheLogDropsTheOldestAndSaysSo(t *testing.T) {
+	old := maxLogBytes
+	maxLogBytes = 4096
+	defer func() { maxLogBytes = old }()
+
+	lg, err := OpenLog(t.TempDir(), "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	for i := 0; i < 300; i++ {
+		if _, err := lg.Append("assistant", []byte(`{"pad":"`+strings.Repeat("x", 100)+`"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldest, newest, dropped := lg.Stats()
+	if dropped == 0 {
+		t.Fatal("溢れたのに落としていない（上限が効いていない）")
+	}
+	if oldest <= 1 {
+		t.Fatalf("古いほうが残ったまま: oldest=%d", oldest)
+	}
+	if newest != 300 {
+		t.Fatalf("newest=%d（300 のはず）", newest)
+	}
+	// カーソルが落ちた範囲を指していたら、飛んだことを言う。
+	_, gap, err := lg.Tail(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gap {
+		t.Fatal("飛んだことを言っていない。**黙って飛ばしてはいけない**")
+	}
+	// 残っている範囲を指していれば、飛んでいない。
+	_, gap, _ = lg.Tail(newest-1, 10)
+	if gap {
+		t.Fatal("飛んでいないのに飛んだと言っている")
+	}
+}
+
+// カーソルは通し番号。**実行面を起こし直しても振り直さない。**
+func TestTheCursorSurvivesTheExecutionSideRestarting(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		lg.Append("assistant", []byte(`{}`))
+	}
+	lg.Close()
+
+	again, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	seq, err := again.Append("assistant", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq != 6 {
+		t.Fatalf("番号が %d に戻った（6 のはず）。読み手のカーソルが黙ってずれる", seq)
+	}
+	lines, _, _ := again.Tail(3, 100)
+	if len(lines) != 3 {
+		t.Fatalf("カーソルの続きが %d 件（3 件のはず）", len(lines))
+	}
+}
+
+// tail は要求された範囲だけを返す。**境界を越える量に天井がある。**
+func TestTailNeverReturnsMoreThanAsked(t *testing.T) {
+	lg, err := OpenLog(t.TempDir(), "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	for i := 0; i < 1200; i++ {
+		lg.Append("assistant", []byte(`{}`))
+	}
+	lines, _, _ := lg.Tail(0, 10)
+	if len(lines) != 10 {
+		t.Fatalf("%d 件返した（10 件のはず）", len(lines))
+	}
+	lines, _, _ = lg.Tail(0, 99999) // 天井を越えて要求する
+	if len(lines) > maxTailLines {
+		t.Fatalf("%d 件返した（上限 %d）", len(lines), maxTailLines)
+	}
+}

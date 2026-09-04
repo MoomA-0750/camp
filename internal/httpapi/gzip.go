@@ -78,6 +78,22 @@ func (g *gzipWriter) flushHeader() {
 	g.ResponseWriter.WriteHeader(g.code)
 }
 
+// Flush は途中まで書いたぶんを送り出す。
+//
+// **SSE のような流し続ける応答は、これが無いと何も届かない。** そちらは
+// そもそも畳まない経路へ回しているが、包みが Flusher を隠さないようにしておく。
+func (g *gzipWriter) Flush() {
+	if !g.decided {
+		g.decide(false)
+	}
+	if g.gz != nil {
+		g.gz.Flush()
+	}
+	if f, ok := g.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func (g *gzipWriter) close() {
 	if !g.decided {
 		g.decide(false)

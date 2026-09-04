@@ -27,6 +27,9 @@ type Agent struct {
 	// Command はテストで差し替える。既定は systemd-run で包んだ `claude`。
 	Command func(id, cwd string) *exec.Cmd
 
+	// LogDir はフレームの落とし先。**子の隣**（本人のユーザーの領域）。
+	LogDir string
+
 	mu   sync.Mutex
 	kids map[string]*child
 	conn net.Conn
@@ -39,13 +42,15 @@ type child struct {
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
 	scope string
+	log   *Log
 	mu    sync.Mutex
 	dead  bool
 }
 
 // NewAgent は実行面を作る。
 func NewAgent(sock, claude string) *Agent {
-	a := &Agent{Sock: sock, Claude: claude, Scope: true, kids: map[string]*child{}}
+	a := &Agent{Sock: sock, Claude: claude, Scope: true,
+		LogDir: DefaultLogDir(), kids: map[string]*child{}}
 	a.Command = a.defaultCommand
 	return a
 }
@@ -120,6 +125,8 @@ func (a *Agent) Run() error {
 			go a.stop(m)
 		case MsgReap:
 			go a.reap(m)
+		case MsgTail:
+			go a.tail(m)
 		case MsgError:
 			fmt.Fprintln(os.Stderr, "campd:", m.Error)
 			if strings.Contains(m.Error, "既に繋がっている") ||
@@ -191,6 +198,13 @@ func (a *Agent) start(m Msg) {
 	if a.Scope {
 		k.scope = scopeName(m.Session)
 	}
+	// **落とし先を先に開く。** 開けなければ drain は行き場を失い、
+	// パイプが詰まって子が止まる。黙って進めない。
+	if lg, err := OpenLog(a.LogDir, m.Session); err == nil {
+		k.log = lg
+	} else {
+		fmt.Fprintf(os.Stderr, "camp agent: 落とし先を開けない（%v）。フレームは残らない\n", err)
+	}
 	a.mu.Lock()
 	a.kids[m.Session] = k
 	a.mu.Unlock()
@@ -214,6 +228,9 @@ func (a *Agent) start(m Msg) {
 	k.mu.Lock()
 	k.dead = true
 	k.mu.Unlock()
+	if k.log != nil {
+		k.log.Close()
+	}
 	a.mu.Lock()
 	delete(a.kids, m.Session)
 	a.mu.Unlock()
@@ -227,6 +244,7 @@ func (a *Agent) start(m Msg) {
 func (a *Agent) drain(k *child, r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLine)
+	var dropped int64
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -236,7 +254,18 @@ func (a *Agent) drain(k *child, r io.Reader) {
 		if err := json.Unmarshal(line, &f); err != nil {
 			continue
 		}
-		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: FrameKind(f)}
+		kind := FrameKind(f)
+		// **読み手より先に、必ず落とす。** ここが読み手待ちになると子が詰まる。
+		if k.log != nil {
+			if _, err := k.log.Append(kind, line); err != nil {
+				fmt.Fprintf(os.Stderr, "camp agent: 落とせない: %v\n", err)
+			}
+			if _, _, d := k.log.Stats(); d > dropped {
+				dropped = d
+				a.send(Msg{T: MsgDropped, Session: k.id, Token: k.token, Dropped: d})
+			}
+		}
+		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: kind}
 		if s, ok := f["session_id"].(string); ok {
 			m.ClaudeID = s
 		}
@@ -396,4 +425,36 @@ func (a *Agent) reap(m Msg) {
 		}
 	}
 	a.send(Msg{T: MsgReaped, Session: m.Session, Reason: "止めた"})
+}
+
+// tail は画面が要求した範囲だけを返す。**境界を越えるのはここだけ。**
+func (a *Agent) tail(m Msg) {
+	a.mu.Lock()
+	k := a.kids[m.Session]
+	a.mu.Unlock()
+	out := Msg{T: MsgTailRes, Session: m.Session, ReqID: m.ReqID}
+	var lg *Log
+	if k != nil && k.token == m.Token {
+		lg = k.log
+	} else {
+		// 終わったセッションでも、落とし先は残っている。読むだけなら開き直す。
+		if l, err := OpenLog(a.LogDir, m.Session); err == nil {
+			defer l.Close()
+			lg = l
+		}
+	}
+	if lg == nil {
+		out.Error = "落とし先が無い"
+		a.send(out)
+		return
+	}
+	lines, gap, err := lg.Tail(m.Since, m.Limit)
+	if err != nil {
+		out.Error = err.Error()
+		a.send(out)
+		return
+	}
+	_, newest, dropped := lg.Stats()
+	out.Lines, out.Gap, out.Seq, out.Dropped = lines, gap, newest, dropped
+	a.send(out)
 }

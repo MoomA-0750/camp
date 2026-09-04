@@ -26,6 +26,8 @@ type Supervisor struct {
 	agent    *agentConn
 	maxConc  int
 	stopping bool
+	// waits は実行面へ投げた問い合わせの返事待ち。request_id で対応づける。
+	waits map[string]chan Msg
 
 	// テストで時間を進めるために差し替える。
 	Now func() time.Time
@@ -51,6 +53,7 @@ func New(db *store.DB) *Supervisor {
 	return &Supervisor{
 		db:         db,
 		live:       map[string]*liveSession{},
+		waits:      map[string]chan Msg{},
 		maxConc:    defaultMaxConcurrent,
 		Now:        time.Now,
 		IdleAfter:  idleTimeout,
@@ -385,4 +388,70 @@ func newID() string {
 		panic("乱数が取れない: " + err.Error())
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// TailResult は画面が受け取る形。
+type TailResult struct {
+	Lines []Line `json:"lines"`
+	// Gap はカーソルより前が落ちていたか。**黙って飛ばさない。**
+	Gap     bool  `json:"gap"`
+	Newest  int64 `json:"newest"`
+	Dropped int64 `json:"dropped"`
+}
+
+// Tail は実行面に、画面が要求した範囲だけを出させる。
+//
+// **campd はフレームを溜めない。** 溜めると、境界を越える量が読み手と無関係に
+// 決まってしまう。要求されたぶんだけ、その都度もらう。
+func (s *Supervisor) Tail(id string, since int64, limit int) (TailResult, error) {
+	s.mu.Lock()
+	agent := s.agent
+	token := ""
+	if ls := s.live[id]; ls != nil {
+		token = ls.token
+	}
+	s.mu.Unlock()
+	if agent == nil {
+		return TailResult{}, ErrNoAgent
+	}
+
+	req := newID()
+	ch := make(chan Msg, 1)
+	s.mu.Lock()
+	s.waits[req] = ch
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.waits, req)
+		s.mu.Unlock()
+	}()
+
+	if err := agent.send(Msg{T: MsgTail, Session: id, Token: token,
+		ReqID: req, Since: since, Limit: limit}); err != nil {
+		return TailResult{}, err
+	}
+	select {
+	case m := <-ch:
+		if m.Error != "" {
+			return TailResult{}, fmt.Errorf("%s", m.Error)
+		}
+		return TailResult{Lines: m.Lines, Gap: m.Gap, Newest: m.Seq, Dropped: m.Dropped}, nil
+	case <-time.After(15 * time.Second):
+		// **返ってこないことを「空」と読まない。**
+		return TailResult{}, errors.New("実行面が返事をしない")
+	}
+}
+
+// deliver は返事を待っている者へ渡す。
+func (s *Supervisor) deliver(m Msg) {
+	s.mu.Lock()
+	ch := s.waits[m.ReqID]
+	s.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- m:
+	default:
+	}
 }

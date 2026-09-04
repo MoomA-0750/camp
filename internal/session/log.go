@@ -1,0 +1,247 @@
+package session
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// Log は1セッションぶんのフレームを、子の隣に落とす場所。
+//
+// **なぜ子の隣なのか。** 読み手（ブラウザ）が遅いと、stdout のパイプが詰まって
+// 子が書けなくなり、そこで止まる。だから読み手とは関係なく、常時 drain して
+// ここへ落とす。読むほうはあとから追いつく。
+//
+// **なぜ上限があるのか。** セッションは何時間も走りうるし、フレームには
+// 工具の出力がそのまま入る。上限が無ければディスクが埋まる。溢れたぶんは
+// 古いほうから落とし、**落としたことを数えて外へ出す**——黙って消さない。
+type Log struct {
+	dir string
+	id  string
+
+	mu      sync.Mutex
+	f       *os.File
+	size    int64
+	seq     int64 // 最後に振った番号
+	dropped int64 // これまでに落とした件数
+
+	curFirst, curCount   int64 // いま書いているファイル
+	prevFirst, prevCount int64 // 1つ前の世代
+}
+
+// Line は落としたフレーム1つ。
+type Line struct {
+	Seq   int64           `json:"seq"`
+	At    string          `json:"at"`
+	Kind  string          `json:"kind"`
+	Frame json.RawMessage `json:"frame"`
+}
+
+// 1世代あたりの上限。2世代持つので、最大でこの倍が残る。
+// テストで小さくするので var。
+var maxLogBytes int64 = 8 << 20
+
+const (
+	// 1回の tail で返す上限。**境界を越える量に必ず天井を置く。**
+	maxTailLines = 500
+	maxTailBytes = 1 << 20
+)
+
+// OpenLog は落とし先を開く。既にあれば続きから書く。
+func OpenLog(dir, id string) (*Log, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	l := &Log{dir: dir, id: id}
+	// 前回の続きを知るために、両方の世代を数え直す。
+	// **番号を振り直さない。** 振り直すと、読み手のカーソルが黙ってずれる。
+	l.prevFirst, l.prevCount, _ = scanFile(l.path(1))
+	first, n, last := scanFile(l.path(0))
+	l.curFirst, l.curCount = first, n
+	if last > l.seq {
+		l.seq = last
+	}
+	if fi, err := os.Stat(l.path(0)); err == nil {
+		l.size = fi.Size()
+	}
+	f, err := os.OpenFile(l.path(0), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	l.f = f
+	return l, nil
+}
+
+func (l *Log) path(gen int) string {
+	if gen == 0 {
+		return filepath.Join(l.dir, l.id+".jsonl")
+	}
+	return filepath.Join(l.dir, fmt.Sprintf("%s.%d.jsonl", l.id, gen))
+}
+
+// scanFile はそのファイルの最初の seq・件数・最後の seq を返す。
+func scanFile(p string) (first, count, last int64) {
+	f, err := os.Open(p)
+	if err != nil {
+		return 0, 0, 0
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), maxLine)
+	for sc.Scan() {
+		var ln Line
+		if json.Unmarshal(sc.Bytes(), &ln) != nil {
+			continue
+		}
+		if count == 0 {
+			first = ln.Seq
+		}
+		count++
+		last = ln.Seq
+	}
+	return first, count, last
+}
+
+// Append は1フレーム落とす。**読み手を待たない。**
+func (l *Log) Append(kind string, frame []byte) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.seq++
+	ln := Line{Seq: l.seq, At: time.Now().UTC().Format(time.RFC3339Nano), Kind: kind}
+	if len(frame) > 0 {
+		ln.Frame = json.RawMessage(frame)
+	}
+	b, err := json.Marshal(ln)
+	if err != nil {
+		return 0, err
+	}
+	b = append(b, '\n')
+
+	if l.size+int64(len(b)) > maxLogBytes && l.curCount > 0 {
+		if err := l.rotate(); err != nil {
+			return 0, err
+		}
+	}
+	n, err := l.f.Write(b)
+	l.size += int64(n)
+	if l.curCount == 0 {
+		l.curFirst = ln.Seq
+	}
+	l.curCount++
+	return ln.Seq, err
+}
+
+// rotate は世代を1つ進める。**溢れたぶんは数えてから捨てる。**
+func (l *Log) rotate() error {
+	if err := l.f.Close(); err != nil {
+		return err
+	}
+	l.dropped += l.prevCount
+	os.Remove(l.path(1))
+	if err := os.Rename(l.path(0), l.path(1)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	l.prevFirst, l.prevCount = l.curFirst, l.curCount
+	l.curFirst, l.curCount, l.size = 0, 0, 0
+	f, err := os.OpenFile(l.path(0), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	l.f = f
+	return nil
+}
+
+// Stats はいま持っている範囲。
+func (l *Log) Stats() (oldest, newest, dropped int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	oldest = l.curFirst
+	if l.prevCount > 0 {
+		oldest = l.prevFirst
+	}
+	if oldest == 0 {
+		oldest = l.seq + 1
+	}
+	return oldest, l.seq, l.dropped
+}
+
+// Tail は since より後ろを返す。
+//
+// 第2の戻り値は「読み手のカーソルより前に落としたものがあるか」。
+// **黙って飛ばさない。** 飛んだことが分かれば、画面は「ここが抜けている」と出せる。
+func (l *Log) Tail(since int64, limit int) (lines []Line, gap bool, err error) {
+	oldest, _, _ := l.Stats()
+	if limit <= 0 || limit > maxTailLines {
+		limit = maxTailLines
+	}
+	if since+1 < oldest {
+		gap = true
+	}
+	var bytes int
+	for gen := 1; gen >= 0; gen-- {
+		f, e := os.Open(l.path(gen))
+		if e != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), maxLine)
+		for sc.Scan() {
+			if len(lines) >= limit || bytes >= maxTailBytes {
+				break
+			}
+			var ln Line
+			if json.Unmarshal(sc.Bytes(), &ln) != nil {
+				continue
+			}
+			if ln.Seq <= since {
+				continue
+			}
+			bytes += len(sc.Bytes())
+			lines = append(lines, ln)
+		}
+		f.Close()
+		if len(lines) >= limit || bytes >= maxTailBytes {
+			break
+		}
+	}
+	return lines, gap, nil
+}
+
+// Close は閉じる。中身は消さない（あとから読める）。
+func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f == nil {
+		return nil
+	}
+	err := l.f.Close()
+	l.f = nil
+	return err
+}
+
+// Remove は落とし先ごと消す。セッションが終わって、もう要らないときだけ。
+func (l *Log) Remove() {
+	l.Close()
+	os.Remove(l.path(0))
+	os.Remove(l.path(1))
+}
+
+// DefaultLogDir は落とし先。**本人のユーザーの領域**に置く（実行面が書く）。
+func DefaultLogDir() string {
+	if d := os.Getenv("CAMP_SESSION_LOG_DIR"); d != "" {
+		return d
+	}
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
+		return filepath.Join(d, "camp", "sessions")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "camp-sessions")
+	}
+	return filepath.Join(home, ".local", "state", "camp", "sessions")
+}
