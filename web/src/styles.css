@@ -154,3 +154,57 @@ table.grid th.pin { position: sticky; left: 0; background: var(--bg); z-index: 1
 table.grid th.pin ~ th.pin { position: static; }
 tr.grouphead th { background: var(--soft); }
 label { display: inline-flex; align-items: center; gap: .3rem; }
+
+/* --- Phase 3: セッション駆動 --- */
+.crumbs { margin: 0 0 .4rem; font-size: .9em; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.small { font-size: .85em; }
+
+.tabs { display: flex; gap: .4rem; margin: 1rem 0 .9rem; flex-wrap: wrap; }
+.tabs button {
+  background: none; border: 1px solid var(--line); border-radius: .35rem;
+  padding: .25rem .7rem; color: var(--muted); cursor: pointer;
+}
+.tabs button.on { color: var(--fg); border-color: var(--accent); }
+
+/* 見えていない範囲があること・上限に達したことは、目立たせる。
+   **黙って飛ばさない**のが設計なので、表示でも黙らせない。 */
+.warn {
+  border: 1px solid #d08b2f; border-radius: .4rem;
+  padding: .5rem .75rem; margin: .7rem 0; color: #d08b2f;
+}
+
+/* 承認は列。1つだけ出す形にすると、2つ目で子が待ち続ける（実測）。 */
+.ask {
+  border: 1px solid var(--accent); border-radius: .5rem;
+  padding: .7rem .9rem; margin: 1rem 0;
+}
+.ask h3 { margin-top: 0; }
+.ask-row {
+  display: flex; gap: 1rem; justify-content: space-between; align-items: flex-start;
+  border-top: 1px solid var(--line); padding: .6rem 0;
+}
+.ask-row:first-of-type { border-top: 0; }
+.ask-buttons { display: flex; gap: .4rem; flex-shrink: 0; }
+
+.talk { display: flex; flex-direction: column; gap: .5rem; margin: .6rem 0; }
+.talk textarea {
+  width: 100%; font: inherit; padding: .5rem .6rem;
+  border: 1px solid var(--line); border-radius: .4rem;
+  background: var(--soft); color: var(--fg); resize: vertical;
+}
+.talk-buttons { display: flex; gap: .5rem; }
+
+.stream { border-top: 1px solid var(--line); margin-top: .6rem; }
+.stream .frame {
+  border-bottom: 1px solid var(--line); padding: .25rem 0; font-size: .9em;
+  overflow-wrap: anywhere;
+}
+.stream .kind { color: var(--muted); font-size: .85em; }
+
+/* 状態はひと目で分かるようにする。色は既にあるものを使い回す。 */
+.badge.s-running { border-color: var(--accent); color: var(--fg); }
+.badge.s-idle    { border-color: var(--line); }
+.badge.s-orphaned,
+.badge.s-stopping { border-color: #d08b2f; color: #d08b2f; }
+.badge.s-exited   { opacity: .7; }

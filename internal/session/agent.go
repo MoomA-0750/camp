@@ -45,8 +45,10 @@ type child struct {
 	stdin io.WriteCloser
 	scope string
 	log   *Log
-	mu    sync.Mutex
-	dead  bool
+	// pending は子へ投げた制御要求の返事待ち。子が返す request_id で対応づける。
+	pending map[string]chan []byte
+	mu      sync.Mutex
+	dead    bool
 }
 
 // NewAgent は実行面を作る。
@@ -194,6 +196,8 @@ func (a *Agent) Run() error {
 			go a.tail(m)
 		case MsgSSHScan:
 			go a.scanSSH(m)
+		case MsgControl:
+			go a.control(m)
 		case MsgError:
 			fmt.Fprintln(os.Stderr, "campd:", m.Error)
 			if strings.Contains(m.Error, "既に繋がっている") ||
@@ -267,7 +271,8 @@ func (a *Agent) start(m Msg) {
 	pid := cmd.Process.Pid
 	st, _ := Starttime(pid)
 
-	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin}
+	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
+		pending: map[string]chan []byte{}}
 	if a.Scope {
 		k.scope = scopeName(m.Session)
 	}
@@ -328,6 +333,10 @@ func (a *Agent) drain(k *child, r io.Reader) {
 			continue
 		}
 		kind := FrameKind(f)
+		// 子からの制御応答は、待っている者へ回す。**画面へは流さない。**
+		if kind == "control_response" {
+			deliverControl(k, f)
+		}
 		// **読み手より先に、必ず落とす。** ここが読み手待ちになると子が詰まる。
 		if k.log != nil {
 			if _, err := k.log.Append(kind, line); err != nil {
@@ -548,6 +557,88 @@ func (a *Agent) scanSSH(m Msg) {
 		out.Error = err.Error()
 	} else {
 		out.SSHHosts = hosts
+	}
+	a.send(out)
+}
+
+// deliverControl は子の制御応答を、待っている者へ渡す。
+func deliverControl(k *child, f map[string]any) {
+	resp, ok := f["response"].(map[string]any)
+	if !ok {
+		return
+	}
+	id, _ := resp["request_id"].(string)
+	if id == "" {
+		return
+	}
+	k.mu.Lock()
+	ch := k.pending[id]
+	delete(k.pending, id)
+	k.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	b, err := json.Marshal(resp["response"])
+	if err != nil {
+		b = []byte("null")
+	}
+	select {
+	case ch <- b:
+	default:
+	}
+}
+
+// control は子へ制御フレームを1つ投げて、答えを返す。
+//
+// 残量（get_usage / get_context_usage）はこの経路でしか取れない。
+// **モデル呼び出しは起きない**ので、押すたびにトークンを使うことはない。
+func (a *Agent) control(m Msg) {
+	out := Msg{T: MsgCtlRes, Session: m.Session, ReqID: m.ReqID}
+	a.mu.Lock()
+	k := a.kids[m.Session]
+	a.mu.Unlock()
+	if k == nil || k.token != m.Token {
+		out.Error = "そのセッションは走っていない"
+		a.send(out)
+		return
+	}
+	childReq := "camp-ctl-" + newID()
+	ch := make(chan []byte, 1)
+	k.mu.Lock()
+	dead := k.dead
+	if !dead {
+		k.pending[childReq] = ch
+	}
+	k.mu.Unlock()
+	if dead {
+		out.Error = "子はもう居ない"
+		a.send(out)
+		return
+	}
+	defer func() {
+		k.mu.Lock()
+		delete(k.pending, childReq)
+		k.mu.Unlock()
+	}()
+
+	b, _ := json.Marshal(map[string]any{
+		"type": "control_request", "request_id": childReq,
+		"request": map[string]any{"subtype": m.Kind},
+	})
+	k.mu.Lock()
+	_, err := k.stdin.Write(append(b, '\n'))
+	k.mu.Unlock()
+	if err != nil {
+		out.Error = err.Error()
+		a.send(out)
+		return
+	}
+	select {
+	case payload := <-ch:
+		out.Frame = payload
+	case <-time.After(10 * time.Second):
+		// **返ってこないことを「空」と読まない。**
+		out.Error = "子が答えない"
 	}
 	a.send(out)
 }

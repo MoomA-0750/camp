@@ -524,3 +524,60 @@ func matchedRoot(db *store.DB, real string) (string, error) {
 	}
 	return best, nil
 }
+
+// Control は走っているセッションへ制御フレームを1つ投げて、答えを返す。
+//
+// 使えるのは**読み取りだけ**。`set_permission_mode` のような、子の振る舞いを
+// 変えるものはここから出せない——画面の1クリックで承認の要否が変わると、
+// 監査ログの意味が薄くなる。
+func (s *Supervisor) Control(id, subtype string) ([]byte, error) {
+	switch subtype {
+	case "get_usage", "get_context_usage", "mcp_status":
+	default:
+		return nil, fmt.Errorf("この制御は出せない: %s", subtype)
+	}
+	s.mu.Lock()
+	agent := s.agent
+	token := ""
+	if ls := s.live[id]; ls != nil {
+		token = ls.token
+	}
+	s.mu.Unlock()
+	if agent == nil {
+		return nil, ErrNoAgent
+	}
+	if token == "" {
+		return nil, fmt.Errorf("そのセッションは走っていない: %s", id)
+	}
+
+	req := newID()
+	ch := make(chan Msg, 1)
+	s.mu.Lock()
+	s.waits[req] = ch
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.waits, req)
+		s.mu.Unlock()
+	}()
+	if err := agent.send(Msg{T: MsgControl, Session: id, Token: token,
+		ReqID: req, Kind: subtype}); err != nil {
+		return nil, err
+	}
+	select {
+	case m := <-ch:
+		if m.Error != "" {
+			return nil, fmt.Errorf("%s", m.Error)
+		}
+		return m.Frame, nil
+	case <-time.After(15 * time.Second):
+		return nil, errors.New("実行面が返事をしない")
+	}
+}
+
+// Capacity はいま何本走っていて、上限がいくつか。**同時実行の警告に使う。**
+func (s *Supervisor) Capacity() (running, max int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.live), s.maxConc
+}

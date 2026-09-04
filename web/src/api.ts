@@ -117,6 +117,42 @@ export type Backup = {
   backup_name: string; origin: string; size: number; missing_at?: string
 }
 
+
+// ---- Phase 3: Camp が起こしたセッション ------------------------------------
+
+export type RuntimeSession = {
+  id: string; claude_id?: string; cwd: string; state: string
+  requested_by: string; created_at: string; updated_at: string
+  pid?: number; scope?: string
+  exit_code?: number; exit_reason?: string; ended_at?: string
+}
+
+export type RuntimeList = { agent_connected: boolean; sessions: RuntimeSession[] }
+
+export type LogLine = { seq: number; at: string; kind: string; frame?: unknown }
+
+export type Approval = {
+  id: number; session_id: string; request_id: string
+  tool?: string; detail?: string; asked_at: string; expires_at: string
+  answered_at?: string; behavior?: string; reason?: string
+}
+
+export type Allowed = {
+  id: number; path: string; note?: string; added_at: string; added_by: string
+}
+
+export type Destination = {
+  id: number; alias: string; hostname?: string; user?: string; port?: number
+  identity?: string; tailscale_ip?: string; note?: string
+  allowed: boolean; source: string; seen_at: string; updated_at: string
+}
+
+export type RuntimeUsage = {
+  usage?: unknown; usage_error?: string
+  context?: unknown; context_error?: string
+  running: number; max: number; warning?: string
+}
+
 /** 認証が切れていたらログイン画面へ送る。画面ごとに書かない。 */
 async function fetchJSON<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
@@ -127,6 +163,24 @@ async function fetchJSON<T>(path: string): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.error ?? `${res.status} ${res.statusText}`)
+  }
+  return res.json() as Promise<T>
+}
+
+/** POST も 401 の扱いを揃える。**画面ごとに書かない。** */
+async function postJSON<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  })
+  if (res.status === 401 && !(body as { password?: string })?.password) {
+    location.href = '/login'
+    throw new Error('未認証')
+  }
+  if (!res.ok) {
+    const b = await res.json().catch(() => ({}))
+    throw new Error(b.error ?? `${res.status} ${res.statusText}`)
   }
   return res.json() as Promise<T>
 }
@@ -219,6 +273,36 @@ export const api = {
 
   vaultIssues: () =>
     fetchJSON<{ ambiguous: Ref[]; dangling: Ref[] }>('/api/vault/issues'),
+
+  runtime: () => fetchJSON<RuntimeList>('/api/runtime'),
+  runtimeStart: (cwd: string) => postJSON<RuntimeSession>('/api/runtime', { cwd }),
+  runtimeInput: (id: string, text: string) =>
+    postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/input`, { text }),
+  runtimeStop: (id: string, mode: 'interrupt' | 'terminate') =>
+    postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/stop`, { mode }),
+  runtimeApprove: (id: string, request_id: string, behavior: 'allow' | 'deny', message = '') =>
+    postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/approve`,
+      { request_id, behavior, message }),
+  runtimeApprovals: (id: string, all = false) =>
+    fetchJSON<Approval[]>(`/api/runtime/${encodeURIComponent(id)}/approvals` + qs({ all: all ? 1 : 0 })),
+  runtimeLog: (id: string, since = 0, limit = 200) =>
+    fetchJSON<{ lines: LogLine[]; gap: boolean; newest: number; dropped: number }>(
+      `/api/runtime/${encodeURIComponent(id)}/log` + qs({ since, limit })),
+  runtimeUsage: (id: string) =>
+    fetchJSON<RuntimeUsage>(`/api/runtime/${encodeURIComponent(id)}/usage`),
+
+  allowlist: () => fetchJSON<Allowed[]>('/api/allowlist'),
+  allowlistAdd: (path: string, password: string, note = '') =>
+    postJSON<Allowed>('/api/allowlist', { path, password, note }),
+  allowlistRemove: (path: string, password: string) =>
+    postJSON<{ removed: boolean }>('/api/allowlist/remove', { path, password }),
+
+  sshHosts: () => fetchJSON<Destination[]>('/api/ssh'),
+  sshScan: () => postJSON<{ added: number; updated: number }>('/api/ssh/scan', {}),
+  sshEdit: (alias: string, note: string, tailscale_ip: string) =>
+    postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/edit`, { note, tailscale_ip }),
+  sshAllow: (alias: string, allowed: boolean, password: string) =>
+    postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/allow`, { allowed, password }),
 
   logout: async () => {
     await fetch('/api/logout', { method: 'POST' })

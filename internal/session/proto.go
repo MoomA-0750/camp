@@ -97,6 +97,7 @@ const (
 	MsgTailRes = "tail_result"
 	MsgDropped = "dropped" // 溢れて捨てた。**黙って消さない**
 	MsgSSHRes  = "ssh_result"
+	MsgCtlRes  = "control_result"
 )
 
 // campd → 実行面
@@ -109,6 +110,7 @@ const (
 	MsgReap    = "reap"     // 孤児を始末しろ
 	MsgTail    = "tail"     // 画面が要求した範囲だけ寄こせ
 	MsgSSHScan = "ssh_scan" // ~/.ssh/config を**読んで**寄こせ
+	MsgControl = "control"  // 子へ制御フレームを1つ投げて、答えを寄こせ
 	MsgError   = "error"
 )
 

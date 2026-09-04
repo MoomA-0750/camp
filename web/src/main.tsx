@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { api } from './api'
 import Sessions from './pages/Sessions'
+import Runtime from './pages/Runtime'
+import RuntimeDetail from './pages/RuntimeDetail'
 import SessionDetail from './pages/SessionDetail'
 import Search from './pages/Search'
 import Usage from './pages/Usage'
@@ -24,6 +26,9 @@ function App() {
         <h1>Camp</h1>
         <NavLink to="/sessions" className={({ isActive }) => (isActive ? 'on' : '')}>
           セッション
+        </NavLink>
+        <NavLink to="/runtime" className={({ isActive }) => (isActive ? 'on' : '')}>
+          駆動
         </NavLink>
         <NavLink to="/search" className={({ isActive }) => (isActive ? 'on' : '')}>
           検索
@@ -51,6 +56,8 @@ function App() {
           <Route path="/" element={<Navigate to="/sessions" replace />} />
           <Route path="/sessions" element={<Sessions />} />
           <Route path="/sessions/:id" element={<SessionDetail />} />
+          <Route path="/runtime" element={<Runtime />} />
+          <Route path="/runtime/:id" element={<RuntimeDetail />} />
           <Route path="/search" element={<Search />} />
           <Route path="/usage" element={<Usage />} />
           <Route path="/notes" element={<Notes />} />

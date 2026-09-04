@@ -410,7 +410,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, audit.OK)
 		}
 
-	case MsgTailRes, MsgSSHRes:
+	case MsgTailRes, MsgSSHRes, MsgCtlRes:
 		s.deliver(m)
 
 	case MsgDropped:

@@ -32,6 +32,7 @@ func (s *Server) runtimeRoutes() {
 	m.HandleFunc("POST /api/runtime/{id}/approve", s.handleRuntimeApprove)
 	m.HandleFunc("GET /api/runtime/{id}/log", s.handleRuntimeLog)
 	m.HandleFunc("GET /api/runtime/{id}/approvals", s.handleRuntimeApprovals)
+	m.HandleFunc("GET /api/runtime/{id}/usage", s.handleRuntimeUsage)
 	m.HandleFunc("GET /api/runtime/{id}/stream", s.handleRuntimeStream)
 }
 
@@ -229,4 +230,39 @@ func (s *Server) handleRuntimeApprovals(w http.ResponseWriter, r *http.Request) 
 	}
 	rows, err := s.sessions.Waiting(id)
 	s.respond(w, r, rows, err)
+}
+
+// handleRuntimeUsage は残量の4種のうち、制御プロトコルからしか取れない2つを返す。
+//
+//   - get_usage        … モデル別の入出力・キャッシュ・費用、プラン枠の残り
+//   - get_context_usage… コンテキストの内訳
+//
+// **モデル呼び出しは起きない。** 押すたびにトークンを使うことはない
+// （2026-09-04 に実測。docs/30-session-protocol.md）。
+//
+// 残り2つ（プラン残量の履歴・同時実行）は DB と supervisor から取る。
+func (s *Server) handleRuntimeUsage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	out := map[string]any{}
+
+	if b, err := s.sessions.Control(id, "get_usage"); err != nil {
+		out["usage_error"] = err.Error()
+	} else {
+		out["usage"] = json.RawMessage(b)
+	}
+	if b, err := s.sessions.Control(id, "get_context_usage"); err != nil {
+		out["context_error"] = err.Error()
+	} else {
+		out["context"] = json.RawMessage(b)
+	}
+	running, max := s.sessions.Capacity()
+	out["running"] = running
+	out["max"] = max
+	// **4コアしかない。** 上限に達していなくても、並べれば遅くなる。
+	if running >= max {
+		out["warning"] = "同時実行の上限に達している"
+	} else if running > 1 {
+		out["warning"] = fmt.Sprintf("%d 本が同時に走っている（4コア）", running)
+	}
+	writeJSON(w, http.StatusOK, out)
 }

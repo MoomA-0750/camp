@@ -1238,3 +1238,45 @@ func TestTheSSHDirectoryIsNotStartable(t *testing.T) {
 		t.Fatal("~/.ssh でセッションを起こせてしまった")
 	}
 }
+
+// ---------------------------------------------------------------- 残量（M31）
+
+// 制御フレームで残量を取れる。**読み取りだけしか出せない。**
+func TestUsageComesBackThroughTheControlChannel(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	// get_usage に答える子。
+	p := filepath.Join(t.TempDir(), "usage-claude")
+	body := `#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"u-1"}'
+while IFS= read -r line; do
+  case "$line" in
+    *get_usage*)
+      id=$(printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+      echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{\"session\":{\"total_cost_usd\":0.5}}}}" ;;
+  esac
+done
+`
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	attach(t, s, p)
+	rec, err := s.Start("test", allowHere(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	got, err := s.Control(rec.ID, "get_usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "total_cost_usd") {
+		t.Fatalf("残量が返っていない: %s", got)
+	}
+
+	// **子の振る舞いを変える制御は出せない。**
+	if _, err := s.Control(rec.ID, "set_permission_mode"); err == nil {
+		t.Fatal("承認の要否を画面から変えられてしまう")
+	}
+}
