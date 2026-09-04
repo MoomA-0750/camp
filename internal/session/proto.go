@@ -148,6 +148,7 @@ const (
 	idleTimeout = 30 * time.Minute // 何も来なくなってから
 	turnTimeout = 60 * time.Minute // 1ターンが終わらない
 	startGrace  = 60 * time.Second // started が返ってこない
+	stopGrace   = 2 * time.Minute  // 止めろと言ったのに止まらない
 )
 
 // validState は知らない状態を弾く。

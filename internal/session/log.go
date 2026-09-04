@@ -245,3 +245,14 @@ func DefaultLogDir() string {
 	}
 	return filepath.Join(home, ".local", "state", "camp", "sessions")
 }
+
+// logExists は落とし先が既にあるか。**開かずに見る**（開くと作ってしまう）。
+func logExists(dir, id string) bool {
+	l := &Log{dir: dir, id: id}
+	for _, gen := range []int{0, 1} {
+		if _, err := os.Stat(l.path(gen)); err == nil {
+			return true
+		}
+	}
+	return false
+}

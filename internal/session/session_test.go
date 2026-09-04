@@ -69,6 +69,11 @@ func attach(t *testing.T, s *Supervisor, claude string) *Agent {
 
 	a := NewAgent(sock, claude)
 	a.Scope = false // テストで systemd に触らない
+	// **本人の ~/.local/state へ書かない。**
+	// 2026-09-04 の outer gate で、テストが 221 個のファイルを本物の
+	// 置き場へ残していたのを見つけた。既定値がそこを指しているので、
+	// 差し替えを忘れると静かに漏れる。
+	a.LogDir = t.TempDir()
 	if err := a.Dial("test"); err != nil {
 		t.Fatal(err)
 	}
@@ -522,6 +527,7 @@ func TestARealClaudeSessionRunsEndToEnd(t *testing.T) {
 
 	a := NewAgent(sock, bin)
 	a.Scope = true // **孫まで包む。本物でこそ確かめる意味がある**
+	a.LogDir = t.TempDir()
 	if err := a.Dial("e2e"); err != nil {
 		t.Fatal(err)
 	}

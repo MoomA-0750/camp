@@ -35,6 +35,7 @@ type Supervisor struct {
 	IdleAfter  time.Duration
 	TurnAfter  time.Duration
 	StartAfter time.Duration
+	StopAfter  time.Duration
 }
 
 type liveSession struct {
@@ -59,6 +60,7 @@ func New(db *store.DB) *Supervisor {
 		IdleAfter:  idleTimeout,
 		TurnAfter:  turnTimeout,
 		StartAfter: startGrace,
+		StopAfter:  stopGrace,
 	}
 }
 
@@ -347,6 +349,13 @@ func (s *Supervisor) Tick() {
 			if now.Sub(ls.last) > s.IdleAfter {
 				todo = append(todo, action{id, StopTerminate, "何も来ないまま時間が経った"})
 			}
+		case StateStopping:
+			// **止めろと言ったのに止まらない。** 実行面が受け取り損ねた・
+			// 子が signal を無視した、どちらもありうる。放っておくと
+			// stopping のまま永久に残るので、期限を切って諦める。
+			if now.Sub(ls.last) > s.StopAfter {
+				dead = append(dead, action{id: id, why: "止めろと言ったのに止まらない"})
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -377,12 +386,50 @@ func (s *Supervisor) Tick() {
 		}
 	}
 
+	// **孤児を、孤児のまま置き去りにしない。**
+	//
+	// 実行面が落ちると、その子は stdin が閉じて自分で終わる（CLI の仕様。
+	// 2026-09-04 に実測）。落ちた瞬間はまだ生きているので orphaned にするが、
+	// そのあと誰も見に行かないと、台帳は永久に「孤児」のまま残る。
+	// **「見ていないから孤児」を「孤児だから孤児」と読ませない。**
+	s.sweepOrphans()
+
 	for _, a := range dead {
 		s.fail(a.id, a.why)
 	}
 	for _, a := range todo {
 		s.audit(a.id, "session.timeout", a.mode, a.why, audit.Timeout)
 		_ = s.Stop(a.id, a.mode)
+	}
+}
+
+// sweepOrphans は orphaned の行を見に行き、もう居ないものを閉じる。
+//
+// 生きているものは触らない——**動いているものを「終わった」と書かない**のは
+// Reconcile と同じ。判定できなかったものも触らない。
+func (s *Supervisor) sweepOrphans() {
+	rows, err := listLive(s.db)
+	if err != nil {
+		return
+	}
+	for _, r := range rows {
+		if r.State != StateOrphaned {
+			continue
+		}
+		s.mu.Lock()
+		adopted := s.live[r.ID] != nil
+		s.mu.Unlock()
+		if adopted {
+			continue // 引き取り直されている
+		}
+		alive, known := r.Owner().Alive()
+		if alive || !known {
+			continue
+		}
+		_ = finish(s.db, r.ID, -1, "見張る者が居ないうちに終わっていた")
+		s.CloseApprovals(r.ID)
+		s.audit(r.ID, "session.ghost", "",
+			fmt.Sprintf("孤児にしていた pid %d はもう居ない", r.PID), audit.OK)
 	}
 }
 

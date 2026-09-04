@@ -34,8 +34,14 @@ type Agent struct {
 
 	mu   sync.Mutex
 	kids map[string]*child
-	conn net.Conn
-	enc  sync.Mutex
+	// stopWanted は「まだ生まれていない子」への停止指示。
+	//
+	// **起動は非同期なので、止めろが先に着くことがある。** そのとき黙って
+	// 捨てると、campd は stopping のまま、子は走り続ける（2026-09-04 の
+	// outer gate で実測。止めたつもりで止まっていない、が一番悪い）。
+	stopWanted map[string]string
+	conn       net.Conn
+	enc        sync.Mutex
 }
 
 type child struct {
@@ -55,7 +61,7 @@ type child struct {
 func NewAgent(sock, claude string) *Agent {
 	a := &Agent{Sock: sock, Claude: claude, Scope: true,
 		LogDir: DefaultLogDir(), SSHConfig: DefaultSSHConfig(),
-		kids: map[string]*child{}}
+		kids: map[string]*child{}, stopWanted: map[string]string{}}
 	a.Command = a.defaultCommand
 	return a
 }
@@ -285,10 +291,19 @@ func (a *Agent) start(m Msg) {
 	}
 	a.mu.Lock()
 	a.kids[m.Session] = k
+	wanted, wasAsked := a.stopWanted[m.Session]
+	delete(a.stopWanted, m.Session)
 	a.mu.Unlock()
 
 	a.send(Msg{T: MsgStarted, Session: m.Session, Token: m.Token,
 		PID: pid, Started: st, BootID: BootID(), Scope: k.scope})
+
+	// **生まれる前に止めろと言われていたなら、生まれた直後に止める。**
+	if wasAsked {
+		fmt.Fprintf(os.Stderr, "camp agent: %s は生まれる前に止めろと言われていた\n",
+			m.Session[:8])
+		go a.stop(Msg{Session: m.Session, Token: m.Token, Mode: wanted})
+	}
 
 	// **stdout は常時読む。** 読まないと子が詰まる（M27 で永続化する）。
 	go a.drain(k, stdout)
@@ -438,8 +453,14 @@ func approveFrame(reqID, behavior, message string) []byte {
 func (a *Agent) stop(m Msg) {
 	a.mu.Lock()
 	k := a.kids[m.Session]
+	if k == nil {
+		// **まだ生まれていない。覚えておく。** 捨てると止まらないまま残る。
+		a.stopWanted[m.Session] = m.Mode
+		a.mu.Unlock()
+		return
+	}
 	a.mu.Unlock()
-	if k == nil || k.token != m.Token {
+	if k.token != m.Token {
 		return
 	}
 	if m.Mode == StopInterrupt {
@@ -523,15 +544,20 @@ func (a *Agent) tail(m Msg) {
 	var lg *Log
 	if k != nil && k.token == m.Token {
 		lg = k.log
-	} else {
+	} else if logExists(a.LogDir, m.Session) {
 		// 終わったセッションでも、落とし先は残っている。読むだけなら開き直す。
+		//
+		// **無ければ開かない。** OpenLog は空のファイルを作るので、
+		// でたらめな id で呼ばれるたびにゴミが増えるし、返す答えが
+		// 「まだ何も流れていない」になる——**「見ていないから0」を
+		// 「無いから0」と読ませる形**。
 		if l, err := OpenLog(a.LogDir, m.Session); err == nil {
 			defer l.Close()
 			lg = l
 		}
 	}
 	if lg == nil {
-		out.Error = "落とし先が無い"
+		out.Error = "そのセッションの落とし先が無い（走っていないか、id が違う）"
 		a.send(out)
 		return
 	}
