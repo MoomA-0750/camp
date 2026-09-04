@@ -22,9 +22,12 @@ import (
 // **だからこそ、繋げる相手を絞る。** socket は 0660 で campreport グループ、
 // さらに uid を指定して照合する。名乗りは見ない（SO_PEERCRED で決める）。
 type Control struct {
-	s        *Supervisor
-	ln       net.Listener
-	path     string
+	s    *Supervisor
+	ln   net.Listener
+	path string
+	// allowUID は実行面になってよい uid。**負なら誰でも。**
+	// ゼロ値は 0（root だけ）になるので、`Listen` 以外でこの型を作るときは
+	// 必ず明示する。
 	allowUID int
 
 	mu     sync.Mutex
@@ -254,6 +257,14 @@ func (c *Control) readopt(held []Held) {
 				audit.Denied)
 			continue
 		}
+		if c.allowUID >= 0 {
+			if uid, ok := OwnerUID(h.PID); ok && uid != c.allowUID {
+				s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
+					fmt.Sprintf("uid %d のプロセスを名乗った（実行面は %d）", uid, c.allowUID),
+					audit.Denied)
+				continue
+			}
+		}
 		o := Owner{PID: h.PID, Started: h.Started, BootID: h.BootID}
 		alive, known := o.Alive()
 		if !known {
@@ -344,6 +355,23 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		// **実行面の言う pid を鵜呑みにしない。** campd 自身が /proc を読んで
 		// 起動時刻を確かめる。読めない環境では「確かめられなかった」と記録する
 		// ——「見ていないから合っている」にはしない。
+		// **名乗られた pid が、実行面と同じユーザーのものか。**
+		//
+		// campd は「そのプロセスが本当に実行面の子か」までは確かめられない。
+		// だが、無関係な system のプロセスを指させることは防げる——
+		// 台帳に入ると、あとで reap されたときに本当に止めてしまう。
+		if c.allowUID >= 0 {
+			if uid, ok := OwnerUID(m.PID); !ok {
+				s.audit(m.Session, "session.started", strconv.Itoa(m.PID),
+					"pid の持ち主を確かめられない", audit.Error)
+			} else if uid != c.allowUID {
+				s.audit(m.Session, "session.started", strconv.Itoa(m.PID),
+					fmt.Sprintf("uid %d のプロセスを名乗った（実行面は %d）", uid, c.allowUID),
+					audit.Denied)
+				s.fail(m.Session, "実行面と違うユーザーのプロセスを名乗った")
+				return
+			}
+		}
 		o := Owner{PID: m.PID, Started: m.Started, BootID: m.BootID}
 		if st, err := Starttime(m.PID); err == nil {
 			if st != m.Started {
@@ -551,6 +579,6 @@ func peerUID(c net.Conn) (uid uint32, pid int32, err error) {
 
 // dispatchForTest はテストから1通だけ流し込む。実行面を用意せずに済ませる。
 func (s *Supervisor) dispatchForTest(m Msg) {
-	c := &Control{s: s}
+	c := &Control{s: s, allowUID: -1}
 	c.dispatch(&agentConn{c: nil, who: "test"}, m)
 }

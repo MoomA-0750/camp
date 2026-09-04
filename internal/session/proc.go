@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // procStatPath は差し替え可能にしておく（テストで偽の /proc を使う）。
@@ -94,4 +95,22 @@ func (o Owner) Alive() (alive bool, known bool) {
 		return false, false // 比べる相手を持っていない
 	}
 	return st == o.Started, true
+}
+
+// OwnerUID は pid の持ち主を返す。
+//
+// **campd は「そのプロセスが実行面の子である」ことを確かめられない。**
+// できるのはここまで——名乗られた pid が、実行面と同じユーザーのものか。
+// これで、無関係な system のプロセスを指させることは防げる（あとで
+// reap されると本当に止めてしまう）。
+func OwnerUID(pid int) (int, bool) {
+	fi, err := os.Stat(fmt.Sprintf("%s/%d", procRoot, pid))
+	if err != nil {
+		return 0, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
 }

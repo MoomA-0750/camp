@@ -1087,7 +1087,7 @@ func TestAReadoptWithTheWrongStartTimeIsRefused(t *testing.T) {
 	st, _ := Starttime(self)
 	mustInsert(t, db, "reused", StateRunning, self, st, BootID())
 
-	c := &Control{s: s}
+	c := &Control{s: s, allowUID: -1}
 	c.readopt([]Held{{ID: "reused", Token: "t", PID: self, Started: st + 1, BootID: BootID()}})
 	if len(s.Live()) != 0 {
 		t.Fatal("起動時刻が違うのに引き取った。pid の使い回しを掴む")

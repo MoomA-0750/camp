@@ -980,7 +980,7 @@ func TestReadoptRefusesAPIDTheLedgerDoesNotKnow(t *testing.T) {
 	// 台帳は別の pid を覚えている。
 	mustInsert(t, db, "sess", StateRunning, 999999, 12345, BootID())
 
-	c := &Control{s: s}
+	c := &Control{s: s, allowUID: -1}
 	c.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st, BootID: BootID()}})
 	if len(s.Live()) != 0 {
 		t.Fatal("台帳と違う pid を名乗って引き取られた")
@@ -998,7 +998,7 @@ func TestReadoptRefusesAForeignScopeName(t *testing.T) {
 	st, _ := Starttime(self)
 	mustInsert(t, db, "sess", StateRunning, self, st, BootID())
 
-	c := &Control{s: s}
+	c := &Control{s: s, allowUID: -1}
 	c.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st,
 		BootID: BootID(), Scope: "dbus.service"}})
 
@@ -1011,7 +1011,7 @@ func TestReadoptRefusesAForeignScopeName(t *testing.T) {
 	}
 	// 正しい名前なら通る。
 	s2 := New(db)
-	c2 := &Control{s: s2}
+	c2 := &Control{s: s2, allowUID: -1}
 	c2.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st,
 		BootID: BootID(), Scope: scopeName("sess")}})
 	r, _ = get(db, "sess")
@@ -1030,7 +1030,7 @@ func TestReadoptKeepsARunningTurnRunning(t *testing.T) {
 	st, _ := Starttime(self)
 	mustInsert(t, db, "sess", StateRunning, self, st, BootID())
 
-	c := &Control{s: s}
+	c := &Control{s: s, allowUID: -1}
 	c.readopt([]Held{{ID: "sess", Token: "t", PID: self, Started: st,
 		BootID: BootID(), State: StateRunning}})
 	if got := state(t, db, "sess"); got != StateRunning {
@@ -1041,7 +1041,7 @@ func TestReadoptKeepsARunningTurnRunning(t *testing.T) {
 	}
 	// 何も言われなければ running 側に倒す（分からないときに idle にしない）。
 	s2 := New(db)
-	(&Control{s: s2}).readopt([]Held{{ID: "sess", Token: "t", PID: self,
+	(&Control{s: s2, allowUID: -1}).readopt([]Held{{ID: "sess", Token: "t", PID: self,
 		Started: st, BootID: BootID()}})
 	if got := state(t, db, "sess"); got != StateRunning {
 		t.Fatalf("状態を名乗られなかったのに %s にした", got)
@@ -1201,4 +1201,39 @@ func TestTheConcurrencyLimitHoldsUnderARace(t *testing.T) {
 	if started > 2 {
 		t.Fatalf("上限 2 に対して %d 本起こした", started)
 	}
+}
+
+// **実行面と違うユーザーのプロセスを名乗らせない。**
+//
+// 台帳に入ると、あとで reap されたときに本当に止めてしまう。campd は
+// 「そのプロセスが実行面の子か」までは確かめられないが、持ち主は見られる。
+func TestAPIDOwnedBySomeoneElseIsRefused(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	sock := filepath.Join(t.TempDir(), "a.sock")
+	// **自分の uid ではない値を「実行面の uid」として許す。**
+	// そのうえで自分のプロセス（uid が違う）を名乗る。
+	c := &Control{s: s, allowUID: os.Getuid() + 1}
+
+	if err := insert(db, Record{ID: "s", Cwd: "/tmp", State: StateStarting,
+		RequestedBy: "test", CreatedAt: now(), UpdatedAt: now()}); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.live["s"] = &liveSession{rec: Record{ID: "s", State: StateStarting},
+		token: "t", last: s.Now(), asked: map[string]bool{}}
+	s.mu.Unlock()
+
+	self := os.Getpid()
+	st, _ := Starttime(self)
+	c.dispatch(&agentConn{c: nopConn{}, who: "test"}, Msg{
+		T: MsgStarted, Session: "s", Token: "t", PID: self, Started: st, BootID: BootID()})
+
+	if got := state(t, db, "s"); got == StateIdle {
+		t.Fatal("他人のプロセスを台帳に入れた。**reap で本当に止めてしまう**")
+	}
+	if !auditHasSilent(db, "session.started", "のプロセスを名乗った") {
+		t.Fatal("食い違いが記録に残っていない")
+	}
+	_ = sock
 }
