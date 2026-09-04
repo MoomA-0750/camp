@@ -108,6 +108,16 @@ func waitFor(t *testing.T, d time.Duration, ok func() bool) {
 	t.Fatalf("%v 待っても起きなかった", d)
 }
 
+// pending は待っている承認。**エラーは黙って空にしない。**
+func pending(t *testing.T, s *Supervisor, id string) []string {
+	t.Helper()
+	got, err := s.Pending(id)
+	if err != nil {
+		t.Fatalf("待っている承認を読めない: %v", err)
+	}
+	return got
+}
+
 func state(t *testing.T, db *store.DB, id string) string {
 	t.Helper()
 	r, err := get(db, id)
@@ -560,7 +570,8 @@ func TestARealClaudeSessionRunsEndToEnd(t *testing.T) {
 				return
 			default:
 			}
-			for _, req := range s.Pending(rec.ID) {
+			p, _ := s.Pending(rec.ID)
+			for _, req := range p {
 				if err := s.Approve(rec.ID, req, "allow", ""); err == nil {
 					answered++
 				}
@@ -910,7 +921,7 @@ func TestAWaitingApprovalSurvivesCampdRestarting(t *testing.T) {
 
 	// **子が殺されていない。** 引き取り直されて、また入力を受けられる。
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if got := s2.Pending(rec.ID); len(got) != 1 || got[0] != "req-9" {
+	if got := pending(t, s2, rec.ID); len(got) != 1 || got[0] != "req-9" {
 		t.Fatalf("待っている承認が見えない: %v", got)
 	}
 	w, err := s2.Waiting(rec.ID)
@@ -939,7 +950,7 @@ func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
 	}
 	s.Tick()
 
-	if got := s.Pending(rec.ID); len(got) != 0 {
+	if got := pending(t, s, rec.ID); len(got) != 0 {
 		t.Fatalf("期限切れがまだ待っている: %v", got)
 	}
 	hist, err := ApprovalHistory(db, rec.ID, 10)
@@ -968,7 +979,10 @@ func TestApprovalsDoNotStayWaitingAfterTheSessionEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 10*time.Second, func() bool { return state(t, db, rec.ID) == StateExited })
-	waitFor(t, 5*time.Second, func() bool { return len(s.Pending(rec.ID)) == 0 })
+	waitFor(t, 5*time.Second, func() bool {
+		p, _ := s.Pending(rec.ID)
+		return len(p) == 0
+	})
 
 	hist, _ := ApprovalHistory(db, rec.ID, 10)
 	if len(hist) != 1 || hist[0].Reason != BySessionEnd {
@@ -989,7 +1003,7 @@ func TestApprovalsAreAQueueNotASingleSlot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := s.Pending(rec.ID); len(got) != 3 {
+	if got := pending(t, s, rec.ID); len(got) != 3 {
 		t.Fatalf("待っているのが %d 件（3 件のはず）", len(got))
 	}
 	for _, id := range []string{"r1", "r2", "r3"} {
@@ -997,7 +1011,7 @@ func TestApprovalsAreAQueueNotASingleSlot(t *testing.T) {
 			t.Fatalf("%s に答えられない: %v", id, err)
 		}
 	}
-	if got := s.Pending(rec.ID); len(got) != 0 {
+	if got := pending(t, s, rec.ID); len(got) != 0 {
 		t.Fatalf("答えたのに残っている: %v", got)
 	}
 }

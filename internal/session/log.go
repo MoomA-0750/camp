@@ -31,6 +31,34 @@ type Log struct {
 
 	curFirst, curCount   int64 // いま書いているファイル
 	prevFirst, prevCount int64 // 1つ前の世代
+
+	// marks は「この seq はこのバイト位置から始まる」の間引いた目印。
+	//
+	// **無いと、末尾を1行引くたびにファイル全体を舐める。** 2026-09-04 の
+	// outer gate で実測: 満杯（約17,000行）の落とし先で 59ms/回。SSE は
+	// 300ms ごとに叩くので、読み手1人でコアの2割を使う計算になる。
+	curMarks, prevMarks []mark
+}
+
+// mark は seq とその行の先頭バイト位置。
+type mark struct {
+	seq int64
+	off int64
+}
+
+// markEvery は何行ごとに目印を置くか。8MB / 1KB ≒ 8,000行に対して 125 個。
+const markEvery = 64
+
+// seekTo は since の次の行を含みうる位置を返す。**必ず行頭。**
+func seekTo(marks []mark, since int64) int64 {
+	var off int64
+	for _, m := range marks {
+		if m.seq > since {
+			break
+		}
+		off = m.off
+	}
+	return off
 }
 
 // Line は落としたフレーム1つ。
@@ -58,10 +86,19 @@ func OpenLog(dir, id string) (*Log, error) {
 	}
 	l := &Log{dir: dir, id: id}
 	// 前回の続きを知るために、両方の世代を数え直す。
+	//
 	// **番号を振り直さない。** 振り直すと、読み手のカーソルが黙ってずれる。
-	l.prevFirst, l.prevCount, _ = scanFile(l.path(1))
-	first, n, last := scanFile(l.path(0))
-	l.curFirst, l.curCount = first, n
+	// だから「読めなかった」を「空だった」に畳まない——畳むと seq が 1 に
+	// 戻り、画面は同じ番号の別のフレームを受け取る。
+	var err error
+	if l.prevFirst, l.prevCount, _, l.prevMarks, err = scanFile(l.path(1)); err != nil {
+		return nil, err
+	}
+	first, n, last, marks, err := scanFile(l.path(0))
+	if err != nil {
+		return nil, err
+	}
+	l.curFirst, l.curCount, l.curMarks = first, n, marks
 	if last > l.seq {
 		l.seq = last
 	}
@@ -84,26 +121,39 @@ func (l *Log) path(gen int) string {
 }
 
 // scanFile はそのファイルの最初の seq・件数・最後の seq を返す。
-func scanFile(p string) (first, count, last int64) {
+//
+// **無いのと読めないのを区別する。** 無いなら 0 件でよいが、読めないのを
+// 0 件と答えると、番号の付け直しが黙って起きる。
+func scanFile(p string) (first, count, last int64, marks []mark, err error) {
 	f, err := os.Open(p)
 	if err != nil {
-		return 0, 0, 0
+		if os.IsNotExist(err) {
+			return 0, 0, 0, nil, nil
+		}
+		return 0, 0, 0, nil, err
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLine)
+	var off int64
 	for sc.Scan() {
+		lineLen := int64(len(sc.Bytes())) + 1 // 改行ぶん
 		var ln Line
 		if json.Unmarshal(sc.Bytes(), &ln) != nil {
+			off += lineLen
 			continue
 		}
 		if count == 0 {
 			first = ln.Seq
 		}
+		if count%markEvery == 0 {
+			marks = append(marks, mark{seq: ln.Seq, off: off})
+		}
 		count++
 		last = ln.Seq
+		off += lineLen
 	}
-	return first, count, last
+	return first, count, last, marks, sc.Err()
 }
 
 // Append は1フレーム落とす。**読み手を待たない。**
@@ -127,6 +177,9 @@ func (l *Log) Append(kind string, frame []byte) (int64, error) {
 			return 0, err
 		}
 	}
+	if l.curCount%markEvery == 0 {
+		l.curMarks = append(l.curMarks, mark{seq: ln.Seq, off: l.size})
+	}
 	n, err := l.f.Write(b)
 	l.size += int64(n)
 	if l.curCount == 0 {
@@ -146,8 +199,8 @@ func (l *Log) rotate() error {
 	if err := os.Rename(l.path(0), l.path(1)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	l.prevFirst, l.prevCount = l.curFirst, l.curCount
-	l.curFirst, l.curCount, l.size = 0, 0, 0
+	l.prevFirst, l.prevCount, l.prevMarks = l.curFirst, l.curCount, l.curMarks
+	l.curFirst, l.curCount, l.size, l.curMarks = 0, 0, 0, nil
 	f, err := os.OpenFile(l.path(0), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
@@ -175,18 +228,39 @@ func (l *Log) Stats() (oldest, newest, dropped int64) {
 // 第2の戻り値は「読み手のカーソルより前に落としたものがあるか」。
 // **黙って飛ばさない。** 飛んだことが分かれば、画面は「ここが抜けている」と出せる。
 func (l *Log) Tail(since int64, limit int) (lines []Line, gap bool, err error) {
-	oldest, _, _ := l.Stats()
+	oldest, newest, _ := l.Stats()
 	if limit <= 0 || limit > maxTailLines {
 		limit = maxTailLines
 	}
 	if since+1 < oldest {
 		gap = true
 	}
+	// **何も無いなら、ファイルを開かない。**
+	// SSE は 300ms ごとに聞きに来る。その大半は「まだ無い」の答えになる。
+	if since >= newest && !gap {
+		return nil, false, nil
+	}
+
+	l.mu.Lock()
+	marks := [2][]mark{l.prevMarks, l.curMarks}
+	l.mu.Unlock()
+
 	var bytes int
 	for gen := 1; gen >= 0; gen-- {
 		f, e := os.Open(l.path(gen))
 		if e != nil {
-			continue
+			if os.IsNotExist(e) {
+				continue // その世代はまだ無い。ふつうのこと
+			}
+			// **開けなかったことを「そこには無かった」と読ませない。**
+			return nil, gap, fmt.Errorf("落とし先の第%d世代が読めない: %w", gen, e)
+		}
+		// 目印まで飛ぶ。**全部舐めない。**
+		if off := seekTo(marks[1-gen], since); off > 0 {
+			if _, e := f.Seek(off, 0); e != nil {
+				f.Close()
+				return nil, gap, e
+			}
 		}
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 0, 64*1024), maxLine)

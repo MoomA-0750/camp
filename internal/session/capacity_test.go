@@ -81,7 +81,8 @@ func TestCapacityWithRealClaude(t *testing.T) {
 			default:
 			}
 			for _, id := range ids {
-				for _, req := range s.Pending(id) {
+				p, _ := s.Pending(id)
+				for _, req := range p {
 					s.Approve(id, req, "allow", "")
 				}
 			}

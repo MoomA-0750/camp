@@ -270,16 +270,19 @@ func (s *Supervisor) Approve(id, reqID, behavior, message string) error {
 }
 
 // Pending は待っている承認の request_id。**DB から読む。**
-func (s *Supervisor) Pending(id string) []string {
+//
+// エラーを空に畳まない。読めなかったことを「待っている承認は無い」と
+// 読ませると、子が止まったまま画面には何も出ない。
+func (s *Supervisor) Pending(id string) ([]string, error) {
 	rows, err := openApprovals(s.db, id)
 	if err != nil {
-		return nil
+		return nil, approvalError("読み取り", err)
 	}
 	out := make([]string, 0, len(rows))
 	for _, a := range rows {
 		out = append(out, a.RequestID)
 	}
-	return out
+	return out, nil
 }
 
 // Waiting は待っている承認を中身つきで返す。画面はこれを出す。
@@ -363,7 +366,12 @@ func (s *Supervisor) Tick() {
 	// **期限切れを、期限切れとして答える。**
 	// 放っておくと `claude` 自身のパーク期限（5分）で子が勝手に諦め、
 	// 何が起きたか分からない記録になる。
-	if late, err := expired(s.db, s.Now()); err == nil {
+	late, err := expired(s.db, s.Now())
+	if err != nil {
+		// **読めなかったことを「期限切れは無い」と読ませない。**
+		s.audit("", "tool.approve", "", "期限切れを数えられない: "+err.Error(), audit.Error)
+	}
+	{
 		for _, a := range late {
 			if ok, err := answer(s.db, a.SessionID, a.RequestID, "deny", ByTimeout, s.Now()); err != nil || !ok {
 				continue
@@ -410,6 +418,8 @@ func (s *Supervisor) Tick() {
 func (s *Supervisor) sweepOrphans() {
 	rows, err := listLive(s.db)
 	if err != nil {
+		s.audit("", "session.reconcile", "",
+			"孤児を見に行けない: "+err.Error(), audit.Error)
 		return
 	}
 	for _, r := range rows {

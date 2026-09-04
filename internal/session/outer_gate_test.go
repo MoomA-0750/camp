@@ -327,7 +327,7 @@ done
 		t.Fatalf("終了コードが残っていない: %+v", r.ExitCode)
 	}
 	// **待っていた承認が宙に浮かない。**
-	if got := s.Pending(rec.ID); len(got) != 0 {
+	if got := pending(t, s, rec.ID); len(got) != 0 {
 		t.Fatalf("子が死んだのに承認が待ったまま: %v", got)
 	}
 }
@@ -398,7 +398,7 @@ func TestOneSessionCannotAnswerAnothersApproval(t *testing.T) {
 	if err := s.Approve(b.ID, "r-a", "allow", ""); err == nil {
 		t.Fatal("別のセッションの承認に答えられた")
 	}
-	if got := s.Pending(a.ID); len(got) != 1 {
+	if got := pending(t, s, a.ID); len(got) != 1 {
 		t.Fatalf("a の待ちが壊れた: %v", got)
 	}
 }
@@ -566,7 +566,7 @@ func TestOrphansAreNotLeftLyingAround(t *testing.T) {
 	if !strings.Contains(r.ExitReason, "見張る者が居ないうちに") {
 		t.Fatalf("何があったか分からない終わり方: %q", r.ExitReason)
 	}
-	if got := s.Pending(rec.ID); len(got) != 0 {
+	if got := pending(t, s, rec.ID); len(got) != 0 {
 		t.Fatalf("承認が宙に浮いたまま: %v", got)
 	}
 }
@@ -582,5 +582,177 @@ func TestALiveOrphanIsLeftAlone(t *testing.T) {
 	s.Tick()
 	if got := state(t, db, "alive-orphan"); got != StateOrphaned {
 		t.Fatalf("生きている孤児を %s にした", got)
+	}
+}
+
+// ---------------------------------------------------------------- 「見ていないから0」
+
+// **読めなかったことを「空だった」と答えない。**
+//
+// このプロジェクトが繰り返し踏んできた形。落とし先が読めないときに 0 件と
+// 答えると、番号の付け直しが黙って起きて、画面は同じ seq の別のフレームを
+// 受け取る（カーソルが嘘になる）。
+func TestAnUnreadableLogIsAnErrorNotAnEmptyOne(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root では権限で弾けない")
+	}
+	old := maxLogBytes
+	maxLogBytes = 512
+	defer func() { maxLogBytes = old }()
+
+	dir := t.TempDir()
+	lg, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		lg.Append("assistant", []byte(`{"pad":"`+strings.Repeat("x", 40)+`"}`))
+	}
+	_, newest, _ := lg.Stats()
+	lg.Close()
+
+	// **1つ前の世代だけ読めなくする。** いま書くファイルは開けるので、
+	// 「開けたから大丈夫」では通れない——数え直しが失敗したことに
+	// 気づかなければ、そのまま続きを書いてしまう。
+	prev := filepath.Join(dir, "s1.1.jsonl")
+	if _, err := os.Stat(prev); err != nil {
+		t.Skipf("まだ世代が回っていない: %v", err)
+	}
+	if err := os.Chmod(prev, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(prev, 0o600)
+
+	again, err := OpenLog(dir, "s1")
+	if err == nil {
+		_, n, _ := again.Stats()
+		again.Close()
+		t.Fatalf("読めない世代を「空」として開いた（newest %d → %d）", newest, n)
+	}
+}
+
+// tail も同じ。世代が読めないなら、そう言う。
+func TestATailThatCannotReadSaysSo(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root では権限で弾けない")
+	}
+	old := maxLogBytes
+	maxLogBytes = 512
+	defer func() { maxLogBytes = old }()
+
+	dir := t.TempDir()
+	lg, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	for i := 0; i < 40; i++ {
+		lg.Append("assistant", []byte(`{"pad":"`+strings.Repeat("x", 40)+`"}`))
+	}
+	prev := filepath.Join(dir, "s1.1.jsonl")
+	if _, err := os.Stat(prev); err != nil {
+		t.Skipf("まだ世代が回っていない: %v", err)
+	}
+	if err := os.Chmod(prev, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(prev, 0o600)
+
+	if _, _, err := lg.Tail(0, 100); err == nil {
+		t.Fatal("読めない世代を黙って飛ばした")
+	}
+}
+
+// 承認の読み取りが失敗したら、そう言う。**「待っている承認は無い」にしない。**
+func TestPendingApprovalsFailLoudly(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	if _, err := db.Exec(`drop table approvals`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pending("x"); err == nil {
+		t.Fatal("読めないのに「待っている承認は無い」と答えた")
+	}
+}
+
+// 目印まで飛ぶようにしたので、**飛びすぎて行を落としていないか**を全カーソルで見る。
+//
+// 速くするために足した仕組みが、静かに行を落とすのが一番悪い。
+func TestSeekingToMarksNeverSkipsALine(t *testing.T) {
+	old := maxLogBytes
+	maxLogBytes = 8192 // 世代を何度も回す
+	defer func() { maxLogBytes = old }()
+
+	dir := t.TempDir()
+	lg, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	const n = 600
+	for i := 1; i <= n; i++ {
+		if _, err := lg.Append("assistant", []byte(fmt.Sprintf(`{"i":%d}`, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldest, newest, _ := lg.Stats()
+	if newest != n {
+		t.Fatalf("newest=%d（%d のはず）", newest, n)
+	}
+
+	for since := int64(0); since <= newest; since++ {
+		lines, gap, err := lg.Tail(since, maxTailLines)
+		if err != nil {
+			t.Fatalf("since=%d: %v", since, err)
+		}
+		if since+1 < oldest {
+			if !gap {
+				t.Fatalf("since=%d: 落ちた範囲なのに gap を言わない", since)
+			}
+			continue
+		}
+		want := newest - since
+		if want > maxTailLines {
+			want = maxTailLines
+		}
+		if int64(len(lines)) != want {
+			t.Fatalf("since=%d: %d 行（%d 行のはず）", since, len(lines), want)
+		}
+		// **連番であること。** 飛ばしていたらここで落ちる。
+		for i, ln := range lines {
+			if ln.Seq != since+int64(i)+1 {
+				t.Fatalf("since=%d: %d 番目が seq=%d（%d のはず）",
+					since, i, ln.Seq, since+int64(i)+1)
+			}
+		}
+	}
+}
+
+// 何も無いときはファイルを開かない（SSE は 300ms ごとに聞きに来る）。
+func TestAnIdlePollDoesNotTouchTheFiles(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	for i := 0; i < 10; i++ {
+		lg.Append("assistant", []byte(`{}`))
+	}
+	_, newest, _ := lg.Stats()
+
+	// 読めなくしても、末尾に居る読み手は困らない（開かないので）。
+	p := filepath.Join(dir, "s1.jsonl")
+	if err := os.Chmod(p, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(p, 0o600)
+	if os.Getuid() == 0 {
+		t.Skip("root では権限で弾けない")
+	}
+	lines, gap, err := lg.Tail(newest, 100)
+	if err != nil || gap || len(lines) != 0 {
+		t.Fatalf("空振りの問い合わせでファイルを開いている: %d 行 gap=%v err=%v",
+			len(lines), gap, err)
 	}
 }

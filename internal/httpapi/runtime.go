@@ -155,6 +155,17 @@ func (s *Server) handleRuntimeStream(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, http.StatusInternalServerError, "流せない")
 		return
 	}
+	// **開きっぱなしの接続に上限を置く。**
+	// 1本ごとに goroutine が1つと、300ms ごとの問い合わせが1つ増える。
+	// タブを開いたまま忘れるだけで積み上がるので、数を絞る。
+	select {
+	case s.streams <- struct{}{}:
+		defer func() { <-s.streams }()
+	default:
+		s.fail(w, r, http.StatusServiceUnavailable,
+			"開いている流れが多すぎる。使っていないタブを閉じる")
+		return
+	}
 	id := r.PathValue("id")
 	since := int64(atoi(r.URL.Query().Get("since")))
 	if v := r.Header.Get("Last-Event-ID"); v != "" {

@@ -52,12 +52,21 @@ type Server struct {
 	log          *slog.Logger
 	views        viewCache
 	sessions     *session.Supervisor
+	// streams は開いている SSE の枠。**数えないと積み上がる。**
+	streams chan struct{}
 }
+
+// maxStreams は同時に開ける SSE の本数。
+//
+// 4コアしかない。1本ごとに goroutine と 300ms ごとの問い合わせが増えるので、
+// 「画面をたくさん開いたら campd が重くなる」形にしない。
+const maxStreams = 16
 
 // New はハンドラを組み立てる。
 func New(db *store.DB, o Options) (*Server, error) {
 	s := &Server{db: db, opts: o, mux: http.NewServeMux(),
-		secureCookie: o.SecureCookie, log: o.Log, sessions: o.Sessions}
+		secureCookie: o.SecureCookie, log: o.Log, sessions: o.Sessions,
+		streams: make(chan struct{}, maxStreams)}
 	if s.log == nil {
 		s.log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}

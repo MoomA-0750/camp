@@ -387,3 +387,51 @@ func TestAllowingAnSSHDestinationNeedsThePasswordAgain(t *testing.T) {
 		t.Fatalf("許可が反映されていない: %+v", list)
 	}
 }
+
+// 開きっぱなしの流れに上限がある。**タブを開いたまま忘れても積み上がらない。**
+func TestTooManyOpenStreamsAreRefused(t *testing.T) {
+	ts, c, sup := runtimeServer(t)
+	work := allowDir(t, c, ts)
+	rec, err := sup.Start("test", work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ok := false
+		for _, r := range sup.Live() {
+			if r.ID == rec.ID && r.State == session.StateIdle {
+				ok = true
+			}
+		}
+		if ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var bodies []io.Closer
+	defer func() {
+		for _, b := range bodies {
+			b.Close()
+		}
+	}()
+	refused := 0
+	for i := 0; i < 24; i++ {
+		req, _ := http.NewRequest("GET", ts.URL+"/api/runtime/"+rec.ID+"/stream", nil)
+		res, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.StatusCode == http.StatusServiceUnavailable {
+			refused++
+			res.Body.Close()
+			continue
+		}
+		bodies = append(bodies, res.Body)
+	}
+	if refused == 0 {
+		t.Fatal("24本開いても1本も断られない。**上限が効いていない**")
+	}
+	t.Logf("24本のうち %d 本を断った", refused)
+}
