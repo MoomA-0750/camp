@@ -119,6 +119,8 @@ func run(args []string) error {
 		return cmdRuntime(rest)
 	case "allow":
 		return cmdAllow(rest)
+	case "ssh":
+		return cmdSSH(rest)
 	case "passwd":
 		return cmdPasswd(rest)
 	case "vault":
@@ -168,6 +170,7 @@ usage:
   campd agent             実行面。本人のユーザーで claude を起こす（DBには触らない）
   campd runtime           Camp が起こしたセッションの台帳を読む
   campd allow [add|remove] セッションを起こしてよい cwd の許可リスト（既定は deny）
+  campd ssh [allow|deny]  SSH接続先の台帳（リモート起動はまだしない）
   campd login-url         使い捨てのログインURLを1本出す（開発中の入口）
   campd vault scan  [DIR] Vault を歩いて内訳を出す（DBには書かない）
   campd vault index [DIR] Vault を索引する（Vault側には一切書かない）
@@ -2404,4 +2407,62 @@ func cmdAllow(args []string) error {
 		return nil
 	}
 	return fmt.Errorf("知らない副命令: %s（list / add / remove）", sub)
+}
+
+// cmdSSH は接続先の台帳を見る・許可を切り替える。**リモート起動はまだしない。**
+func cmdSSH(args []string) error {
+	fs := flag.NewFlagSet("ssh", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
+	rest, err := parseAround(fs, args)
+	if err != nil {
+		return err
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	sub := ""
+	if len(rest) > 0 {
+		sub = rest[0]
+	}
+	switch sub {
+	case "", "list":
+		rows, err := session.ListDestinations(db)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			fmt.Println("台帳は空。画面から取り込む（POST /api/ssh/scan）。")
+			return nil
+		}
+		for _, d := range rows {
+			mark := "  "
+			if d.Allowed {
+				mark = "許"
+			}
+			fmt.Printf("%s %-20s %s@%s:%d %s\n", mark, d.Alias, d.User, d.HostName, d.Port, d.Note)
+		}
+		fmt.Println("\n（許 = 許可済み。**リモート起動は Phase 3 では行わない**）")
+		return nil
+
+	case "allow", "deny":
+		if len(rest) < 2 {
+			return fmt.Errorf("エイリアスを指す: campd ssh %s <alias>", sub)
+		}
+		on := sub == "allow"
+		if err := session.SetDestinationAllowed(db, rest[1], on); err != nil {
+			return err
+		}
+		out, detail := audit.OK, "許した"
+		if !on {
+			out, detail = audit.Denied, "許可を外した"
+		}
+		audit.Append(db, audit.Entry{Actor: "cli", Action: "ssh.allow",
+			Target: rest[1], Detail: detail, Outcome: out})
+		fmt.Printf("%s: %s\n", rest[1], detail)
+		return nil
+	}
+	return fmt.Errorf("知らない副命令: %s（list / allow / deny）", sub)
 }

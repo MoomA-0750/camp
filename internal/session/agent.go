@@ -29,6 +29,8 @@ type Agent struct {
 
 	// LogDir はフレームの落とし先。**子の隣**（本人のユーザーの領域）。
 	LogDir string
+	// SSHConfig は読む場所。**読むだけ。書き戻す経路をこの型に持たせない。**
+	SSHConfig string
 
 	mu   sync.Mutex
 	kids map[string]*child
@@ -50,7 +52,8 @@ type child struct {
 // NewAgent は実行面を作る。
 func NewAgent(sock, claude string) *Agent {
 	a := &Agent{Sock: sock, Claude: claude, Scope: true,
-		LogDir: DefaultLogDir(), kids: map[string]*child{}}
+		LogDir: DefaultLogDir(), SSHConfig: DefaultSSHConfig(),
+		kids: map[string]*child{}}
 	a.Command = a.defaultCommand
 	return a
 }
@@ -189,6 +192,8 @@ func (a *Agent) Run() error {
 			go a.reap(m)
 		case MsgTail:
 			go a.tail(m)
+		case MsgSSHScan:
+			go a.scanSSH(m)
 		case MsgError:
 			fmt.Fprintln(os.Stderr, "campd:", m.Error)
 			if strings.Contains(m.Error, "既に繋がっている") ||
@@ -529,5 +534,20 @@ func (a *Agent) tail(m Msg) {
 	}
 	_, newest, dropped := lg.Stats()
 	out.Lines, out.Gap, out.Seq, out.Dropped = lines, gap, newest, dropped
+	a.send(out)
+}
+
+// scanSSH は `~/.ssh/config` を**読んで**返す。
+//
+// campd（camp ユーザー）は `~/.ssh` を開けない——開けるようにもしない。
+// 鍵の置き場に読み取りを配れば、境界がそのぶん薄くなる。
+func (a *Agent) scanSSH(m Msg) {
+	out := Msg{T: MsgSSHRes, ReqID: m.ReqID}
+	hosts, err := ReadSSHConfig(a.SSHConfig)
+	if err != nil {
+		out.Error = err.Error()
+	} else {
+		out.SSHHosts = hosts
+	}
 	a.send(out)
 }

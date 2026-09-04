@@ -17,6 +17,18 @@ import (
 )
 
 // runtimeServer は supervisor と実行面まで繋いだサーバーを立てる。
+var dbFor = map[*httptest.Server]*store.DB{}
+
+// dbOf はそのサーバーが使っている DB。テストから直に触るため。
+func dbOf(t *testing.T, ts *httptest.Server) *store.DB {
+	t.Helper()
+	db := dbFor[ts]
+	if db == nil {
+		t.Fatal("この httptest.Server の DB を知らない")
+	}
+	return db
+}
+
 func runtimeServer(t *testing.T) (*httptest.Server, *http.Client, *session.Supervisor) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "camp.sqlite"))
@@ -69,7 +81,8 @@ done
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(s.Handler())
-	t.Cleanup(ts.Close)
+	dbFor[ts] = db
+	t.Cleanup(func() { delete(dbFor, ts); ts.Close() })
 
 	deadline := time.Now().Add(3 * time.Second)
 	for !sup.AgentConnected() && time.Now().Before(deadline) {
@@ -330,5 +343,47 @@ func TestAllowlistChangesAreRecorded(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("%s が監査ログに無い", want)
 		}
+	}
+}
+
+// 接続先の許可フラグにもパスワードが要る。
+func TestAllowingAnSSHDestinationNeedsThePasswordAgain(t *testing.T) {
+	ts, c, _ := runtimeServer(t)
+	if _, _, err := session.ImportSSH(dbOf(t, ts), []session.SSHHost{{Alias: "tower"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := c.Post(ts.URL+"/api/ssh/tower/allow", "application/json",
+		strings.NewReader(`{"allowed":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("パスワード無しで許可できた: %s", r.Status)
+	}
+
+	r, err = c.Post(ts.URL+"/api/ssh/tower/allow", "application/json",
+		strings.NewReader(`{"allowed":true,"password":"correct horse battery"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != 200 {
+		t.Fatalf("正しいパスワードで通らない: %s", r.Status)
+	}
+
+	g, err := c.Get(ts.URL + "/api/ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Body.Close()
+	var list []struct {
+		Alias   string `json:"alias"`
+		Allowed bool   `json:"allowed"`
+	}
+	json.NewDecoder(g.Body).Decode(&list)
+	if len(list) != 1 || !list[0].Allowed {
+		t.Fatalf("許可が反映されていない: %+v", list)
 	}
 }

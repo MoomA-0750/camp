@@ -63,6 +63,9 @@ type Msg struct {
 	Seq     int64  `json:"seq,omitempty"`
 	Dropped int64  `json:"dropped,omitempty"`
 
+	// ssh_scan / ssh_result
+	SSHHosts []SSHHost `json:"ssh_hosts,omitempty"`
+
 	// hello / welcome
 	Version string `json:"version,omitempty"`
 	// Held は実行面がいま抱えている子。**campd を入れ替えても殺さないため。**
@@ -93,6 +96,7 @@ const (
 	MsgPing    = "ping"    // 生きている。**止まった実行面に気づくため**
 	MsgTailRes = "tail_result"
 	MsgDropped = "dropped" // 溢れて捨てた。**黙って消さない**
+	MsgSSHRes  = "ssh_result"
 )
 
 // campd → 実行面
@@ -102,8 +106,9 @@ const (
 	MsgInput   = "input"
 	MsgStop    = "stop"
 	MsgApprove = "approve"
-	MsgReap    = "reap" // 孤児を始末しろ
-	MsgTail    = "tail" // 画面が要求した範囲だけ寄こせ
+	MsgReap    = "reap"     // 孤児を始末しろ
+	MsgTail    = "tail"     // 画面が要求した範囲だけ寄こせ
+	MsgSSHScan = "ssh_scan" // ~/.ssh/config を**読んで**寄こせ
 	MsgError   = "error"
 )
 

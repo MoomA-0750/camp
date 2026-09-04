@@ -100,6 +100,7 @@ func New(db *store.DB, o Options) (*Server, error) {
 	s.routes()
 	s.runtimeRoutes()
 	s.allowlistRoutes()
+	s.sshRoutes()
 	return s, nil
 }
 
