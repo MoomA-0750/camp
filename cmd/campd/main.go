@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -2006,7 +2007,7 @@ func cmdReport(args []string) error {
 
 	c, err := net.DialTimeout("unix", *sock, 5*time.Second)
 	if err != nil {
-		return fmt.Errorf("報告口へ繋がらない: %w", err)
+		return fmt.Errorf("報告口へ繋がらない: %w%s", err, whyDenied(*sock, err))
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(10 * time.Second))
@@ -2069,7 +2070,7 @@ func reportLimits(sock string, r io.Reader) error {
 	}
 	c, err := net.DialTimeout("unix", sock, 3*time.Second)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w%s", err, whyDenied(sock, err))
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(5 * time.Second))
@@ -2122,4 +2123,49 @@ func limitsTarget(explicit bool, sock, dbPath string) string {
 		return targetSocket
 	}
 	return targetDB
+}
+
+// whyDenied は報告口に繋げなかった理由を、直せる形で説明する。
+//
+// **黙って失敗させない。** 報告口は 0660 で共有グループのものなので、
+// グループに入っていないプロセスからは `permission denied` としか出ない。
+// 補助グループはプロセスの起動時に決まるので、`usermod -aG` のあとに
+// **入り直していないセッション**からは、いつまでも繋がらない。
+// Phase 3 で launcher が黙って報告できないのが一番まずいので、ここで名指しする。
+func whyDenied(sock string, err error) string {
+	if !errors.Is(err, os.ErrPermission) {
+		return ""
+	}
+	want := ""
+	if fi, serr := os.Stat(sock); serr == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if g, gerr := user.LookupGroupId(fmt.Sprint(st.Gid)); gerr == nil {
+				want = g.Name
+			}
+		}
+	}
+	if want == "" {
+		want = "campreport"
+	}
+
+	have := false
+	if gids, gerr := os.Getgroups(); gerr == nil {
+		if g, gerr := user.LookupGroup(want); gerr == nil {
+			for _, gid := range gids {
+				if fmt.Sprint(gid) == g.Gid {
+					have = true
+					break
+				}
+			}
+		}
+	}
+	if have {
+		return fmt.Sprintf("\n  %s には入っている。campd が動いているか確かめる: systemctl status camp.service", want)
+	}
+	return fmt.Sprintf(`
+  このプロセスは %s グループに入っていない。
+  補助グループは起動時に決まるので、usermod のあとに**入り直していない**
+  セッションからは繋がらない。
+    確認: id -nG | tr ' ' '\n' | grep %s
+    直す: sudo usermod -aG %s $USER   （そのあとログインし直す）`, want, want, want)
 }

@@ -147,3 +147,26 @@ func TestShorteningNeverPanics(t *testing.T) {
 		}
 	}
 }
+
+// 報告口に繋げなかった理由を、直せる形で言う。
+//
+// 2026-09-04: Claude Code のセッションが campreport に入っておらず、
+// `permission denied` としか出なかった。補助グループは起動時に決まるので、
+// usermod のあとに入り直していないセッションからは永久に繋がらない。
+// **Phase 3 で launcher が黙って報告できないのが一番まずい。**
+func TestPermissionDeniedExplainsItself(t *testing.T) {
+	msg := whyDenied("/run/camp/report.sock", os.ErrPermission)
+	if msg == "" {
+		t.Fatal("権限で断られたのに何も説明していない")
+	}
+	for _, want := range []string{"campreport", "id -nG", "usermod"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("説明に %q が無い: %s", want, msg)
+		}
+	}
+
+	// 権限以外の理由には、余計なことを言わない。
+	if got := whyDenied("/run/camp/report.sock", os.ErrNotExist); got != "" {
+		t.Errorf("権限の話ではないのにグループの説明をしている: %s", got)
+	}
+}
