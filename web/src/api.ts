@@ -147,9 +147,32 @@ export type Destination = {
   allowed: boolean; source: string; seen_at: string; updated_at: string
 }
 
+/** `get_usage` の中身。実測で出た欄だけを写している（2026-09-04）。 */
+export type PlanLimit = {
+  kind: string; group?: string; percent: number
+  resets_at?: string; severity?: string; is_active?: boolean
+}
+export type ModelUsage = {
+  inputTokens: number; outputTokens: number
+  cacheReadInputTokens: number; cacheCreationInputTokens: number
+  thinkingTokens: number; costUSD: number; contextWindow?: number
+}
+export type UsagePayload = {
+  subscription_type?: string
+  rate_limits?: { limits?: PlanLimit[] }
+  session?: {
+    total_cost_usd?: number; total_duration_ms?: number
+    total_lines_added?: number; total_lines_removed?: number
+    model_usage?: Record<string, ModelUsage>
+  }
+}
+export type ContextPayload = {
+  categories?: { name: string; tokens: number }[]
+  totalTokens?: number; maxTokens?: number; percentage?: number
+}
 export type RuntimeUsage = {
-  usage?: unknown; usage_error?: string
-  context?: unknown; context_error?: string
+  usage?: UsagePayload; usage_error?: string
+  context?: ContextPayload; context_error?: string
   running: number; max: number; warning?: string
 }
 

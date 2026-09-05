@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { api, type Approval, type LogLine, type RuntimeUsage } from '../api'
+import {
+  api, type Approval, type ContextPayload, type LogLine,
+  type PlanLimit, type RuntimeUsage,
+} from '../api'
 import { Empty, Failed, Loading, short, tokens, useAsync } from '../ui'
 import { StateBadge } from './Runtime'
 
@@ -21,7 +24,7 @@ export default function RuntimeDetail() {
   const [tick, setTick] = useState(0)
 
   const list = useAsync(() => api.runtime(), [tick])
-  const rec = list.data?.sessions.find((s) => s.id === id)
+  const rec = (list.data?.sessions ?? []).find((s) => s.id === id)
   const waiting = useAsync(() => api.runtimeApprovals(id), [id, tick])
 
   const bottom = useRef<HTMLDivElement>(null)
@@ -78,7 +81,7 @@ export default function RuntimeDetail() {
 
       <Ask id={id} rows={waiting} onAnswered={() => setTick((v) => v + 1)} />
 
-      <nav className="tabs">
+      <div className="tabs">
         <button className={tab === 'stream' ? 'on' : ''} onClick={() => set({ tab: '' })}>
           流れ
         </button>
@@ -88,7 +91,7 @@ export default function RuntimeDetail() {
         <button className={tab === 'history' ? 'on' : ''} onClick={() => set({ tab: 'history' })}>
           承認の履歴
         </button>
-      </nav>
+      </div>
 
       {tab === 'usage' && <Usage id={id} />}
       {tab === 'history' && <History id={id} />}
@@ -156,7 +159,8 @@ function Ask({ id, rows, onAnswered }: {
   onAnswered: () => void
 }) {
   const [err, setErr] = useState('')
-  if (!rows.data || rows.data.length === 0) return null
+  const waiting = rows.data ?? []
+  if (waiting.length === 0) return null
   const answer = async (req: string, behavior: 'allow' | 'deny') => {
     setErr('')
     try {
@@ -168,13 +172,13 @@ function Ask({ id, rows, onAnswered }: {
   }
   return (
     <div className="ask">
-      <h3>承認を待っている（{rows.data.length}）</h3>
+      <h3>承認を待っている（{waiting.length}）</h3>
       <p className="sub muted">
         答えるまで、そのターンは止まっている。
         <strong>答えないままにすると期限切れで拒否になる</strong>（4分30秒）。
       </p>
       {err && <Failed error={err} />}
-      {rows.data.map((a) => (
+      {waiting.map((a) => (
         <div key={a.request_id} className="ask-row">
           <div>
             <strong>{a.tool}</strong>{' '}
@@ -250,45 +254,159 @@ function Talk({ id, state, onSent }: { id: string; state?: string; onSent: () =>
   )
 }
 
-// Usage は仕様が求めていた4種のうち3種をここに出す
+// 残量。仕様が求めていた4種のうち3種をここに出す
 // （プラン残量の履歴は「使用量」の画面にある）。
+//
+// **どれもチャートにしない。** 測っているのは「大きさ」と「状態」で、
+// 種類は2〜8しかない——プラン枠はメーター、内訳は表、同時実行は1行。
+// 8分類を積み上げ棒にすると、そこで初めて categorical な配色が要るが、
+// このリポジトリはまだそれを持っていない。持っていない配色を
+// その場で作るより、表のほうが正確に読める。
 function Usage({ id }: { id: string }) {
   const u = useAsync(() => api.runtimeUsage(id), [id])
   if (u.loading) return <Loading />
   if (u.error) return <Failed error={u.error} />
   const d = u.data as RuntimeUsage
+  const limits = d.usage?.rate_limits?.limits ?? []
+  const models = Object.entries(d.usage?.session?.model_usage ?? {})
+
   return (
     <>
       {d.warning && <p className="warn">{d.warning}</p>}
       <p className="sub muted">
         同時に走っているのは {d.running} / {d.max} 本。
         <strong>4コアしかない</strong>ので、先に効くのはメモリではなくCPU。
+        {d.usage?.subscription_type ? ` / プラン ${d.usage.subscription_type}` : ''}
       </p>
-      <h3>プラン枠とモデル別</h3>
-      {d.usage_error ? <Failed error={d.usage_error} /> : <Json v={d.usage} />}
+
+      <h3>プラン枠</h3>
+      {d.usage_error && <Failed error={d.usage_error} />}
+      {!d.usage_error && limits.length === 0 && <Empty>枠の情報が来ていない。</Empty>}
+      {limits.length > 0 && (
+        <div className="windows">
+          {limits.map((l) => <LimitCard key={l.kind + (l.group ?? '')} l={l} />)}
+        </div>
+      )}
+
+      <h3>トークンの内訳（このセッション）</h3>
+      {models.length === 0 ? (
+        <Empty>まだ1度もモデルを呼んでいない。</Empty>
+      ) : (
+        <div className="scroll-x">
+          <table>
+            <thead>
+              <tr>
+                <th>モデル</th><th className="num">入力</th><th className="num">出力</th>
+                <th className="num">キャッシュ読み</th><th className="num">キャッシュ作成</th>
+                <th className="num">思考</th><th className="num">費用</th>
+              </tr>
+            </thead>
+            <tbody>
+              {models.map(([name, m]) => (
+                <tr key={name}>
+                  <td className="mono">{name}</td>
+                  <td className="num">{tokens(m.inputTokens)}</td>
+                  <td className="num">{tokens(m.outputTokens)}</td>
+                  <td className="num">{tokens(m.cacheReadInputTokens)}</td>
+                  <td className="num">{tokens(m.cacheCreationInputTokens)}</td>
+                  <td className="num">{tokens(m.thinkingTokens)}</td>
+                  <td className="num">{usd(m.costUSD)}</td>
+                </tr>
+              ))}
+              <tr>
+                <td className="muted">合計</td>
+                <td colSpan={5} />
+                <td className="num">{usd(d.usage?.session?.total_cost_usd ?? 0)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <h3>コンテキストの内訳</h3>
       {d.context_error ? <Failed error={d.context_error} /> : <Context v={d.context} />}
+
+      <details>
+        <summary>返ってきたものをそのまま見る</summary>
+        <Json v={{ usage: d.usage, context: d.context }} />
+      </details>
     </>
   )
 }
 
-function Context({ v }: { v: unknown }) {
-  const o = v as { categories?: { name: string; tokens: number }[]; totalTokens?: number
-    maxTokens?: number; percentage?: number } | undefined
-  if (!o?.categories) return <Json v={v} />
+const LIMIT_LABEL: Record<string, string> = {
+  session: 'セッション', five_hour: '5時間',
+  weekly_all: '週（全体）', seven_day: '7日',
+  weekly_opus: '週（Opus）', seven_day_opus: '7日（Opus）',
+}
+
+/** リセットまでの残り。過ぎていれば空。 */
+function until(at?: string) {
+  if (!at) return ''
+  const ms = new Date(at).getTime() - Date.now()
+  if (!Number.isFinite(ms) || ms <= 0) return ''
+  const h = Math.floor(ms / 3_600_000)
+  const m = Math.floor((ms % 3_600_000) / 60_000)
+  return h > 0 ? `あと ${h}時間${m}分` : `あと ${m}分`
+}
+
+function LimitCard({ l }: { l: PlanLimit }) {
+  const pct = Math.min(100, Math.max(0, l.percent ?? 0))
+  // 色は状態（good/warn/critical）であって、系列の識別ではない。
+  // **数字を必ず添える**——色だけで伝えない。
+  const level = pct >= 90 ? 'hot' : pct >= 75 ? 'warm' : 'cool'
+  return (
+    <div className="window">
+      <div className="window-head">
+        <span className="window-kind">
+          {LIMIT_LABEL[l.kind] ?? l.kind}
+          {l.is_active && <span className="tag warn">拘束中</span>}
+        </span>
+        <span className="window-pct">{Math.round(pct)}%</span>
+      </div>
+      <div className="bar" role="meter" aria-valuenow={Math.round(pct)}
+        aria-valuemin={0} aria-valuemax={100}
+        aria-label={`${LIMIT_LABEL[l.kind] ?? l.kind} の使用率`}>
+        <span className={`fill ${level}`} style={{ width: `${pct}%` }} />
+      </div>
+      <div className="window-foot muted">
+        <span>{until(l.resets_at)}</span>
+        <span>{short(l.resets_at)} に戻る</span>
+      </div>
+    </div>
+  )
+}
+
+function usd(n: number) {
+  return '$' + (n ?? 0).toFixed(n >= 1 ? 2 : 4)
+}
+
+function Context({ v }: { v?: ContextPayload }) {
+  if (!v?.categories) return <Empty>コンテキストの内訳が来ていない。</Empty>
+  const max = v.maxTokens ?? 0
   return (
     <>
       <p>
-        {tokens(o.totalTokens ?? 0)} / {tokens(o.maxTokens ?? 0)}（{o.percentage ?? 0}%）
+        {tokens(v.totalTokens ?? 0)} / {tokens(max)}（{v.percentage ?? 0}%）
       </p>
-      <table>
-        <thead><tr><th>分類</th><th>トークン</th></tr></thead>
-        <tbody>
-          {o.categories.map((c) => (
-            <tr key={c.name}><td>{c.name}</td><td className="num">{tokens(c.tokens)}</td></tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="scroll-x">
+        <table>
+          <thead>
+            <tr><th>分類</th><th className="num">トークン</th><th className="num">割合</th></tr>
+          </thead>
+          <tbody>
+            {v.categories.map((c) => (
+              <tr key={c.name}>
+                <td>{c.name}</td>
+                <td className="num">{tokens(c.tokens)}</td>
+                <td className="num muted">
+                  {max > 0 ? ((c.tokens / max) * 100).toFixed(1) + '%' : ''}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </>
   )
 }
@@ -301,12 +419,14 @@ function History({ id }: { id: string }) {
   const h = useAsync(() => api.runtimeApprovals(id, true), [id])
   if (h.loading) return <Loading />
   if (h.error) return <Failed error={h.error} />
-  if (!h.data || h.data.length === 0) return <Empty>承認は一度も来ていない。</Empty>
+  const rows = h.data ?? []
+  if (rows.length === 0) return <Empty>承認は一度も来ていない。</Empty>
+
   return (
     <table>
       <thead><tr><th>工具</th><th>訊かれた</th><th>答え</th><th>理由</th></tr></thead>
       <tbody>
-        {h.data.map((a) => (
+        {rows.map((a) => (
           <tr key={a.id}>
             <td>{a.tool}</td>
             <td>{short(a.asked_at)}</td>

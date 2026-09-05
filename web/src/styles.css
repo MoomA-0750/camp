@@ -160,7 +160,23 @@ label { display: inline-flex; align-items: center; gap: .3rem; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .small { font-size: .85em; }
 
-.tabs { display: flex; gap: .4rem; margin: 1rem 0 .9rem; flex-wrap: wrap; }
+/* **`nav` を使わない。** サイドバーの `nav { flex-direction: column }` を
+   そのまま浴びて、タブが縦積みになる（2026-09-04、実ブラウザで実際にそうなった。
+   テストは DOM を見ていても、この見た目までは見ていなかった）。
+   浴びても倒れないように、向きはここで言い切る。 */
+.tabs {
+  display: flex; flex-direction: row; gap: .4rem;
+  margin: 1rem 0 .9rem; flex-wrap: wrap;
+}
+.tabs button { flex: 0 0 auto; }
+
+/* 状態の札は折り返さない（折り返すと押せる面積が消える）。 */
+.badge { white-space: nowrap; }
+.nowrap { white-space: nowrap; }
+/* 長いパスは表の幅を壊さずに折る。 */
+td.wrap { overflow-wrap: anywhere; width: 100%; }
+/* 横に長い表は、ページ全体ではなく表だけを滑らせる。 */
+.scroll-x { overflow-x: auto; }
 .tabs button {
   background: none; border: 1px solid var(--line); border-radius: .35rem;
   padding: .25rem .7rem; color: var(--muted); cursor: pointer;

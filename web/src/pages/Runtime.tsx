@@ -13,6 +13,11 @@ export default function Runtime() {
   const tab = sp.get('tab') ?? 'sessions'
   const [n, setN] = useState(0)
   const list = useAsync(() => api.runtime(), [n])
+  // **API が null を返しても落ちない。**
+  // Go の nil スライスは JSON で `null` になる。サーバー側でも空配列を
+  // 返すようにしたが、受け手も畳んでおく——2026-09-04 に実ブラウザで
+  // 真っ白になったのがこれ（テストでは出なかった）。
+  const sessions = list.data?.sessions ?? []
   const allow = useAsync(() => api.allowlist(), [n, tab])
 
   const [cwd, setCwd] = useState('')
@@ -50,7 +55,7 @@ export default function Runtime() {
         <code>claude</code> を起こし、campd は決めて記録する。
       </p>
 
-      <nav className="tabs">
+      <div className="tabs">
         <button className={tab === 'sessions' ? 'on' : ''} onClick={() => set({ tab: '' })}>
           走っているもの
         </button>
@@ -60,7 +65,7 @@ export default function Runtime() {
         <button className={tab === 'ssh' ? 'on' : ''} onClick={() => set({ tab: 'ssh' })}>
           接続先の台帳
         </button>
-      </nav>
+      </div>
 
       {tab === 'allow' && <Allowlist reload={() => setN((v) => v + 1)} rows={allow} />}
       {tab === 'ssh' && <SSHLedger />}
@@ -83,25 +88,32 @@ export default function Runtime() {
           </form>
           {err && <Failed error={err} />}
 
-          {list.data && list.data.sessions.length === 0 && (
+          {!list.loading && !list.error && sessions.length === 0 && (
             <Empty>まだ1本も起こしていない。</Empty>
           )}
-          {list.data && list.data.sessions.length > 0 && (
+          {sessions.length > 0 && (
             <table>
               <thead>
-                <tr><th>状態</th><th>場所</th><th>起こした時刻</th><th>pid</th><th>終わり</th></tr>
+                <tr>
+                  <th className="nowrap">状態</th><th>場所</th>
+                  <th className="nowrap">起こした時刻</th><th className="num">pid</th>
+                  <th>終わり</th>
+                </tr>
               </thead>
               <tbody>
-                {list.data.sessions.map((s) => (
+                {sessions.map((s) => (
                   <tr key={s.id}>
-                    <td>
-                      <Link to={`/runtime/${s.id}`}>
-                        <StateBadge state={s.state} />
-                      </Link>
+                    <td className="nowrap">
+                      {/* **開く導線を、折り返す小さなバッジ1つにしない。**
+                          2026-09-04、実ブラウザで押せなかった。場所も含めて
+                          リンクにする。 */}
+                      <Link to={`/runtime/${s.id}`}><StateBadge state={s.state} /></Link>
                     </td>
-                    <td className="mono">{s.cwd}</td>
-                    <td>{short(s.created_at)}</td>
-                    <td>{s.pid || ''}</td>
+                    <td className="mono wrap">
+                      <Link to={`/runtime/${s.id}`}>{s.cwd}</Link>
+                    </td>
+                    <td className="nowrap">{short(s.created_at)}</td>
+                    <td className="num">{s.pid || ''}</td>
                     <td className="muted">{s.exit_reason ?? ''}</td>
                   </tr>
                 ))}
@@ -158,14 +170,17 @@ function Allowlist({ rows, reload }: {
       </form>
       {err && <Failed error={err} />}
       {rows.loading && <Loading />}
-      {rows.data && rows.data.length === 0 && (
+      {/* **null を「まだ読み込み中」と混ぜない。** data が null でも
+          読み終わっていれば「空」と出す——出さないと、何も無い画面が
+          「読めなかった」のか「空だった」のか分からない。 */}
+      {!rows.loading && !rows.error && (rows.data ?? []).length === 0 && (
         <Empty>空。この状態では1本も起こせない。</Empty>
       )}
-      {rows.data && rows.data.length > 0 && (
+      {(rows.data ?? []).length > 0 && (
         <table>
           <thead><tr><th>場所</th><th>覚え書き</th><th>足した時刻</th><th></th></tr></thead>
           <tbody>
-            {rows.data.map((a) => (
+            {(rows.data ?? []).map((a) => (
               <tr key={a.id}>
                 <td className="mono">{a.path}</td>
                 <td>{a.note}</td>
@@ -215,14 +230,16 @@ function SSHLedger() {
       </form>
       {err && <Failed error={err} />}
       {rows.loading && <Loading />}
-      {rows.data && rows.data.length === 0 && <Empty>台帳は空。読み直すと入る。</Empty>}
-      {rows.data && rows.data.length > 0 && (
+      {!rows.loading && !rows.error && (rows.data ?? []).length === 0 && (
+        <Empty>台帳は空。読み直すと入る。</Empty>
+      )}
+      {(rows.data ?? []).length > 0 && (
         <table>
           <thead>
             <tr><th>許可</th><th>エイリアス</th><th>接続先</th><th>Tailscale</th><th>覚え書き</th></tr>
           </thead>
           <tbody>
-            {rows.data.map((d) => (
+            {(rows.data ?? []).map((d) => (
               <tr key={d.id}>
                 <td>
                   <button disabled={!pw}

@@ -143,6 +143,11 @@ func listLive(db *store.DB) ([]Record, error) {
 }
 
 // List は画面と CLI 用。新しい順に n 件。
+//
+// **1件も無いときは空の配列を返す。nil を返さない。**
+// Go の nil スライスは JSON で `null` になる。受け取る側が「配列が来る」
+// 前提で書いていると、そこで落ちる（2026-09-04、実ブラウザで実際に落ちた）。
+// **「まだ無い」と「そもそも無い」を、受け手に区別させない。**
 func List(db *store.DB, n int) ([]Record, error) {
 	if n <= 0 || n > 500 {
 		n = 50
@@ -152,7 +157,7 @@ func List(db *store.DB, n int) ([]Record, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Record
+	out := []Record{}
 	for rows.Next() {
 		r, err := scanOne(rows)
 		if err != nil {

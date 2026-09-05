@@ -2205,15 +2205,26 @@ func whyDenied(sock string, err error) string {
 			}
 		}
 	}
-	if have {
-		return fmt.Sprintf("\n  %s には入っている。campd が動いているか確かめる: systemctl status camp.service", want)
+	return denyAdvice(want, have)
+}
+
+// denyAdvice は言うことを組み立てるだけ。**環境を見ない。**
+//
+// 見ていると、テストが「たまたま入っていた／入っていなかった」で通ったり
+// 落ちたりする（2026-09-05 に実際に起きた。再起動でグループが反映されて、
+// それまで通っていたテストが落ちた）。
+func denyAdvice(group string, inGroup bool) string {
+	if inGroup {
+		return fmt.Sprintf(
+			"\n  %s には入っている。campd が動いているか確かめる: systemctl status camp.service",
+			group)
 	}
 	return fmt.Sprintf(`
   このプロセスは %s グループに入っていない。
   補助グループは起動時に決まるので、usermod のあとに**入り直していない**
   セッションからは繋がらない。
     確認: id -nG | tr ' ' '\n' | grep %s
-    直す: sudo usermod -aG %s $USER   （そのあとログインし直す）`, want, want, want)
+    直す: sudo usermod -aG %s $USER   （そのあとログインし直す）`, group, group, group)
 }
 
 // defaultAgentSock は実行面と話す制御口の場所。報告口と同じ置き場に開く。

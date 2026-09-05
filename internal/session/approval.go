@@ -96,7 +96,7 @@ func openApprovals(db *store.DB, sessionID string) ([]Approval, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Approval
+	out := []Approval{} // **nil を返さない**（JSON で null になる）
 	for rows.Next() {
 		var a Approval
 		if err := rows.Scan(&a.ID, &a.SessionID, &a.RequestID, &a.Tool, &a.Detail,
@@ -160,7 +160,7 @@ func ApprovalHistory(db *store.DB, sessionID string, limit int) ([]Approval, err
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Approval
+	out := []Approval{} // **nil を返さない**（JSON で null になる）
 	for rows.Next() {
 		var a Approval
 		var answered sql.NullString

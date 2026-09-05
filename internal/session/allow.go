@@ -42,7 +42,7 @@ func ListAllowed(db *store.DB) ([]Allowed, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Allowed
+	out := []Allowed{} // **nil を返さない**（JSON で null になる）
 	for rows.Next() {
 		var a Allowed
 		if err := rows.Scan(&a.ID, &a.Path, &a.Note, &a.AddedAt, &a.AddedBy); err != nil {

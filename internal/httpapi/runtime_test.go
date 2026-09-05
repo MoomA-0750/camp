@@ -435,3 +435,25 @@ func TestTooManyOpenStreamsAreRefused(t *testing.T) {
 	}
 	t.Logf("24本のうち %d 本を断った", refused)
 }
+
+// **空の一覧は `[]` で返す。`null` では返さない。**
+//
+// Go の nil スライスは JSON で `null` になる。2026-09-04、実ブラウザで開いて
+// 初めて分かった——画面が `sessions.length` で落ちて真っ白になった。
+// テストは JSON の中身しか見ていなかったので出なかった。
+func TestEmptyListsComeBackAsArraysNotNull(t *testing.T) {
+	ts, c, _ := runtimeServer(t)
+	for _, path := range []string{
+		"/api/runtime", "/api/allowlist", "/api/ssh",
+	} {
+		r, err := c.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		if strings.Contains(string(b), "null") {
+			t.Errorf("%s が null を含む: %s", path, b)
+		}
+	}
+}

@@ -278,6 +278,7 @@ func (l *Log) Broken() bool {
 // 第2の戻り値は「読み手のカーソルより前に落としたものがあるか」。
 // **黙って飛ばさない。** 飛んだことが分かれば、画面は「ここが抜けている」と出せる。
 func (l *Log) Tail(since int64, limit int) (lines []Line, gap bool, err error) {
+	lines = []Line{} // **nil を返さない**（JSON で null になる）
 	oldest, newest, _ := l.Stats()
 	if limit <= 0 || limit > maxTailLines {
 		limit = maxTailLines

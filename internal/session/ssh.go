@@ -34,7 +34,7 @@ func ListDestinations(db *store.DB) ([]Destination, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Destination
+	out := []Destination{} // **nil を返さない**（JSON で null になる）
 	for rows.Next() {
 		var d Destination
 		var allowed int

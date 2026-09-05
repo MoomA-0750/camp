@@ -155,16 +155,26 @@ func TestShorteningNeverPanics(t *testing.T) {
 // usermod のあとに入り直していないセッションからは永久に繋がらない。
 // **Phase 3 で launcher が黙って報告できないのが一番まずい。**
 func TestPermissionDeniedExplainsItself(t *testing.T) {
-	msg := whyDenied("/run/camp/report.sock", os.ErrPermission)
-	if msg == "" {
-		t.Fatal("権限で断られたのに何も説明していない")
-	}
-	for _, want := range []string{"campreport", "id -nG", "usermod"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("説明に %q が無い: %s", want, msg)
+	// **入っていない側。** 直し方を名指しする。
+	out := denyAdvice("campreport", false)
+	for _, want := range []string{"campreport", "id -nG", "usermod", "入り直していない"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("説明に %q が無い: %s", want, out)
 		}
 	}
+	// **入っている側。** グループの話をせず、別の可能性を指す。
+	in := denyAdvice("campreport", true)
+	if strings.Contains(in, "usermod") {
+		t.Errorf("入っているのに usermod を勧めている: %s", in)
+	}
+	if !strings.Contains(in, "systemctl") {
+		t.Errorf("入っているのに、次に何を見るかを言っていない: %s", in)
+	}
 
+	// 権限で断られたなら、必ず何か言う（どちらの枝かは環境しだい）。
+	if whyDenied("/run/camp/report.sock", os.ErrPermission) == "" {
+		t.Error("権限で断られたのに何も説明していない")
+	}
 	// 権限以外の理由には、余計なことを言わない。
 	if got := whyDenied("/run/camp/report.sock", os.ErrNotExist); got != "" {
 		t.Errorf("権限の話ではないのにグループの説明をしている: %s", got)
