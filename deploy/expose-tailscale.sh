@@ -49,6 +49,18 @@ cat <<EOS
 やめるとき:  sudo bash $0 --off
 今の状態  :  tailscale serve status
 
+== うまく入れなかったら ==
+
+「オリジンが違う」と出たら、そのメッセージが**何を見て断ったか**を言う。
+Origin のホストと、campd に届いた Host が食い違っているなら、そのオリジンを
+明示的に許す。camp.service の ExecStart をこうする:
+
+  ExecStart=/usr/local/bin/campd serve -secure-cookie -origin https://$NAME
+
+（メッセージが出ないほど古い campd なら、先に新しいものを入れる:
+  sudo install -o root -g root -m 0755 ./campd /usr/local/bin/campd
+  sudo systemctl daemon-reload && sudo systemctl restart camp.service）
+
 == まだ残っていること ==
 
 Cookie に Secure を付けるなら、camp.service の ExecStart に -secure-cookie を
