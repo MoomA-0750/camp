@@ -135,9 +135,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !isSafeMethod(r.Method) && !sameOrigin(r, s.opts.Origins) {
-		s.fail(w, r, http.StatusForbidden, "オリジンが違う")
-		return
+	if !isSafeMethod(r.Method) {
+		// **断るときは理由を言う。** 「オリジンが違う」だけでは、
+		// 受け取った側に次の一手が無い。
+		if ok, why := checkOrigin(r, s.opts.Origins); !ok {
+			s.log.Warn("オリジンで断った", "path", r.URL.Path, "why", why,
+				"origin", r.Header.Get("Origin"), "host", r.Host,
+				"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"),
+				"remote", r.RemoteAddr)
+			s.fail(w, r, http.StatusForbidden, "オリジンが違う: "+why+
+				"（プロキシの後ろなら campd serve -origin <そのオリジン> で許す）")
+			return
+		}
 	}
 
 	switch {

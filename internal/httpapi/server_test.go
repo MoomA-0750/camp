@@ -439,3 +439,65 @@ func TestViewRoutesRequireAuth(t *testing.T) {
 		}
 	}
 }
+
+// **断るときは理由を言う。**
+//
+// 2026-09-06、ブラウザからのログインが「オリジンが違う」だけで弾かれ、
+// curl では同じヘッダで通ったため再現できなかった。何を見て断ったのかを
+// 返していれば、1回叩くだけで分かったはずだった。
+func TestARefusedOriginSaysWhatItSaw(t *testing.T) {
+	cases := []struct {
+		name, origin, host, site string
+		wantOK                   bool
+		wantIn                   string
+	}{
+		{"同じホスト", "https://camp.example", "camp.example", "same-origin", true, "同じ"},
+		{"別のホスト", "https://evil.example", "camp.example", "cross-site", false, "evil.example"},
+		{"Origin なしのブラウザ", "", "camp.example", "same-origin", true, "Sec-Fetch-Site"},
+		{"他所からの投稿", "", "camp.example", "cross-site", false, "他所"},
+		{"curl", "", "camp.example", "", true, "ブラウザではない"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "http://"+c.host+"/api/login", nil)
+			r.Host = c.host
+			if c.origin != "" {
+				r.Header.Set("Origin", c.origin)
+			}
+			if c.site != "" {
+				r.Header.Set("Sec-Fetch-Site", c.site)
+			}
+			ok, why := checkOrigin(r, nil)
+			if ok != c.wantOK {
+				t.Fatalf("ok=%v（%v のはず）: %s", ok, c.wantOK, why)
+			}
+			if why == "" {
+				t.Fatal("理由が空。断られた側に次の一手が無い")
+			}
+			if !strings.Contains(why, c.wantIn) {
+				t.Errorf("理由に %q が無い: %s", c.wantIn, why)
+			}
+		})
+	}
+}
+
+// 断った理由は、返す本文にも入る（画面に出るのはそれだけなので）。
+func TestTheRefusalReachesTheBrowser(t *testing.T) {
+	ts, _ := newServer(t)
+	req, _ := http.NewRequest("POST", ts.URL+"/api/login",
+		strings.NewReader(`{"password":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://よそ.example")
+	res, err := bare().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d（403 のはず）", res.StatusCode)
+	}
+	b, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(b), "よそ.example") {
+		t.Fatalf("何を見て断ったのかが返っていない: %s", b)
+	}
+}

@@ -226,21 +226,34 @@ func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 // 返さないので、他所からの読み取りはブラウザ側で止まる。書き込みは
 // フォーム投稿で飛ぶのでここで止める。
 func sameOrigin(r *http.Request, allowed []string) bool {
+	ok, _ := checkOrigin(r, allowed)
+	return ok
+}
+
+// checkOrigin は「通すか」と「なぜそう判断したか」を返す。
+//
+// **理由を返すのは、断ったときに何が起きたか言えるようにするため。**
+// 「オリジンが違う」だけを返していたとき、本人も実装側も次に何を見ればいいか
+// 分からなかった（2026-09-06、ブラウザからのログインが弾かれたが、curl では
+// 同じヘッダで通り、再現できなかった）。
+func checkOrigin(r *http.Request, allowed []string) (bool, string) {
 	o := r.Header.Get("Origin")
+	site := r.Header.Get("Sec-Fetch-Site")
 	if o == "" {
 		// Origin を付けない古い経路は、ブラウザからのフォーム投稿とも
 		// 区別が付かない。Sec-Fetch-Site があればそれを見る。
-		switch r.Header.Get("Sec-Fetch-Site") {
+		switch site {
 		case "same-origin", "same-site", "none":
-			return true
+			return true, "Origin なし / Sec-Fetch-Site=" + site
 		case "":
-			return true // 非ブラウザ（curl 等）。Cookie を持っていれば通す
+			// 非ブラウザ（curl 等）。Cookie を持っていれば通す
+			return true, "Origin も Sec-Fetch-Site も無い（ブラウザではない）"
 		}
-		return false
+		return false, "Origin が無く、Sec-Fetch-Site=" + site + "（他所からの投稿）"
 	}
 	for _, a := range allowed {
 		if strings.EqualFold(a, o) {
-			return true
+			return true, "-origin で許してある: " + a
 		}
 	}
 	// スキームを剥がしてホストだけ比べる。プロキシの後ろでは
@@ -249,7 +262,11 @@ func sameOrigin(r *http.Request, allowed []string) bool {
 	if i := strings.Index(host, "://"); i >= 0 {
 		host = host[i+3:]
 	}
-	return host == r.Host
+	if host == r.Host {
+		return true, "Origin のホストが Host と同じ: " + host
+	}
+	return false, fmt.Sprintf("Origin=%q のホスト %q が、届いた Host %q と違う",
+		o, host, r.Host)
 }
 
 // HasPassword はパスワードが設定済みかを返す。
