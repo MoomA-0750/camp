@@ -3,6 +3,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Camp — ログイン</title>
+<!--
+  **スクリプトを置かない。**
+
+  この画面には fetch で送るインラインスクリプトが入っていたが、campd 自身の
+  CSP（default-src 'self'、script-src は未指定）がインラインを止めるので、
+  一度も動いていなかった。動かないぶん素のフォーム投稿に落ち、そちらは
+  Referrer-Policy: no-referrer のせいで Origin: null になって弾かれていた
+  ——**ブラウザからパスワードで入れない状態**だった（2026-09-06 に判明）。
+
+  直し方は「CSP を緩める」ではなく「スクリプトを要らなくする」。
+  素のフォームで送り、結果はサーバー側が描く。
+-->
 <style>
   :root { color-scheme: light dark; }
   body { font: 15px/1.7 system-ui, sans-serif; margin: 0; display: grid;
@@ -15,26 +27,11 @@
   button { cursor: pointer; }
   .err { color: #c0392b; min-height: 1.4em; font-size: .85rem; }
 </style>
-<form id="f" method="post" action="/api/login">
+<form method="post" action="/api/login">
   <h1>Camp</h1>
   <p>会話履歴とVaultをまとめて持つ場所。</p>
   <input type="password" name="password" autocomplete="current-password"
          placeholder="パスワード" required autofocus>
   <button type="submit">入る</button>
-  <div class="err" id="e"></div>
+  <div class="err">%ERR%</div>
 </form>
-<script>
-document.getElementById('f').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const e = document.getElementById('e');
-  e.textContent = '';
-  const res = await fetch('/api/login', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({password: ev.target.password.value}),
-  });
-  if (res.ok) { location.href = '/'; return; }
-  const body = await res.json().catch(() => ({}));
-  e.textContent = body.error || ('失敗しました（' + res.status + '）');
-});
-</script>

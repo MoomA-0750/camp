@@ -2,9 +2,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -173,7 +175,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/", http.StatusFound)
 			return
 		}
-		s.writeHTML(w, s.login)
+		s.writeHTML(w, loginPage(s.login, r.URL.Query().Get("e")))
 		return
 	}
 
@@ -220,32 +222,75 @@ func (s *Server) securityHeaders(w http.ResponseWriter) {
 			"connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 }
 
+// loginPage は %ERR% を埋める。**スクリプトを使わずに理由を出すため。**
+func loginPage(shell []byte, code string) []byte {
+	msg := ""
+	switch code {
+	case "pw":
+		msg = "パスワードが違う"
+	case "busy":
+		msg = "試行が多すぎる。しばらく待つこと"
+	case "none":
+		msg = ErrNoCredential.Error()
+	}
+	return bytes.Replace(shell, []byte("%ERR%"), []byte(html.EscapeString(msg)), 1)
+}
+
+// loginFailed は、素のフォーム投稿ならログイン画面へ戻し、
+// そうでなければ JSON で返す。**画面に生の JSON を出さない。**
+func (s *Server) loginFailed(w http.ResponseWriter, r *http.Request,
+	code int, msg, mark string) {
+	if isFormPost(r) {
+		http.Redirect(w, r, "/login?e="+mark, http.StatusSeeOther)
+		return
+	}
+	s.fail(w, r, code, msg)
+}
+
+func isFormPost(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Content-Type"), "form")
+}
+
 func isSafeMethod(m string) bool {
 	return m == http.MethodGet || m == http.MethodHead || m == http.MethodOptions
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if s.throttle.blocked() {
-		s.fail(w, r, http.StatusTooManyRequests, "試行が多すぎる。しばらく待つこと")
+		s.loginFailed(w, r, http.StatusTooManyRequests,
+			"試行が多すぎる。しばらく待つこと", "busy")
 		return
 	}
-	var body struct {
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
-		// フォーム投稿も受ける（組み込みのログイン画面が JS 無しでも動くように）。
+	// **Content-Type で決める。順に試さない。**
+	//
+	// 以前は「まず JSON、駄目ならフォーム」と書いてあったが、JSON の
+	// デコーダが本文を先に読み切ってしまうので、フォームからは常に空の
+	// パスワードが渡っていた（2026-09-06 に判明。組み込みのログイン画面は
+	// スクリプトが CSP で止まって素のフォーム投稿に落ちるので、
+	// **その経路は一度も通ったことがなかった**）。
+	var pw string
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if isFormPost(r) {
 		if err := r.ParseForm(); err == nil {
-			body.Password = r.PostFormValue("password")
+			pw = r.PostFormValue("password")
+		}
+	} else {
+		var body struct {
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			pw = body.Password
 		}
 	}
-	if err := checkPassword(s.db, body.Password); err != nil {
+	if err := checkPassword(s.db, pw); err != nil {
 		s.throttle.fail()
 		s.log.Warn("ログイン失敗", "remote", r.RemoteAddr, "err", err)
 		if err == ErrNoCredential {
-			s.fail(w, r, http.StatusServiceUnavailable, ErrNoCredential.Error())
+			s.loginFailed(w, r, http.StatusServiceUnavailable,
+				ErrNoCredential.Error(), "none")
 			return
 		}
-		s.fail(w, r, http.StatusUnauthorized, "パスワードが違う")
+		s.loginFailed(w, r, http.StatusUnauthorized, "パスワードが違う", "pw")
 		return
 	}
 	s.throttle.reset()
@@ -258,8 +303,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.setCookie(w, tok, exp)
 	s.log.Info("ログイン", "remote", r.RemoteAddr, "expires", exp.Format(time.RFC3339))
 
-	if strings.Contains(r.Header.Get("Content-Type"), "form") {
-		http.Redirect(w, r, "/", http.StatusFound)
+	if isFormPost(r) {
+		// 303 で GET に落とす。302 だと戻る操作で再投稿になる。
+		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "expires_at": exp})

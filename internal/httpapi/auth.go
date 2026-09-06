@@ -239,17 +239,34 @@ func sameOrigin(r *http.Request, allowed []string) bool {
 func checkOrigin(r *http.Request, allowed []string) (bool, string) {
 	o := r.Header.Get("Origin")
 	site := r.Header.Get("Sec-Fetch-Site")
-	if o == "" {
-		// Origin を付けない古い経路は、ブラウザからのフォーム投稿とも
-		// 区別が付かない。Sec-Fetch-Site があればそれを見る。
+
+	// **`null` は「よそのオリジン」ではなく「オリジンが分からない」。**
+	//
+	// 2026-09-06 に実際に踏んだ。組み込みのログイン画面は素のフォーム投稿に
+	// 落ちる（CSP がインラインスクリプトを止めるため）。素のフォーム投稿で
+	// `Referrer-Policy: no-referrer` が効いていると、Chrome は Origin を
+	// `null` にする。それを「よそ」と読んで、**パスワードでのログインが
+	// ブラウザから一度も通らなかった。**
+	//
+	// 分からないときに見るべきは Sec-Fetch-Site で、これはブラウザが付ける
+	// ので、よそのページからは詐称できない。
+	if o == "" || o == "null" {
+		why := "Origin なし"
+		if o == "null" {
+			why = "Origin=null（素のフォーム投稿など）"
+		}
 		switch site {
 		case "same-origin", "same-site", "none":
-			return true, "Origin なし / Sec-Fetch-Site=" + site
+			return true, why + " / Sec-Fetch-Site=" + site
 		case "":
+			if o == "null" {
+				// ブラウザなのに Sec-Fetch-Site が無い。どこから来たか分からない。
+				return false, "Origin=null で Sec-Fetch-Site も無い（出どころが分からない）"
+			}
 			// 非ブラウザ（curl 等）。Cookie を持っていれば通す
 			return true, "Origin も Sec-Fetch-Site も無い（ブラウザではない）"
 		}
-		return false, "Origin が無く、Sec-Fetch-Site=" + site + "（他所からの投稿）"
+		return false, why + " / Sec-Fetch-Site=" + site + "（他所からの投稿）"
 	}
 	for _, a := range allowed {
 		if strings.EqualFold(a, o) {

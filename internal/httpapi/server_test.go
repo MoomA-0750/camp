@@ -501,3 +501,100 @@ func TestTheRefusalReachesTheBrowser(t *testing.T) {
 		t.Fatalf("何を見て断ったのかが返っていない: %s", b)
 	}
 }
+
+// **ブラウザからパスワードで入れる。**
+//
+// 2026-09-06 まで一度も入れなかった。3つ重なっていた:
+//  1. ログイン画面のインラインスクリプトを、campd 自身の CSP が止めていた
+//  2. 動かないので素のフォーム投稿に落ちる
+//  3. 素のフォーム投稿 + Referrer-Policy: no-referrer で Chrome は
+//     Origin を `null` にする。それを「よそのオリジン」と読んで断っていた
+//
+// トークンURLと curl でしか試していなかったので、全部素通りしていた。
+func TestAPlainFormLoginWorksLikeABrowserSendsIt(t *testing.T) {
+	ts, _ := newServer(t)
+	c := bare()
+
+	form := url.Values{"password": {"correct horse battery"}}
+	req, _ := http.NewRequest("POST", ts.URL+"/api/login",
+		strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Chrome が素のフォーム投稿で送る形。**Origin は null。**
+	req.Header.Set("Origin", "null")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("status=%d（303 のはず）: %s", res.StatusCode, b)
+	}
+	if loc := res.Header.Get("Location"); loc != "/" {
+		t.Fatalf("Location=%q（/ のはず）", loc)
+	}
+	if len(res.Cookies()) == 0 {
+		t.Fatal("Cookie を渡していない")
+	}
+}
+
+// 間違えたときは、生の JSON ではなくログイン画面に理由を出す。
+func TestAFailedFormLoginGoesBackToTheLoginPage(t *testing.T) {
+	ts, _ := newServer(t)
+	form := url.Values{"password": {"ちがう"}}
+	req, _ := http.NewRequest("POST", ts.URL+"/api/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "null")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+
+	res, err := bare().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status=%d（303 のはず）", res.StatusCode)
+	}
+	if loc := res.Header.Get("Location"); loc != "/login?e=pw" {
+		t.Fatalf("Location=%q", loc)
+	}
+
+	// 戻った先に理由が出ている。
+	page, err := bare().Get(ts.URL + "/login?e=pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer page.Body.Close()
+	b, _ := io.ReadAll(page.Body)
+	if !strings.Contains(string(b), "パスワードが違う") {
+		t.Fatalf("理由が画面に出ていない")
+	}
+	if strings.Contains(string(b), "%ERR%") {
+		t.Fatal("差し込み口がそのまま残っている")
+	}
+}
+
+// **ログイン画面にスクリプトを置かない。**
+// 置くと CSP が止めるので、動かないものを置いたことに気づけない。
+func TestTheLoginPageNeedsNoScript(t *testing.T) {
+	ts, _ := newServer(t)
+	res, err := bare().Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if strings.Contains(strings.ToLower(string(b)), "<script") {
+		t.Fatal("ログイン画面にスクリプトがある。CSP が止めるので動かない")
+	}
+	// CSP は緩めない。
+	csp := res.Header.Get("Content-Security-Policy")
+	if strings.Contains(csp, "'unsafe-inline'") &&
+		!strings.Contains(csp, "style-src 'self' 'unsafe-inline'") {
+		t.Fatalf("CSP を緩めて直している: %s", csp)
+	}
+}
