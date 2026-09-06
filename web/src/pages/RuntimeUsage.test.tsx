@@ -58,7 +58,7 @@ test('残量タブに、枠・トークン内訳・コンテキスト・同時�
     return { agent_connected: true, sessions: [] }
   })
   render(
-    <MemoryRouter initialEntries={['/runtime/abc?tab=usage']}>
+    <MemoryRouter initialEntries={['/runtime/abc?tab=usage&live=0']}>
       <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
     </MemoryRouter>)
 
@@ -88,8 +88,98 @@ test('残量が取れないと、その理由が出る', async () => {
     return { agent_connected: true, sessions: [] }
   })
   render(
-    <MemoryRouter initialEntries={['/runtime/abc?tab=usage']}>
+    <MemoryRouter initialEntries={['/runtime/abc?tab=usage&live=0']}>
       <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
     </MemoryRouter>)
   await waitFor(() => expect(screen.getAllByText(/子が答えない/).length).toBe(2))
+})
+
+// **終わったセッションでは流さない。**
+//
+// 何も来ないのに枠（同時16本）を1つ握り続けるだけになる。
+// `?live=0` でも同じ。代わりに1度だけ読んで並べる。
+test('終わったセッションでは EventSource を開かない', async () => {
+  let opened = 0
+  vi.stubGlobal('EventSource', class {
+    constructor() { opened++ }
+    close() {}
+    addEventListener() {}
+  } as unknown as typeof EventSource)
+  vi.stubGlobal('fetch', async (url: string) => ({
+    ok: true, status: 200,
+    json: async () => {
+      if (url.includes('/log')) return { lines: [{ seq: 1, at: '2026-09-06T00:00:00Z', kind: 'result' }], gap: false, newest: 1, dropped: 0 }
+      if (url.startsWith('/api/runtime/')) return []
+      return { agent_connected: true, sessions: [{ id: 'abc', state: 'exited', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+    },
+    text: async () => '',
+  } as unknown as Response))
+
+  render(
+    <MemoryRouter initialEntries={['/runtime/abc']}>
+      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
+    </MemoryRouter>)
+
+  await waitFor(() => expect(screen.getByText(/終わったので流していない/)).toBeTruthy())
+  expect(opened).toBe(0)
+  // 流さなくても、落ちているぶんは読める。
+  await waitFor(() => expect(screen.getByText('result')).toBeTruthy())
+})
+
+test('live=0 なら走っていても流さない', async () => {
+  let opened = 0
+  vi.stubGlobal('EventSource', class {
+    constructor() { opened++ }
+    close() {}
+    addEventListener() {}
+  } as unknown as typeof EventSource)
+  vi.stubGlobal('fetch', async (url: string) => ({
+    ok: true, status: 200,
+    json: async () => {
+      if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
+      if (url.startsWith('/api/runtime/')) return []
+      return { agent_connected: true, sessions: [{ id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+    },
+    text: async () => '',
+  } as unknown as Response))
+
+  render(
+    <MemoryRouter initialEntries={['/runtime/abc?live=0']}>
+      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
+    </MemoryRouter>)
+  await waitFor(() => expect(screen.getByText(/流していない（live=0）/)).toBeTruthy())
+  expect(opened).toBe(0)
+})
+
+// **Camp 自身の問い合わせは会話ではない。** 畳むが、畳んだことは言う。
+test('control_response は流れから畳み、件数を出す', async () => {
+  vi.stubGlobal('EventSource', class { close() {} addEventListener() {} } as unknown as typeof EventSource)
+  vi.stubGlobal('fetch', async (url: string) => ({
+    ok: true, status: 200,
+    json: async () => {
+      if (url.includes('/log')) {
+        return {
+          lines: [
+            { seq: 1, at: '2026-09-06T08:37:20Z', kind: 'assistant' },
+            { seq: 2, at: '2026-09-06T08:37:37Z', kind: 'control_response' },
+            { seq: 3, at: '2026-09-06T08:37:38Z', kind: 'control_response' },
+            { seq: 4, at: '2026-09-06T08:37:20Z', kind: 'result' },
+          ],
+          gap: false, newest: 4, dropped: 0,
+        }
+      }
+      if (url.startsWith('/api/runtime/')) return []
+      return { agent_connected: true, sessions: [{ id: 'abc', state: 'exited', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+    },
+    text: async () => '',
+  } as unknown as Response))
+
+  render(
+    <MemoryRouter initialEntries={['/runtime/abc']}>
+      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
+    </MemoryRouter>)
+
+  await waitFor(() => expect(screen.getByText('result')).toBeTruthy())
+  expect(screen.queryByText('control_response')).toBeNull()
+  expect(screen.getByText(/Camp 自身の問い合わせ 2 件は畳んでいる/)).toBeTruthy()
 })

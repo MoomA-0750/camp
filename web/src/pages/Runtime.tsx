@@ -178,14 +178,19 @@ function Allowlist({ rows, reload }: {
       )}
       {(rows.data ?? []).length > 0 && (
         <table>
-          <thead><tr><th>場所</th><th>覚え書き</th><th>足した時刻</th><th></th></tr></thead>
+          <thead>
+            <tr>
+              <th>場所</th><th className="nowrap">覚え書き</th>
+              <th className="nowrap">足した時刻</th><th></th>
+            </tr>
+          </thead>
           <tbody>
             {(rows.data ?? []).map((a) => (
               <tr key={a.id}>
-                <td className="mono">{a.path}</td>
+                <td className="mono wrap">{a.path}</td>
                 <td>{a.note}</td>
-                <td>{short(a.added_at)}</td>
-                <td>
+                <td className="nowrap">{short(a.added_at)}</td>
+                <td className="nowrap">
                   <button disabled={!pw}
                     onClick={() => void run(() => api.allowlistRemove(a.path, pw))}>外す</button>
                 </td>
@@ -236,12 +241,15 @@ function SSHLedger() {
       {(rows.data ?? []).length > 0 && (
         <table>
           <thead>
-            <tr><th>許可</th><th>エイリアス</th><th>接続先</th><th>Tailscale</th><th>覚え書き</th></tr>
+            <tr>
+              <th className="nowrap">許可</th><th>エイリアス</th><th>接続先</th>
+              <th className="nowrap">Tailscale</th><th>覚え書き</th>
+            </tr>
           </thead>
           <tbody>
             {(rows.data ?? []).map((d) => (
               <tr key={d.id}>
-                <td>
+                <td className="nowrap">
                   <button disabled={!pw}
                     onClick={() => void run(() => api.sshAllow(d.alias, !d.allowed, pw))}>
                     {d.allowed ? '許可済み' : '不許可'}

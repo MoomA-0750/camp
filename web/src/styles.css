@@ -170,6 +170,10 @@ label { display: inline-flex; align-items: center; gap: .3rem; }
 }
 .tabs button { flex: 0 0 auto; }
 
+/* ボタンの中の字は折り返さない。折り返すと「外す」が縦2文字になり、
+   押せる面積が消える（2026-09-06、実ブラウザで実際にそうなった）。 */
+button { white-space: nowrap; }
+
 /* 状態の札は折り返さない（折り返すと押せる面積が消える）。 */
 .badge { white-space: nowrap; }
 .nowrap { white-space: nowrap; }

@@ -17,6 +17,10 @@ export default function RuntimeDetail() {
   const [sp, setSp] = useSearchParams()
   const tab = sp.get('tab') ?? 'stream'
   const follow = sp.get('follow') !== '0'
+  // **流さないで読む**という選択肢を URL に置く。
+  // 終わったセッションを読み返すだけのときや、回線を使いたくないときに、
+  // 開いているだけで枠（同時16本）を1つ潰さないため。
+  const wantLive = sp.get('live') !== '0'
 
   const [lines, setLines] = useState<LogLine[]>([])
   const [gap, setGap] = useState(0)
@@ -30,8 +34,31 @@ export default function RuntimeDetail() {
   const bottom = useRef<HTMLDivElement>(null)
 
   // SSE で追いかける。**繋がなくても子は走る**ので、切れても壊れない。
+  //
+  // 終わったセッションでは繋がない。何も流れてこないのに枠を1つ握り続ける
+  // だけになる（枠は全体で16本）。代わりに1度だけ読んで並べる。
+  // **状態が分かるまで繋がない。** 分かる前に繋ぐと、終わったセッションを
+  // 開いただけでも一瞬だけ枠を取る。
+  const known = !!list.data
+  const done = rec?.state === 'exited'
+  const streaming = wantLive && known && !done
+
   useEffect(() => {
-    if (!id) return
+    if (!id || streaming) return
+    let alive = true
+    api.runtimeLog(id, 0, 500).then(
+      (r) => {
+        if (!alive) return
+        setLines(r.lines ?? [])
+        if (r.gap) setGap(r.dropped || -1)
+      },
+      () => { /* 落とし先が無いだけのこともある。空のまま出す */ },
+    )
+    return () => { alive = false }
+  }, [id, streaming, tick])
+
+  useEffect(() => {
+    if (!id || !streaming) return
     const es = new EventSource(`/api/runtime/${encodeURIComponent(id)}/stream`)
     es.onopen = () => setLive(true)
     es.onerror = () => setLive(false)
@@ -49,11 +76,21 @@ export default function RuntimeDetail() {
       try { setGap(JSON.parse((e as MessageEvent).data).dropped ?? 0) } catch { setGap(-1) }
     })
     return () => es.close()
-  }, [id])
+  }, [id, streaming])
+
+  // Camp が子へ投げた制御の返事は、会話ではない（残量の取得など）。
+  // **落とし先からは消さない。** 画面で畳むだけ。
+  const shown = lines.filter((l) => l.kind !== 'control_response')
+  const hidden = lines.length - shown.length
 
   useEffect(() => {
-    if (follow) bottom.current?.scrollIntoView({ block: 'end' })
-  }, [lines.length, follow])
+    // scrollIntoView は無い環境がある（古い WebView、テストの DOM）。
+    // **無いだけで画面ごと落とさない。**
+    const el = bottom.current
+    if (follow && typeof el?.scrollIntoView === 'function') {
+      el.scrollIntoView({ block: 'end' })
+    }
+  }, [shown.length, follow])
 
   const set = (patch: Record<string, string>) => {
     const next = new URLSearchParams(sp)
@@ -99,7 +136,15 @@ export default function RuntimeDetail() {
         <>
           <Talk id={id} state={rec?.state} onSent={() => setTick((v) => v + 1)} />
           <p className="sub muted">
-            {live ? '繋がっている' : '繋がっていない（子は走り続ける）'}
+            {!streaming
+              ? (done ? '終わったので流していない' : '流していない（live=0）')
+              : live ? '繋がっている' : '繋がっていない（子は走り続ける）'}
+            {' · '}
+            <label>
+              <input type="checkbox" checked={wantLive}
+                onChange={(e) => set({ live: e.target.checked ? '' : '0' })} />
+              流す
+            </label>
             {' · '}
             <label>
               <input type="checkbox" checked={follow}
@@ -114,8 +159,14 @@ export default function RuntimeDetail() {
             </p>
           )}
           {lines.length === 0 && <Empty>まだ何も流れていない。</Empty>}
+          {hidden > 0 && (
+            <p className="sub muted">
+              Camp 自身の問い合わせ {hidden} 件は畳んでいる（残量の取得など。
+              会話ではない）。落とし先には残っている。
+            </p>
+          )}
           <div className="stream">
-            {lines.map((ln) => (
+            {shown.map((ln) => (
               <div key={ln.seq} className="frame">
                 <span className="muted mono">{ln.at.slice(11, 19)}</span>{' '}
                 <span className="kind">{ln.kind}</span>{' '}
