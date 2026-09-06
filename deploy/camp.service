@@ -10,10 +10,16 @@ Group=camp
 
 # 実体は root のもの。**エージェントと同じユーザーからは差し替えられない。**
 # リポジトリ内の ./campd を指してはいけない（そこは書き換えられる）。
-ExecStart=/usr/local/bin/campd serve
+# -secure-cookie は「Cookie を HTTPS でしか出さない」。
+# tailnet へ出すとき（deploy/expose-tailscale.sh）は付ける。
+# 127.0.0.1 は安全な文脈として扱われるので、付けてもローカルからは入れる。
+ExecStart=/usr/local/bin/campd serve -secure-cookie
 
 # DB は camp のもの。0700 のディレクトリに置く。
 Environment=CAMP_DB=/var/lib/camp/camp.sqlite
+# **待ち受けは 127.0.0.1 のまま。** 外から使うときも、ここは変えない。
+# Tailscale が :443 で終端して、ここへ渡す（deploy/expose-tailscale.sh）。
+# 0.0.0.0 にすると LAN からも触れてしまう。
 Environment=CAMP_ADDR=127.0.0.1:8785
 # 読むだけ。ACL で camp に読み取りを与えてある。
 Environment=CAMP_CLAUDE_PROJECTS=/home/mooma-0750/.claude/projects
