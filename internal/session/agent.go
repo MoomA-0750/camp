@@ -479,6 +479,14 @@ func (a *Agent) toChild(m Msg, frame []byte) {
 	k.stdin.Write(append(frame, '\n'))
 }
 
+// DenyReason は拒否の理由。**空にしない。**
+func DenyReason(message string) string {
+	if strings.TrimSpace(message) == "" {
+		return "本人が拒否した"
+	}
+	return message
+}
+
 func userFrame(text string) []byte {
 	b, _ := json.Marshal(map[string]any{
 		"type":    "user",
@@ -490,7 +498,15 @@ func userFrame(text string) []byte {
 func approveFrame(reqID, behavior, message string) []byte {
 	resp := map[string]any{"behavior": behavior}
 	if behavior == "deny" {
-		resp["message"] = message
+		// **理由を空で送らない。**
+		//
+		// 空だと、CLI は中身の無い tool_result（is_error: true）を会話へ
+		// 積む。API はそれを 400 で弾き、**その1件が履歴に残る以上、
+		// 以後どの発言も通らなくなる**——セッションが死ぬ。
+		// 2026-09-07 に本人が踏んだ:
+		//   messages.15.content.0.tool_result: content cannot be empty
+		//   if `is_error` is true
+		resp["message"] = DenyReason(message)
 	}
 	b, _ := json.Marshal(map[string]any{
 		"type": "control_response",

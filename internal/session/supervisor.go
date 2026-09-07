@@ -275,6 +275,11 @@ func (s *Supervisor) Approve(id, reqID, behavior, message string) error {
 		return fmt.Errorf("その承認はもう答えてある（または待っていない）: %s", reqID)
 	}
 
+	if behavior == "deny" {
+		// **理由を空のまま先へ渡さない。** 空だと子の会話が壊れて、
+		// 以後どの発言も通らなくなる（agent.go の approveFrame 参照）。
+		message = DenyReason(message)
+	}
 	if err := agent.send(Msg{
 		T: MsgApprove, Session: id, Token: token,
 		ReqID: reqID, Behavior: behavior, Text: message,

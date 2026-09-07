@@ -1237,3 +1237,65 @@ func TestAPIDOwnedBySomeoneElseIsRefused(t *testing.T) {
 	}
 	_ = sock
 }
+
+// **拒否の理由を空で送らない。**
+//
+// 2026-09-07、本人が拒否を1回押しただけでセッションが死んだ:
+//
+//	API Error: 400 messages.15.content.0.tool_result:
+//	content cannot be empty if `is_error` is true
+//
+// 空の理由は、中身の無い tool_result（is_error: true）として会話に積まれる。
+// API はそれを弾き、**その1件が履歴に残る以上、以後どの発言も通らない。**
+// 承認が要らない発言まで通らなくなり、セッションは作り直すしかなくなる。
+func TestADenialNeverCarriesAnEmptyReason(t *testing.T) {
+	for _, in := range []string{"", " ", "\n", "\t "} {
+		frame := approveFrame("r-1", "deny", in)
+		var f map[string]any
+		if err := json.Unmarshal(frame, &f); err != nil {
+			t.Fatal(err)
+		}
+		resp := f["response"].(map[string]any)["response"].(map[string]any)
+		msg, _ := resp["message"].(string)
+		if strings.TrimSpace(msg) == "" {
+			t.Fatalf("理由が空のまま送っている（入力 %q）: %s", in, frame)
+		}
+	}
+	// 理由があれば、そのまま渡す。
+	frame := approveFrame("r-1", "deny", "その場所は触らせない")
+	if !strings.Contains(string(frame), "その場所は触らせない") {
+		t.Fatalf("与えた理由が消えている: %s", frame)
+	}
+	// 許可には message を付けない。
+	frame = approveFrame("r-1", "allow", "")
+	if strings.Contains(string(frame), "message") {
+		t.Fatalf("許可に message が入っている: %s", frame)
+	}
+}
+
+// campd 側でも埋める。実行面が古くても、空は渡らない。
+func TestTheSupervisorFillsInADenialReason(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	rec, err := s.Start("test", allowHere(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(rec.ID, "r", "deny", ""); err != nil {
+		t.Fatal(err)
+	}
+	hist, err := ApprovalHistory(db, rec.ID, 10)
+	if err != nil || len(hist) != 1 {
+		t.Fatalf("履歴が読めない: %v", err)
+	}
+	if hist[0].Behavior != "deny" {
+		t.Fatalf("拒否として残っていない: %+v", hist[0])
+	}
+	if !auditHasSilent(db, "tool.approve", "本人が拒否した") {
+		t.Fatal("実際に送った理由が監査ログに残っていない")
+	}
+}

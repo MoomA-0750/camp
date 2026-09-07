@@ -1300,3 +1300,106 @@ done
 		t.Fatal("承認の要否を画面から変えられてしまう")
 	}
 }
+
+// **拒否したあとも、セッションが続く。**
+//
+// 2026-09-07、本人が拒否を1回押しただけでセッションが死んだ。空の理由が
+// 中身の無い tool_result として会話に積まれ、API が 400 を返し、
+// **その1件が履歴に残る以上、以後どの発言も通らなくなった。**
+//
+//	CAMP_E2E_CLAUDE=1 go test ./internal/session/ -run DenyThenContinue -v
+func TestDenyThenContinueWithRealClaude(t *testing.T) {
+	if os.Getenv("CAMP_E2E_CLAUDE") == "" {
+		t.Skip("CAMP_E2E_CLAUDE=1 のときだけ走らせる（本物を呼ぶ）")
+	}
+	bin := os.Getenv("CAMP_CLAUDE_BIN")
+	if bin == "" {
+		bin = os.Getenv("HOME") + "/.local/bin/claude"
+	}
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("claude が無い: %v", err)
+	}
+
+	db := newDB(t)
+	s := New(db)
+	sock := filepath.Join(t.TempDir(), "a.sock")
+	c, err := s.Listen(sock, "", os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go c.Serve()
+	defer c.Close()
+
+	a := NewAgent(sock, bin)
+	a.Scope = false
+	a.LogDir = t.TempDir()
+	if err := a.Dial("deny-e2e"); err != nil {
+		t.Fatal(err)
+	}
+	go a.Run()
+	defer a.conn.Close()
+	waitFor(t, 5*time.Second, func() bool { return s.AgentConnected() })
+
+	work := allowHere(t, db)
+	rec, err := s.Start("deny-e2e", work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop(rec.ID, StopTerminate)
+	waitFor(t, 60*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	// 1ターン目: 承認を出させて、**拒否する**。
+	if err := s.Input(rec.ID, "Write a file named nope.txt containing x here, then say done."); err != nil {
+		t.Fatal(err)
+	}
+	var denied int
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, req := range pendingQuiet(s, rec.ID) {
+				if err := s.Approve(rec.ID, req, "deny", ""); err == nil {
+					denied++
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	waitFor(t, 180*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	close(stop)
+	if denied == 0 {
+		t.Fatal("承認が来なかった。この test は拒否を試せていない")
+	}
+
+	// 2ターン目: **承認の要らない発言が通る。**
+	before := len(framesOf(t, s, rec.ID))
+	if err := s.Input(rec.ID, "Say exactly: still alive"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 120*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	for _, ln := range framesOf(t, s, rec.ID)[before:] {
+		if strings.Contains(string(ln.Frame), "API Error") {
+			t.Fatalf("拒否のあとに会話が壊れている: %s", firstN(string(ln.Frame), 300))
+		}
+	}
+	t.Logf("%d 回拒否したあとも、続けて話せた", denied)
+}
+
+func pendingQuiet(s *Supervisor, id string) []string {
+	got, _ := s.Pending(id)
+	return got
+}
+
+func framesOf(t *testing.T, s *Supervisor, id string) []Line {
+	t.Helper()
+	r, err := s.Tail(id, 0, maxTailLines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r.Lines
+}
