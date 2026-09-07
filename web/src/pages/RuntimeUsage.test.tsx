@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import RuntimeDetail from './RuntimeDetail'
 
@@ -182,4 +182,65 @@ test('control_response は流れから畳み、件数を出す', async () => {
   await waitFor(() => expect(screen.getByText('result')).toBeTruthy())
   expect(screen.queryByText('control_response')).toBeNull()
   expect(screen.getByText(/Camp 自身の問い合わせ 2 件は畳んでいる/)).toBeTruthy()
+})
+
+// **上へ遡っている最中は引き戻さない。**
+//
+// 2026-09-07、承認の枠を見ようとしても 0.5 秒おきに最下へ飛ばされて、
+// 触ることも読むこともできなかった。追うのは「末尾に居るとき」だけにする。
+test('上へ遡ったら、新しい行が来ても引き戻さない', async () => {
+  let seq = 0
+  const listeners: ((e: MessageEvent) => void)[] = []
+  vi.stubGlobal('EventSource', class {
+    set onmessage(f: (e: MessageEvent) => void) { listeners.push(f) }
+    close() {}
+    addEventListener() {}
+  } as unknown as typeof EventSource)
+  vi.stubGlobal('fetch', async (url: string) => ({
+    ok: true, status: 200,
+    json: async () => {
+      if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
+      if (url.startsWith('/api/runtime/')) return []
+      return { agent_connected: true, sessions: [{ id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+    },
+    text: async () => '',
+  } as unknown as Response))
+
+  const { container } = render(
+    <MemoryRouter initialEntries={['/runtime/abc']}>
+      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
+    </MemoryRouter>)
+
+  await waitFor(() => expect(listeners.length).toBeGreaterThan(0))
+  const box = container.querySelector('.stream') as HTMLDivElement
+
+  // 箱の大きさを装う（jsdom はレイアウトしない）。
+  Object.defineProperty(box, 'scrollHeight', { value: 1000, configurable: true })
+  Object.defineProperty(box, 'clientHeight', { value: 200, configurable: true })
+
+  const push = () => act(() => {
+    seq++
+    listeners[0](new MessageEvent('message', {
+      data: JSON.stringify({ seq, at: '2026-09-07T00:00:00Z', kind: 'assistant' }),
+    }))
+  })
+
+  // 末尾に居るあいだは追う。
+  push()
+  await waitFor(() => expect(box.scrollTop).toBe(1000))
+
+  // 上へ遡る。
+  box.scrollTop = 0
+  act(() => { box.dispatchEvent(new Event('scroll', { bubbles: true })) })
+
+  // 新しい行が来ても、引き戻さない。
+  push()
+  await waitFor(() => expect(screen.getAllByText('assistant').length).toBe(2))
+  expect(box.scrollTop).toBe(0)
+
+  // 末尾へ戻せば、また追う。
+  box.scrollTop = 800
+  act(() => { box.dispatchEvent(new Event('scroll', { bubbles: true })) })
+  push()
+  await waitFor(() => expect(box.scrollTop).toBe(1000))
 })

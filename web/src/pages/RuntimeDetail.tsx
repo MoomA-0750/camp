@@ -31,7 +31,12 @@ export default function RuntimeDetail() {
   const rec = (list.data?.sessions ?? []).find((s) => s.id === id)
   const waiting = useAsync(() => api.runtimeApprovals(id), [id, tick])
 
-  const bottom = useRef<HTMLDivElement>(null)
+  // 流れは**この箱の中だけ**を動かす。ページごと動かすと、上に出ている
+  // 承認の枠が視界から飛んでいって、答えられなくなる（2026-09-07 に実際に
+  // そうなった。0.5秒ごとに最下へ引き戻されて、読むことすらできなかった）。
+  const box = useRef<HTMLDivElement>(null)
+  // 末尾に居るときだけ追う。**上へ遡っている最中は引き戻さない。**
+  const stick = useRef(true)
 
   // SSE で追いかける。**繋がなくても子は走る**ので、切れても壊れない。
   //
@@ -84,13 +89,20 @@ export default function RuntimeDetail() {
   const hidden = lines.length - shown.length
 
   useEffect(() => {
-    // scrollIntoView は無い環境がある（古い WebView、テストの DOM）。
-    // **無いだけで画面ごと落とさない。**
-    const el = bottom.current
-    if (follow && typeof el?.scrollIntoView === 'function') {
-      el.scrollIntoView({ block: 'end' })
-    }
+    const el = box.current
+    // **増えたときだけ動かす。** 何も増えていないのに動かすと、
+    // 読んでいる途中で毎回引き戻される。
+    if (!el || !follow || !stick.current) return
+    el.scrollTop = el.scrollHeight
   }, [shown.length, follow])
+
+  // 上へ遡ったら追うのをやめ、末尾へ戻したら再開する。
+  const onScroll = () => {
+    const el = box.current
+    if (!el) return
+    const slack = el.scrollHeight - el.scrollTop - el.clientHeight
+    stick.current = slack < 24
+  }
 
   const set = (patch: Record<string, string>) => {
     const next = new URLSearchParams(sp)
@@ -161,11 +173,10 @@ export default function RuntimeDetail() {
           {lines.length === 0 && <Empty>まだ何も流れていない。</Empty>}
           {hidden > 0 && (
             <p className="sub muted">
-              Camp 自身の問い合わせ {hidden} 件は畳んでいる（残量の取得など。
-              会話ではない）。落とし先には残っている。
+              Camp 自身の問い合わせ {hidden} 件は畳んでいる。
             </p>
           )}
-          <div className="stream">
+          <div className="stream" ref={box} onScroll={onScroll}>
             {shown.map((ln) => (
               <div key={ln.seq} className="frame">
                 <span className="muted mono">{ln.at.slice(11, 19)}</span>{' '}
@@ -173,7 +184,6 @@ export default function RuntimeDetail() {
                 <span className="mono">{summarize(ln)}</span>
               </div>
             ))}
-            <div ref={bottom} />
           </div>
         </>
       )}
@@ -325,8 +335,7 @@ function Usage({ id }: { id: string }) {
     <>
       {d.warning && <p className="warn">{d.warning}</p>}
       <p className="sub muted">
-        同時に走っているのは {d.running} / {d.max} 本。
-        <strong>4コアしかない</strong>ので、先に効くのはメモリではなくCPU。
+        同時に走っているのは {d.running} / {d.max} 本（4コア）。
         {d.usage?.subscription_type ? ` / プラン ${d.usage.subscription_type}` : ''}
       </p>
 

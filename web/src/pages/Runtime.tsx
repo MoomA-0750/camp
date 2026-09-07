@@ -50,10 +50,7 @@ export default function Runtime() {
   return (
     <>
       <h2>セッション駆動</h2>
-      <p className="sub muted">
-        Camp が起こしたセッション。実行面（<code>campd agent</code>）が本人のユーザーで
-        <code>claude</code> を起こし、campd は決めて記録する。
-      </p>
+      <p className="sub muted">Camp が起こしたセッション。</p>
 
       <div className="tabs">
         <button className={tab === 'sessions' ? 'on' : ''} onClick={() => set({ tab: '' })}>
@@ -156,9 +153,8 @@ function Allowlist({ rows, reload }: {
   return (
     <>
       <p className="sub muted">
-        ここに無い場所ではセッションを起こせない（既定は deny）。
-        <strong>変更にはパスワードの再入力が要る</strong>——Cookie を盗られただけで
-        境界を広げられてはいけないため。
+        ここに無い場所ではセッションを起こせない。
+        <strong>変更にはパスワードの再入力が要る。</strong>
       </p>
       <form className="filters" onSubmit={(e) => e.preventDefault()}>
         <input type="text" placeholder="許すディレクトリ（絶対パス）" value={path}
@@ -222,9 +218,8 @@ function SSHLedger() {
   return (
     <>
       <p className="sub muted">
-        <code>~/.ssh/config</code> は<strong>読むだけ</strong>。Camp が書き戻すことはない。
-        取り込みで許可は変わらない。<strong>リモート起動は Phase 3 では行わない</strong>
-        ——ここで作るのは台帳と許可だけ。
+        <code>~/.ssh/config</code> は<strong>読むだけ</strong>で、書き戻さない。
+        取り込みで許可は変わらない。<strong>繋ぐのはまだできない。</strong>
       </p>
       <form className="filters" onSubmit={(e) => e.preventDefault()}>
         <button onClick={() => void run(() => api.sshScan())}>
