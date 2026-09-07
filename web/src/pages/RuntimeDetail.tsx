@@ -37,6 +37,9 @@ export default function RuntimeDetail() {
   const box = useRef<HTMLDivElement>(null)
   // 末尾に居るときだけ追う。**上へ遡っている最中は引き戻さない。**
   const stick = useRef(true)
+  // どこまで受け取ったか。**繋ぎ直しのたびに先頭から流し直させない。**
+  // 覚えていないと、繋ぎ直すたびに同じ行が積み上がる（2026-09-07 に実測）。
+  const lastSeq = useRef(0)
 
   // SSE で追いかける。**繋がなくても子は走る**ので、切れても壊れない。
   //
@@ -54,7 +57,9 @@ export default function RuntimeDetail() {
     api.runtimeLog(id, 0, 500).then(
       (r) => {
         if (!alive) return
-        setLines(r.lines ?? [])
+        const got = r.lines ?? []
+        setLines(got)
+        if (got.length > 0) lastSeq.current = got[got.length - 1].seq
         if (r.gap) setGap(r.dropped || -1)
       },
       () => { /* 落とし先が無いだけのこともある。空のまま出す */ },
@@ -64,12 +69,17 @@ export default function RuntimeDetail() {
 
   useEffect(() => {
     if (!id || !streaming) return
-    const es = new EventSource(`/api/runtime/${encodeURIComponent(id)}/stream`)
+    const es = new EventSource(
+      `/api/runtime/${encodeURIComponent(id)}/stream?since=${lastSeq.current}`)
     es.onopen = () => setLive(true)
     es.onerror = () => setLive(false)
     es.onmessage = (e) => {
       try {
         const ln = JSON.parse(e.data) as LogLine
+        // **同じ番号を二度入れない。** 繋ぎ直しの取りこぼしを直すのは
+        // since だが、取り違えの保険はここにも要る。
+        if (ln.seq <= lastSeq.current) return
+        lastSeq.current = ln.seq
         setLines((prev) => (prev.length > 2000 ? [...prev.slice(-1500), ln] : [...prev, ln]))
         if (ln.kind === 'result' || ln.kind.startsWith('control_request')) {
           setTick((v) => v + 1) // 状態と承認を取り直す
@@ -148,12 +158,13 @@ export default function RuntimeDetail() {
         <>
           <Talk id={id} state={rec?.state} onSent={() => setTick((v) => v + 1)} />
           <p className="sub muted">
-            {!streaming
-              ? (done ? '終わったので流していない' : '流していない（live=0）')
-              : live ? '繋がっている' : '繋がっていない（子は走り続ける）'}
+            {!known ? '状態を確かめている'
+              : !wantLive ? '流していない（live=0）'
+                : done ? '終わったので流していない'
+                  : live ? '繋がっている' : '繋がっていない（子は走り続ける）'}
             {' · '}
             <label>
-              <input type="checkbox" checked={wantLive}
+              <input type="checkbox" checked={wantLive} aria-label="流す"
                 onChange={(e) => set({ live: e.target.checked ? '' : '0' })} />
               流す
             </label>

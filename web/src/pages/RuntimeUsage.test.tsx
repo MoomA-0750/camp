@@ -244,3 +244,58 @@ test('上へ遡ったら、新しい行が来ても引き戻さない', async ()
   push()
   await waitFor(() => expect(box.scrollTop).toBe(1000))
 })
+
+// **繋ぎ直しても、同じ行が積み上がらない。**
+//
+// 2026-09-07、画面が震えるたびに流れを繋ぎ直し、そのつど先頭から流し直されて
+// 同じ行が何度も並んだ。どこまで受け取ったかを覚えて、そこから続ける。
+test('繋ぎ直しは、受け取った続きから', async () => {
+  const urls: string[] = []
+  const listeners: ((e: MessageEvent) => void)[] = []
+  vi.stubGlobal('EventSource', class {
+    constructor(u: string) { urls.push(u) }
+    set onmessage(f: (e: MessageEvent) => void) { listeners.push(f) }
+    close() {}
+    addEventListener() {}
+  } as unknown as typeof EventSource)
+  vi.stubGlobal('fetch', async (url: string) => ({
+    ok: true, status: 200,
+    json: async () => {
+      if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
+      if (url.startsWith('/api/runtime/')) return []
+      return { agent_connected: true, sessions: [{ id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+    },
+    text: async () => '',
+  } as unknown as Response))
+
+  render(
+    <MemoryRouter initialEntries={['/runtime/abc']}>
+      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
+    </MemoryRouter>)
+  await waitFor(() => expect(listeners.length).toBeGreaterThan(0))
+
+  // 最初は先頭から。
+  expect(urls[0]).toContain('since=0')
+
+  const push = (seq: number) => act(() => {
+    listeners[listeners.length - 1](new MessageEvent('message', {
+      data: JSON.stringify({ seq, at: '2026-09-07T00:00:00Z', kind: 'assistant' }),
+    }))
+  })
+  push(1); push(2)
+  await waitFor(() => expect(screen.getAllByText('assistant').length).toBe(2))
+
+  // 同じ番号がもう一度来ても、増えない。
+  push(1); push(2)
+  expect(screen.getAllByText('assistant').length).toBe(2)
+  push(3)
+  await waitFor(() => expect(screen.getAllByText('assistant').length).toBe(3))
+
+  // **繋ぎ直したら、続きから。** 先頭からやり直すと、同じ行が積み上がる。
+  const before = urls.length
+  act(() => { (screen.getByLabelText('流す') as HTMLInputElement).click() })  // 止める
+  await waitFor(() => expect(screen.getByText(/流していない（live=0）/)).toBeTruthy())
+  act(() => { (screen.getByLabelText('流す') as HTMLInputElement).click() })  // 繋ぎ直す
+  await waitFor(() => expect(urls.length).toBeGreaterThan(before))
+  expect(urls[urls.length - 1]).toContain('since=3')
+})

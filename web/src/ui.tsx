@@ -1,15 +1,22 @@
 import { useEffect, useState } from 'react'
 
-/** 読み込み中・失敗・中身の3状態をまとめて扱う。画面ごとに書かない。 */
+/**
+ * 読み込み中・失敗・中身の3状態をまとめて扱う。画面ごとに書かない。
+ *
+ * **読み直しのあいだ、前の中身を消さない。** 消すと、定期的に読み直す画面が
+ * 「出る／消える」を繰り返して上下に震える（2026-09-07、セッションの画面で
+ * 実際にそうなった。しかも中身が消えているあいだに別の判断が走って、
+ * 流れを繋ぎ直し、同じ行をもう一度受け取る、という輪になっていた）。
+ */
 export function useAsync<T>(fn: () => Promise<T>, deps: unknown[]) {
   const [state, setState] = useState<{ data?: T; error?: string; loading: boolean }>(
     { loading: true })
   useEffect(() => {
     let alive = true
-    setState({ loading: true })
+    setState((prev) => ({ ...prev, loading: true, error: undefined }))
     fn().then(
       (data) => { if (alive) setState({ data, loading: false }) },
-      (e: Error) => { if (alive) setState({ error: e.message, loading: false }) },
+      (e: Error) => { if (alive) setState((prev) => ({ ...prev, error: e.message, loading: false })) },
     )
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
