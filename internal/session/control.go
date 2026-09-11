@@ -292,6 +292,30 @@ func (c *Control) readopt(held []Held) {
 				scope = h.Scope
 			}
 		}
+		// **向こうの身元も台帳と照らす。** started が届く前に campd が落ちていれば、
+		// 台帳は向こうの pid をまだ知らない。そのときは名乗りを採って書く。
+		// 知っているなら、違うものは採らない（手元の pid と同じ理由）。
+		ro := h.RemoteOwner
+		if r.Host != "" {
+			why := ""
+			switch {
+			case ro == nil || ro.PID <= 0 || ro.Started == 0:
+				why = "向こうの身元を名乗らなかった"
+			case ro.Host != r.Host:
+				why = fmt.Sprintf("台帳は %s なのに %s の子を名乗った", r.Host, ro.Host)
+			case !under(ro.Cwd, ro.Root):
+				why = "向こうで降りた先が許した場所の外と名乗った"
+			case r.RemotePID != 0 && (ro.PID != r.RemotePID || ro.Started != r.RemoteStarted):
+				why = fmt.Sprintf("台帳の向こうの pid %d/%d と違うものを名乗った", r.RemotePID, r.RemoteStarted)
+			}
+			if why != "" {
+				s.audit(h.ID, "session.readopt", r.Host, why, audit.Denied)
+				continue
+			}
+		} else if ro != nil {
+			s.audit(h.ID, "session.readopt", ro.Host, "このマシンの行なのに向こうの子を名乗った", audit.Denied)
+			continue
+		}
 		s.mu.Lock()
 		if s.live[h.ID] != nil {
 			s.mu.Unlock()
@@ -305,10 +329,17 @@ func (c *Control) readopt(held []Held) {
 			r.State = StateIdle
 		}
 		r.PID, r.Started, r.BootID, r.Scope = o.PID, o.Started, o.BootID, scope
+		if ro != nil {
+			r.Cwd, r.RemotePID, r.RemoteStarted = ro.Cwd, ro.PID, ro.Started
+			r.RemoteBootID, r.RemoteScope = ro.BootID, ro.Scope
+		}
 		s.live[h.ID] = &liveSession{rec: r, token: h.Token, last: s.Now(),
 			turn: turnStartFor(r.State, s.Now()), asked: map[string]bool{}}
 		s.mu.Unlock()
 		_ = setOwner(s.db, h.ID, o, scope)
+		if ro != nil {
+			_ = setRemote(s.db, h.ID, *ro)
+		}
 		_ = setState(s.db, h.ID, r.State)
 		// 見張りは戻った。「見張りが外れていた」の控えはもう理由にならない。
 		_ = clearOrphanCause(s.db, h.ID)
@@ -341,6 +372,10 @@ func (c *Control) reapOrphans(a *agentConn) {
 		adopted := c.s.live[r.ID] != nil
 		c.s.mu.Unlock()
 		if adopted {
+			continue
+		}
+		if r.Host != "" {
+			c.s.askRemoteReap(r, true)
 			continue
 		}
 		a.send(Msg{T: MsgReap, Session: r.ID, PID: r.PID,
@@ -393,13 +428,51 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			o.BootID = BootID()
 		}
 
+		// **向こうの身元は確かめられない。** 実行面の報告を記録するだけ。
+		// ただし、頼んだホストのものか・許した場所の中と言っているかは照らす。
+		s.mu.Lock()
+		host := ls.rec.Host
+		s.mu.Unlock()
+		ro := m.RemoteOwner
+		if host != "" {
+			why := ""
+			switch {
+			case ro == nil || ro.PID <= 0:
+				why = "向こうの身元が来ない"
+			case ro.Host != host:
+				why = fmt.Sprintf("頼んだのは %s なのに %s の子を名乗った", host, ro.Host)
+			case !under(ro.Cwd, ro.Root):
+				why = fmt.Sprintf("向こうで降りた先が許した場所の外（%s）", ro.Cwd)
+			}
+			if why != "" {
+				_ = a.send(Msg{T: MsgStop, Session: m.Session, Token: m.Token, Mode: StopTerminate})
+				s.audit(m.Session, "session.started", host, why, audit.Denied)
+				s.fail(m.Session, why, EndStartFailed)
+				return
+			}
+		} else if ro != nil {
+			_ = a.send(Msg{T: MsgStop, Session: m.Session, Token: m.Token, Mode: StopTerminate})
+			s.fail(m.Session, "このマシンに頼んだのに、向こうの子を名乗った", EndStartFailed)
+			return
+		}
+
 		s.mu.Lock()
 		ls.rec.State = StateIdle
 		ls.rec.PID, ls.rec.Started, ls.rec.BootID, ls.rec.Scope = o.PID, o.Started, o.BootID, m.Scope
+		if ro != nil {
+			ls.rec.Cwd = ro.Cwd
+			ls.rec.RemotePID, ls.rec.RemoteStarted = ro.PID, ro.Started
+			ls.rec.RemoteBootID, ls.rec.RemoteScope = ro.BootID, ro.Scope
+		}
 		ls.last = s.Now()
 		s.mu.Unlock()
 
 		_ = setOwner(s.db, m.Session, o, m.Scope)
+		if ro != nil {
+			_ = setRemote(s.db, m.Session, *ro)
+			s.auditFromAgent(m.Session, "session.started", host,
+				fmt.Sprintf("向こうの pid %d（scope=%s）", ro.PID, ro.Scope), audit.OK)
+		}
 		s.auditFromAgent(m.Session, "session.started", strconv.Itoa(m.PID),
 			"scope="+m.Scope, audit.OK)
 
@@ -439,15 +512,31 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		}
 
 	case MsgExited:
-		if _, ok := s.check(m); !ok {
+		ls, ok := s.check(m)
+		if !ok {
 			return
 		}
 		s.mu.Lock()
+		host := ls.rec.Host
 		delete(s.live, m.Session)
 		s.mu.Unlock()
 		// 止めろと言ってあれば、控えてある理由（本人が止めた・放置で閉じた）が残る。
 		// 何も言っていないのに終わったなら、子が自分で終わった。
-		_ = finish(s.db, m.Session, m.Code, m.Reason, EndSelf, false)
+		cause := EndSelf
+		if m.ConnLost {
+			cause = EndConnLost
+		}
+		if host != "" && (m.RemoteEnd == RemoteUnreachable || m.RemoteEnd == RemoteUnsupported) {
+			// **向こうを確かめられないうちは「終わった」と書かない。**
+			// 手元の ssh は終わったが、向こうの子はまだ工具を走らせているかもしれない。
+			// 孤児にして、繋がり次第見に行かせる。承認はもう届けようがないので閉じる。
+			_ = markOrphaned(s.db, m.Session, cause)
+			s.CloseApprovals(m.Session)
+			s.audit(m.Session, "session.orphan", host,
+				"向こうを確かめられないので孤児として残す: "+m.Reason, audit.Error)
+			return
+		}
+		_ = finish(s.db, m.Session, m.Code, m.Reason, cause, false)
 		s.CloseApprovals(m.Session)
 		out := audit.OK
 		if m.Code != 0 {
@@ -468,6 +557,10 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			return
 		}
 		alive, known := r.Owner().Alive()
+		if r.Host != "" && !alive {
+			s.reapedRemote(r, m)
+			return
+		}
 		switch {
 		case alive:
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID),
@@ -481,7 +574,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, audit.OK)
 		}
 
-	case MsgTailRes, MsgSSHRes, MsgCtlRes:
+	case MsgTailRes, MsgSSHRes, MsgCtlRes, MsgSSHResolved:
 		s.deliver(m)
 
 	case MsgDropped:
@@ -515,6 +608,34 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 	default:
 		a.send(Msg{T: MsgError, Error: "知らない種類: " + m.T})
 	}
+}
+
+// reapedRemote は向こうの孤児を見に行った報告を受ける。
+//
+// **campd はこれを確かめられない**（向こうの /proc を読めるのは鍵を持つ側だけ）。
+// 手元なら /proc で「本当に居ないか」を見るが、ここでは実行面の報告を記録するだけ。
+func (s *Supervisor) reapedRemote(r Record, m Msg) {
+	// **「確かめようがない」を「終わった」と書かない**（codex の指摘。以前は
+	// unsupported を gone と同じに扱い、生きているかもしれない子を閉じていた）。
+	// /proc の無いホストではそもそも起こさないので、ここへ来るのは異常なときだけ。
+	switch m.RemoteEnd {
+	case RemoteGone:
+		// 控えてある理由（実行面が落ちた・SSH が切れた）が残る。
+		_ = finish(s.db, r.ID, -1, "見張る者が居ないうちに終わっていた。向こう: "+m.Reason,
+			EndUnseen, false)
+	case RemoteKilled:
+		// SSH が切れて残っていたものなら、「切れた」を残す（始末したことは理由の文に）。
+		_ = finish(s.db, r.ID, -1, "孤児を始末した。向こう: "+m.Reason,
+			EndReaped, r.EndCause != EndConnLost)
+	default:
+		s.audit(r.ID, "session.reap", r.Host, "向こうを確かめられない: "+m.Reason, audit.Error)
+		return
+	}
+	s.mu.Lock()
+	delete(s.reapAsked, r.ID)
+	s.mu.Unlock()
+	s.CloseApprovals(r.ID)
+	s.audit(r.ID, "session.reap", r.Host, m.Reason, audit.OK)
 }
 
 // recordAsk は承認要求を DB に残す。**ここが実行面から DB を太らせる本線**

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api, type RuntimeSession } from '../api'
+import { api, type Destination, type Pinned, type RuntimeSession } from '../api'
 import { Empty, Failed, Loading, short, useAsync } from '../ui'
 
 // Camp が起こしたセッションの一覧と、新しく起こす口。
@@ -19,8 +19,13 @@ export default function Runtime() {
   // 真っ白になったのがこれ（テストでは出なかった）。
   const sessions = list.data?.sessions ?? []
   const allow = useAsync(() => api.allowlist(), [n, tab])
+  // 起こせる接続先は、許して**行き先を固定したもの**だけ（2026-09-11）。
+  const hostsQ = useAsync(() => api.sshHosts(), [n, tab])
+  const hosts = Array.isArray(hostsQ.data) ? hostsQ.data : []
+  const startable = hosts.filter((d) => d.allowed && pinnedOK(d.pinned))
 
   const [cwd, setCwd] = useState('')
+  const [host, setHost] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -28,7 +33,7 @@ export default function Runtime() {
     setErr('')
     setBusy(true)
     try {
-      await api.runtimeStart(cwd)
+      await api.runtimeStart(cwd, host)
       setCwd('')
       setN((v) => v + 1)
     } catch (e) {
@@ -69,7 +74,7 @@ export default function Runtime() {
         </button>
       </div>
 
-      {tab === 'allow' && <Allowlist reload={() => setN((v) => v + 1)} rows={allow} />}
+      {tab === 'allow' && <Allowlist reload={() => setN((v) => v + 1)} rows={allow} hosts={hosts} />}
       {tab === 'ssh' && <SSHLedger />}
       {tab === 'ended' && (
         <Ended kind={sp.get('kind') ?? ''} before={sp.get('before') ?? ''} set={set} />
@@ -85,9 +90,18 @@ export default function Runtime() {
           )}
 
           <form className="filters" onSubmit={(e) => { e.preventDefault(); void start() }}>
+            <select value={host} onChange={(e) => setHost(e.target.value)} aria-label="どこで起こすか">
+              <option value="">このマシン</option>
+              {startable.map((d) => (
+                <option key={d.alias} value={d.alias}>{d.alias}（{pinLabel(d.pinned)}）</option>
+              ))}
+            </select>
             <input
-              type="text" placeholder="起こす場所（許可リストの中の絶対パス）"
-              value={cwd} onChange={(e) => setCwd(e.target.value)} style={{ minWidth: '28rem' }}
+              type="text"
+              placeholder={host
+                ? `${host} の上の場所（許可リストの中の絶対パス）`
+                : '起こす場所（許可リストの中の絶対パス）'}
+              value={cwd} onChange={(e) => setCwd(e.target.value)} style={{ minWidth: '24rem' }}
             />
             <button disabled={busy || !cwd || !list.data?.agent_connected}>起こす</button>
           </form>
@@ -114,7 +128,7 @@ export default function Runtime() {
                       <Link to={`/runtime/${s.id}`}><StateBadge state={s.state} /></Link>
                     </td>
                     <td className="mono wrap">
-                      <Link to={`/runtime/${s.id}`}>{s.cwd}</Link>
+                      <Link to={`/runtime/${s.id}`}>{where(s)}</Link>
                     </td>
                     <td className="nowrap">{short(s.created_at)}</td>
                     <td className="num">{s.pid || ''}</td>
@@ -127,6 +141,27 @@ export default function Runtime() {
       )}
     </>
   )
+}
+
+// where は起こした場所。向こうなら `host:/path`。
+export function where(s: { host?: string; cwd: string }): string {
+  return s.host ? `${s.host}:${s.cwd}` : s.cwd
+}
+
+// pinnedOK は起こしてよい固定か。**信じるホスト鍵まで固定していないものは固定ではない**
+// （2026-09-11 の outer gate で codex が指摘）。
+export function pinnedOK(p?: Pinned): boolean {
+  return !!p && !!p.hostname && (p.hostkeys?.length ?? 0) > 0
+}
+
+// pinLabel は固定した行き先の文。
+export function pinLabel(p?: Pinned): string {
+  if (!p) return ''
+  let s = (p.user ? p.user + '@' : '') + p.hostname
+  if (p.port && p.port !== '22') s += ':' + p.port
+  if (p.proxyjump) s += `（${p.proxyjump} 経由）`
+  if (p.hostkeys?.length) s += `・鍵 ${p.hostkeys.length}`
+  return s
 }
 
 export function StateBadge({ state }: { state: string }) {
@@ -147,6 +182,7 @@ const END_LABEL: Record<string, string> = {
   stop_timeout: '止まらず見張りを諦めた',
   start_failed: '起こせなかった',
   agent_lost: '実行面が落ちた',
+  conn_lost: 'SSH が切れた',
   unseen: '見ていない間に終わっていた',
   reaped: '残っていたものを始末した',
 }
@@ -226,7 +262,7 @@ function Ended({ kind, before, set }: {
                 <td className="nowrap">{endLabel(s.end_cause)}</td>
                 <td className="nowrap">{atEndLabel(s.end_state)}</td>
                 <td className="nowrap"><ApprovalSummary s={s} /></td>
-                <td className="mono wrap"><Link to={`/runtime/${s.id}`}>{s.cwd}</Link></td>
+                <td className="mono wrap"><Link to={`/runtime/${s.id}`}>{where(s)}</Link></td>
                 <td className="num">{s.exit_code ?? ''}</td>
               </tr>
             ))}
@@ -258,11 +294,13 @@ export function ApprovalSummary({ s }: { s: RuntimeSession }) {
   )
 }
 
-function Allowlist({ rows, reload }: {
+function Allowlist({ rows, reload, hosts }: {
   rows: ReturnType<typeof useAsync<import('../api').Allowed[]>>
   reload: () => void
+  hosts: Destination[]
 }) {
   const [path, setPath] = useState('')
+  const [host, setHost] = useState('')
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
 
@@ -282,14 +320,20 @@ function Allowlist({ rows, reload }: {
       <p className="sub muted">
         ここに無い場所ではセッションを起こせない。
         <strong>変更にはパスワードの再入力が要る。</strong>
+        向こうの場所は書いたとおりに覚え、起こすときに向こうで実パスに直してから照らす
+        （symlink で外へは出られない）。
       </p>
       <form className="filters" onSubmit={(e) => e.preventDefault()}>
+        <select value={host} onChange={(e) => setHost(e.target.value)} aria-label="どのホストの場所か">
+          <option value="">このマシン</option>
+          {hosts.map((d) => <option key={d.alias} value={d.alias}>{d.alias}</option>)}
+        </select>
         <input type="text" placeholder="許すディレクトリ（絶対パス）" value={path}
-          onChange={(e) => setPath(e.target.value)} style={{ minWidth: '24rem' }} />
+          onChange={(e) => setPath(e.target.value)} style={{ minWidth: '20rem' }} />
         <input type="password" placeholder="パスワード" value={pw}
           onChange={(e) => setPw(e.target.value)} autoComplete="current-password" />
         <button disabled={!path || !pw}
-          onClick={() => void run(() => api.allowlistAdd(path, pw))}>足す</button>
+          onClick={() => void run(() => api.allowlistAdd(path, pw, '', host))}>足す</button>
       </form>
       {err && <Failed error={err} />}
       {rows.loading && <Loading />}
@@ -303,19 +347,20 @@ function Allowlist({ rows, reload }: {
         <table>
           <thead>
             <tr>
-              <th>場所</th><th className="nowrap">覚え書き</th>
+              <th className="nowrap">ホスト</th><th>場所</th><th className="nowrap">覚え書き</th>
               <th className="nowrap">足した時刻</th><th></th>
             </tr>
           </thead>
           <tbody>
             {(rows.data ?? []).map((a) => (
-              <tr key={a.id}>
+              <tr key={(a.host ?? '') + ':' + a.id}>
+                <td className="mono nowrap">{a.host ?? <span className="muted">このマシン</span>}</td>
                 <td className="mono wrap">{a.path}</td>
                 <td>{a.note}</td>
                 <td className="nowrap">{short(a.added_at)}</td>
                 <td className="nowrap">
                   <button disabled={!pw}
-                    onClick={() => void run(() => api.allowlistRemove(a.path, pw))}>外す</button>
+                    onClick={() => void run(() => api.allowlistRemove(a.path, pw, a.host ?? ''))}>外す</button>
                 </td>
               </tr>
             ))}
@@ -331,6 +376,8 @@ function SSHLedger() {
   const rows = useAsync(() => api.sshHosts(), [n])
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
+  const [ca, setCa] = useState('')
+  const [cp, setCp] = useState('')
 
   const run = async (fn: () => Promise<unknown>) => {
     setErr('')
@@ -346,7 +393,10 @@ function SSHLedger() {
     <>
       <p className="sub muted">
         <code>~/.ssh/config</code> は<strong>読むだけ</strong>で、書き戻さない。
-        取り込みで許可は変わらない。<strong>繋ぐのはまだできない。</strong>
+        取り込みで許可は変わらない。
+        <strong>許すときに、そのときの行き先（ssh -G）と、known_hosts が信じるホスト鍵を固定する。</strong>
+        あとで config や known_hosts が別の先・別の鍵を指すようになったら起こさない。
+        ホスト鍵は Camp では受け入れないので、初めての先は端末で一度 <code>ssh</code> して確かめる。
       </p>
       <form className="filters" onSubmit={(e) => e.preventDefault()}>
         <button onClick={() => void run(() => api.sshScan())}>
@@ -354,6 +404,18 @@ function SSHLedger() {
         </button>
         <input type="password" placeholder="パスワード（許可の変更に要る）" value={pw}
           onChange={(e) => setPw(e.target.value)} autoComplete="current-password" />
+      </form>
+      <form className="filters" onSubmit={(e) => e.preventDefault()}>
+        <select value={ca} onChange={(e) => setCa(e.target.value)} aria-label="claude の場所を書く先">
+          <option value="">claude の場所を書く先</option>
+          {(Array.isArray(rows.data) ? rows.data : []).map((d) => (
+            <option key={d.alias} value={d.alias}>{d.alias}</option>
+          ))}
+        </select>
+        <input type="text" placeholder="向こうの claude の絶対パス（空なら向こうで探す）" value={cp}
+          onChange={(e) => setCp(e.target.value)} style={{ minWidth: '18rem' }} />
+        <button disabled={!ca || !pw}
+          onClick={() => void run(() => api.sshClaude(ca, cp, pw))}>書く</button>
       </form>
       {err && <Failed error={err} />}
       {rows.loading && <Loading />}
@@ -365,6 +427,7 @@ function SSHLedger() {
           <thead>
             <tr>
               <th className="nowrap">許可</th><th>エイリアス</th><th>接続先</th>
+              <th className="nowrap">固定した行き先</th><th className="nowrap">claude</th>
               <th className="nowrap">Tailscale</th><th>覚え書き</th>
             </tr>
           </thead>
@@ -380,6 +443,17 @@ function SSHLedger() {
                 <td className="mono">{d.alias}</td>
                 <td className="mono muted">
                   {d.user ? d.user + '@' : ''}{d.hostname}{d.port ? ':' + d.port : ''}
+                </td>
+                {/* 長いパスで表が画面の外へ押し出されないよう、折り返す。**td.wrap は
+                    width:100% なので1つの表に2つ置かない**——2つ置いたら取り合って、
+                    片方が1文字幅に潰れた（2026-09-11 に撮って直した）。 */}
+                <td className="mono">
+                  {pinnedOK(d.pinned) ? pinLabel(d.pinned)
+                    : d.allowed ? <span className="warn-text">許し直す（行き先が固定されていない）</span>
+                      : <span className="muted">—</span>}
+                </td>
+                <td className="mono" style={{ overflowWrap: 'anywhere', minWidth: '10rem' }}>
+                  {d.claude_path || <span className="muted">探す</span>}
                 </td>
                 <td className="mono muted">{d.tailscale_ip}</td>
                 <td>{d.note}</td>

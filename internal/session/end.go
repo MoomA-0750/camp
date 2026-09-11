@@ -22,12 +22,15 @@ const (
 	EndAgentLost   = "agent_lost"   // 実行面が落ち、見張りが外れている間に終わった
 	EndUnseen      = "unseen"       // campd が止まっている間に終わっていた
 	EndReaped      = "reaped"       // 前回の残りを、実行面に頼んで始末した
+	// EndConnLost は SSH の接続が切れた（2026-09-11、リモート起動と一緒に足した）。
+	// **向こうの子はそれで終わるとは限らない**ので、実行面が見に行って始末する。
+	EndConnLost = "conn_lost"
 )
 
 // EndCauses は画面が絞り込みに使える終わり方の全部。並びは画面に出す順。
 var EndCauses = []string{
 	EndSelf, EndUserStop, EndIdleTimeout, EndTurnTimeout, EndStopTimeout,
-	EndStartFailed, EndAgentLost, EndUnseen, EndReaped,
+	EndStartFailed, EndAgentLost, EndConnLost, EndUnseen, EndReaped,
 }
 
 var endLabels = map[string]string{
@@ -38,6 +41,7 @@ var endLabels = map[string]string{
 	EndStopTimeout: "止まらず見張りを諦めた",
 	EndStartFailed: "起こせなかった",
 	EndAgentLost:   "実行面が落ちた",
+	EndConnLost:    "SSH が切れた",
 	EndUnseen:      "見ていない間に終わっていた",
 	EndReaped:      "残っていたものを始末した",
 }

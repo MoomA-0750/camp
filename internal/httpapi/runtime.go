@@ -86,11 +86,13 @@ func (s *Server) handleRuntimeOne(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRuntimeStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Cwd string `json:"cwd"`
+		// Host は ssh の Host 名。空ならこのマシン。
+		Host string `json:"host"`
 	}
 	if !s.readBody(w, r, &body) {
 		return
 	}
-	rec, err := s.sessions.Start("user", body.Cwd)
+	rec, err := s.sessions.StartOn("user", body.Host, body.Cwd)
 	if err != nil {
 		code := http.StatusBadRequest
 		if errors.Is(err, session.ErrNoAgent) {

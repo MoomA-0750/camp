@@ -130,11 +130,14 @@ export default function RuntimeDetail() {
       <p className="crumbs"><Link to="/runtime">← セッション駆動</Link></p>
       <h2>
         {rec ? <StateBadge state={rec.state} /> : null}{' '}
-        <span className="mono">{rec?.cwd ?? id}</span>
+        <span className="mono">{rec ? (rec.host ? `${rec.host}:${rec.cwd}` : rec.cwd) : id}</span>
       </h2>
       {rec && (
         <p className="sub muted">
-          起こしたのは {short(rec.created_at)} / pid {rec.pid || '—'}
+          起こしたのは {short(rec.created_at)} /{' '}
+          {rec.host
+            ? <>手元の ssh の pid {rec.pid || '—'} / {rec.host} の pid {rec.remote_pid || '—'}</>
+            : <>pid {rec.pid || '—'}</>}
           {rec.claude_id ? <> / 会話記録 <code>{rec.claude_id.slice(0, 8)}</code></> : null}
         </p>
       )}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -71,6 +72,31 @@ done
 	ag := session.NewAgent(sock, fake)
 	ag.Scope = false
 	ag.LogDir = t.TempDir()
+	// **本物の ~/.ssh/config を読まない。** 許すときの `ssh -G` は偽物に答えさせる。
+	// 鍵は本物を作り、使い捨ての known_hosts に置く（許すときに指紋を固定するので）。
+	khDir := t.TempDir()
+	hk := filepath.Join(khDir, "hostkey")
+	if out, err := exec.Command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", hk).CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen: %v %s", err, out)
+	}
+	pub, err := os.ReadFile(hk + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pf := strings.Fields(string(pub))
+	kh := filepath.Join(khDir, "known_hosts")
+	if err := os.WriteFile(kh, []byte("tower.example "+pf[0]+" "+pf[1]+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeSSH := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(fakeSSH, []byte(`#!/bin/sh
+for a; do last=$a; done
+printf 'user tester\nhostname %s.example\nport 22\nuserknownhostsfile `+kh+`\n' "$last"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ag.SSH = fakeSSH
+	ag.SSHConfig = filepath.Join(t.TempDir(), "no-config")
 	if err := ag.Dial("test"); err != nil {
 		t.Fatal(err)
 	}
@@ -381,10 +407,89 @@ func TestAllowingAnSSHDestinationNeedsThePasswordAgain(t *testing.T) {
 	var list []struct {
 		Alias   string `json:"alias"`
 		Allowed bool   `json:"allowed"`
+		Pinned  *struct {
+			HostName string   `json:"hostname"`
+			HostKeys []string `json:"hostkeys"`
+		} `json:"pinned"`
 	}
 	json.NewDecoder(g.Body).Decode(&list)
 	if len(list) != 1 || !list[0].Allowed {
 		t.Fatalf("許可が反映されていない: %+v", list)
+	}
+	// **許したときの行き先と、信じるホスト鍵が固定される。**
+	if list[0].Pinned == nil || list[0].Pinned.HostName != "tower.example" || len(list[0].Pinned.HostKeys) != 1 {
+		t.Fatalf("行き先が固定されていない: %+v", list[0].Pinned)
+	}
+}
+
+// 向こうへ起こす口も、許可リストの外は断る。**文字の上で決められることは campd が決める。**
+func TestStartingOnAnotherHostIsCheckedByCampd(t *testing.T) {
+	ts, c, _ := runtimeServer(t)
+	db := dbOf(t, ts)
+	if _, _, err := session.ImportSSH(db, []session.SSHHost{{Alias: "far"}}); err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string) (int, string) {
+		t.Helper()
+		r, err := c.Post(ts.URL+"/api/runtime", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		b, _ := io.ReadAll(r.Body)
+		return r.StatusCode, string(b)
+	}
+	if code, msg := post(`{"host":"far","cwd":"/srv/work"}`); code != 400 || !strings.Contains(msg, "許していない") {
+		t.Fatalf("許していない先に起こせた: %d %s", code, msg)
+	}
+	if err := session.AllowDestination(db, "far", session.Resolved{HostName: "far.example",
+		HostKeys: []string{"SHA256:x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if code, msg := post(`{"host":"far","cwd":"/srv/work"}`); code != 400 || !strings.Contains(msg, "許した場所が無い") {
+		t.Fatalf("場所を許していないのに起こせた: %d %s", code, msg)
+	}
+	if code, msg := post(`{"host":"-oProxyCommand=x","cwd":"/srv/work"}`); code != 400 {
+		t.Fatalf("名前でないものを通した: %d %s", code, msg)
+	}
+
+	// 場所を足すのにも再認証が要る。
+	r, err := c.Post(ts.URL+"/api/allowlist", "application/json",
+		strings.NewReader(`{"host":"far","path":"/srv/work"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("パスワード無しで向こうの場所を足せた: %s", r.Status)
+	}
+	r, err = c.Post(ts.URL+"/api/allowlist", "application/json",
+		strings.NewReader(`{"host":"far","path":"/srv/work","password":"correct horse battery"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != 200 {
+		t.Fatalf("向こうの場所を足せない: %s", r.Status)
+	}
+	g, err := c.Get(ts.URL + "/api/allowlist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Body.Close()
+	var rows []struct {
+		Host string `json:"host"`
+		Path string `json:"path"`
+	}
+	json.NewDecoder(g.Body).Decode(&rows)
+	found := false
+	for _, a := range rows {
+		if a.Host == "far" && a.Path == "/srv/work" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("足した向こうの場所が一覧に出ない: %+v", rows)
 	}
 }
 

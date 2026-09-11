@@ -32,6 +32,9 @@ type Supervisor struct {
 	// budgets はセッションごとの「記録してよい件数」。
 	// 実行面が起こす audit の増え方を押さえる。
 	budgets map[string]*budget
+	// reapAsked は向こうの孤児を見に行かせた時刻。繋がらないホストを
+	// Tick のたびに叩かないため。
+	reapAsked map[string]time.Time
 
 	// テストで時間を進めるために差し替える。
 	Now func() time.Time
@@ -40,6 +43,8 @@ type Supervisor struct {
 	TurnAfter  time.Duration
 	StartAfter time.Duration
 	StopAfter  time.Duration
+	// RemoteReapEvery は向こうを確かめられなかった孤児を見に行き直す間隔。
+	RemoteReapEvery time.Duration
 }
 
 type liveSession struct {
@@ -65,12 +70,15 @@ func New(db *store.DB) *Supervisor {
 		live:       map[string]*liveSession{},
 		waits:      map[string]chan Msg{},
 		budgets:    map[string]*budget{},
+		reapAsked:  map[string]time.Time{},
 		maxConc:    defaultMaxConcurrent,
 		Now:        time.Now,
 		IdleAfter:  idleTimeout,
 		TurnAfter:  turnTimeout,
 		StartAfter: startGrace,
 		StopAfter:  stopGrace,
+
+		RemoteReapEvery: remoteReapEvery,
 	}
 }
 
@@ -117,6 +125,14 @@ func (s *Supervisor) Reconcile() (ghosts, orphans, unknown int, err error) {
 			_ = markOrphaned(s.db, r.ID, EndUnseen)
 			s.audit(r.ID, "session.orphan", r.Cwd,
 				fmt.Sprintf("campd の再起動後も pid %d が生きている", r.PID), audit.OK)
+		case r.Host != "":
+			// **手元の ssh が居ないだけでは、向こうの子が終わったとは言えない。**
+			// stdin を読んでいない子は ssh が死んでも生き残る（実測）。
+			// 孤児にして、実行面が繋がってきたら見に行かせる。
+			orphans++
+			_ = markOrphaned(s.db, r.ID, EndUnseen)
+			s.audit(r.ID, "session.orphan", r.Host+":"+r.Cwd,
+				fmt.Sprintf("手元の ssh（pid %d）は居ないが、向こうはまだ確かめていない", r.PID), audit.OK)
 		default:
 			ghosts++
 			_ = finish(s.db, r.ID, -1, "campd の再起動後に居なかった", EndUnseen, false)
@@ -130,18 +146,38 @@ func (s *Supervisor) Reconcile() (ghosts, orphans, unknown int, err error) {
 	return ghosts, orphans, unknown, nil
 }
 
-// Start は新しいセッションを起こす。**起こすのは実行面だが、決めるのはここ。**
+// Start はこのマシンに新しいセッションを起こす。
 func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
+	return s.StartOn(requestedBy, "", cwd)
+}
+
+// StartOn は host（空ならこのマシン）に新しいセッションを起こす。
+// **起こすのは実行面だが、決めるのはここ。**
+func (s *Supervisor) StartOn(requestedBy, host, cwd string) (Record, error) {
 	// **照合するのは campd 側。** 実行面は本人のユーザーで動くので、
 	// そこでの照合は迂回できる。ここが唯一の境界。
-	real, err := CheckCwd(s.db, cwd)
-	if err != nil {
-		s.audit("", "session.start", cwd, err.Error(), audit.Denied)
-		return Record{}, err
-	}
-	root, err := matchedRoot(s.db, real)
-	if err != nil {
-		return Record{}, err
+	var real, root, target string
+	var spec *RemoteSpec
+	if host == "" {
+		r, err := CheckCwd(s.db, cwd)
+		if err != nil {
+			s.audit("", "session.start", cwd, err.Error(), audit.Denied)
+			return Record{}, err
+		}
+		if root, err = matchedRoot(s.db, r); err != nil {
+			return Record{}, err
+		}
+		real, target = r, r
+	} else {
+		// 向こうのパスは campd には実パスに直せない。文字の上で決め、
+		// symlink は向こうの sh が解いてから塞ぐ（remote.go）。
+		var err error
+		real, root, spec, err = checkRemote(s.db, host, cwd)
+		if err != nil {
+			s.audit("", "session.start", host+":"+cwd, err.Error(), audit.Denied)
+			return Record{}, err
+		}
+		target = host + ":" + real
 	}
 
 	id := newID()
@@ -150,6 +186,7 @@ func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
 	rec := Record{
 		ID: id, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
 		CreatedAt: t.Format(time.RFC3339), UpdatedAt: t.Format(time.RFC3339),
+		Host: host,
 	}
 
 	// **枠は数えたその場で押さえる。**
@@ -158,13 +195,13 @@ func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
 	s.mu.Lock()
 	if s.agent == nil {
 		s.mu.Unlock()
-		s.audit("", "session.start", real, ErrNoAgent.Error(), audit.Denied)
+		s.audit("", "session.start", target, ErrNoAgent.Error(), audit.Denied)
 		return Record{}, ErrNoAgent
 	}
 	if n := len(s.live); n >= s.maxConc {
 		s.mu.Unlock()
 		err := fmt.Errorf("同時に走らせる上限（%d本）に達している", s.maxConc)
-		s.audit("", "session.start", real, err.Error(), audit.Denied)
+		s.audit("", "session.start", target, err.Error(), audit.Denied)
 		return Record{}, err
 	}
 	agent := s.agent
@@ -180,15 +217,16 @@ func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
 		return Record{}, err
 	}
 
-	s.audit(id, "session.start", real, "実行面へ起動を依頼した", audit.OK)
+	s.audit(id, "session.start", target, "実行面へ起動を依頼した", audit.OK)
 
-	if err := agent.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root}); err != nil {
+	if err := agent.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root,
+		Remote: spec}); err != nil {
 		// **「届かなかった」を「起きなかった」と確定しない。**
 		// 途中まで書けていれば実行面は子を起こしている。ここで exited と
 		// 書くと、あとから来る started も、繋ぎ直しの名乗りも弾いてしまい、
 		// 生きた子が台帳から外れる。starting のまま残し、started が来なければ
 		// 起動猶予（Tick）で閉じる。
-		s.audit(id, "session.start", real,
+		s.audit(id, "session.start", target,
 			"実行面へ届いたか分からない: "+err.Error(), audit.Error)
 		return rec, err
 	}
@@ -514,12 +552,36 @@ func (s *Supervisor) sweepOrphans() {
 		if alive || !known {
 			continue
 		}
+		if r.Host != "" {
+			// **手元の ssh が居ないことは、向こうが終わったことを意味しない。**
+			// 実行面に見に行かせる。繋がらなければ、しばらくしてまた行かせる。
+			s.askRemoteReap(r, false)
+			continue
+		}
 		// 実行面が落ちて孤児にしたのなら、控えてある「実行面が落ちた」が残る。
 		_ = finish(s.db, r.ID, -1, "見張る者が居ないうちに終わっていた", EndUnseen, false)
 		s.CloseApprovals(r.ID)
 		s.audit(r.ID, "session.ghost", "",
 			fmt.Sprintf("孤児にしていた pid %d はもう居ない", r.PID), audit.OK)
 	}
+}
+
+// askRemoteReap は向こうの孤児を実行面に見に行かせる。
+// force でなければ、前に行かせてから RemoteReapEvery 経つまで行かせない。
+func (s *Supervisor) askRemoteReap(r Record, force bool) {
+	s.mu.Lock()
+	agent := s.agent
+	last := s.reapAsked[r.ID]
+	due := agent != nil && (force || last.IsZero() || s.Now().Sub(last) >= s.RemoteReapEvery)
+	if due {
+		s.reapAsked[r.ID] = s.Now()
+	}
+	s.mu.Unlock()
+	if !due {
+		return
+	}
+	_ = agent.send(Msg{T: MsgReap, Session: r.ID, PID: r.PID, Started: r.Started,
+		BootID: r.BootID, RemoteOwner: r.remoteOwner()})
 }
 
 // Run は Tick を回し続ける。ctx が終わるまで戻らない。

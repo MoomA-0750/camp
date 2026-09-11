@@ -57,7 +57,8 @@ func wire(t *testing.T, db *store.DB) (*Supervisor, *Agent) {
 }
 
 // attach は既にある supervisor に実行面を繋ぐ。campd の再起動を模すのに使う。
-func attach(t *testing.T, s *Supervisor, claude string) *Agent {
+// opts は繋ぐ前に実行面へ掛ける（走り出してから書き換えると競合する）。
+func attach(t *testing.T, s *Supervisor, claude string, opts ...func(*Agent)) *Agent {
 	t.Helper()
 	sock := filepath.Join(t.TempDir(), "a.sock")
 	c, err := s.Listen(sock, "", os.Getuid())
@@ -74,6 +75,9 @@ func attach(t *testing.T, s *Supervisor, claude string) *Agent {
 	// 置き場へ残していたのを見つけた。既定値がそこを指しているので、
 	// 差し替えを忘れると静かに漏れる。
 	a.LogDir = t.TempDir()
+	for _, o := range opts {
+		o(a)
+	}
 	if err := a.Dial("test"); err != nil {
 		t.Fatal(err)
 	}

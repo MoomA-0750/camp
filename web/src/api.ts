@@ -124,6 +124,8 @@ export type RuntimeSession = {
   id: string; claude_id?: string; cwd: string; state: string
   requested_by: string; created_at: string; updated_at: string
   pid?: number; scope?: string
+  // ssh の Host 名。無ければこのマシン（2026-09-11 から）。そのとき pid は手元の ssh。
+  host?: string; remote_pid?: number; remote_scope?: string
   exit_code?: number; exit_reason?: string; ended_at?: string
   // どう終わったか（2026-09-11 から）。それより前に終わったものには無い。
   end_cause?: string; end_state?: string
@@ -146,13 +148,22 @@ export type Approval = {
 }
 
 export type Allowed = {
-  id: number; path: string; note?: string; added_at: string; added_by: string
+  id: number; host?: string; path: string; note?: string; added_at: string; added_by: string
+}
+
+/** 許したときに `ssh -G` で見た行き先。起こすたびに照らす。 */
+export type Pinned = {
+  hostname: string; user?: string; port?: string; proxyjump?: string; proxycommand?: string
+  hostkeyalias?: string
+  // ssh が信じるホスト鍵の指紋。**これが無い固定では起こせない。**
+  hostkeys?: string[]
 }
 
 export type Destination = {
   id: number; alias: string; hostname?: string; user?: string; port?: number
   identity?: string; tailscale_ip?: string; note?: string
   allowed: boolean; source: string; seen_at: string; updated_at: string
+  pinned?: Pinned; claude_path?: string
 }
 
 /** `get_usage` の中身。実測で出た欄だけを写している（2026-09-04）。 */
@@ -310,7 +321,8 @@ export const api = {
     fetchJSON<RuntimeSession>(`/api/runtime/${encodeURIComponent(id)}`),
   runtimeEnded: (kind = '', before = '') =>
     fetchJSON<RuntimeEnded>('/api/runtime/ended' + qs({ kind, before })),
-  runtimeStart: (cwd: string) => postJSON<RuntimeSession>('/api/runtime', { cwd }),
+  runtimeStart: (cwd: string, host = '') =>
+    postJSON<RuntimeSession>('/api/runtime', host ? { cwd, host } : { cwd }),
   runtimeInput: (id: string, text: string) =>
     postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/input`, { text }),
   runtimeStop: (id: string, mode: 'interrupt' | 'terminate') =>
@@ -327,10 +339,10 @@ export const api = {
     fetchJSON<RuntimeUsage>(`/api/runtime/${encodeURIComponent(id)}/usage`),
 
   allowlist: () => fetchJSON<Allowed[]>('/api/allowlist'),
-  allowlistAdd: (path: string, password: string, note = '') =>
-    postJSON<Allowed>('/api/allowlist', { path, password, note }),
-  allowlistRemove: (path: string, password: string) =>
-    postJSON<{ removed: boolean }>('/api/allowlist/remove', { path, password }),
+  allowlistAdd: (path: string, password: string, note = '', host = '') =>
+    postJSON<Allowed>('/api/allowlist', { path, password, note, host }),
+  allowlistRemove: (path: string, password: string, host = '') =>
+    postJSON<{ removed: boolean }>('/api/allowlist/remove', { path, password, host }),
 
   sshHosts: () => fetchJSON<Destination[]>('/api/ssh'),
   sshScan: () => postJSON<{ added: number; updated: number }>('/api/ssh/scan', {}),
@@ -338,6 +350,8 @@ export const api = {
     postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/edit`, { note, tailscale_ip }),
   sshAllow: (alias: string, allowed: boolean, password: string) =>
     postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/allow`, { allowed, password }),
+  sshClaude: (alias: string, claude_path: string, password: string) =>
+    postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/claude`, { claude_path, password }),
 
   logout: async () => {
     await fetch('/api/logout', { method: 'POST' })

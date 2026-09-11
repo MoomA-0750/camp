@@ -66,6 +66,19 @@ type Msg struct {
 	// ssh_scan / ssh_result
 	SSHHosts []SSHHost `json:"ssh_hosts,omitempty"`
 
+	// start（campd → 実行面）: どこへ繋ぐか。nil ならこのマシン。
+	Remote *RemoteSpec `json:"remote,omitempty"`
+	// started / reap: 向こうで起きた子の身元。**campd は確かめられない。**
+	RemoteOwner *RemoteOwner `json:"remote_owner,omitempty"`
+	// exited / reaped: 向こうを見に行った結果（RemoteGone など）。
+	RemoteEnd string `json:"remote_end,omitempty"`
+	// exited: SSH の接続が切れて終わったか。
+	ConnLost bool `json:"conn_lost,omitempty"`
+
+	// ssh_resolve / ssh_resolved: `ssh -G` で alias がいまどこを指すか
+	Alias    string    `json:"alias,omitempty"`
+	Resolved *Resolved `json:"resolved,omitempty"`
+
 	// hello / welcome
 	Version string `json:"version,omitempty"`
 	// Held は実行面がいま抱えている子。**campd を入れ替えても殺さないため。**
@@ -83,6 +96,8 @@ type Held struct {
 	BootID  string `json:"boot_id"`
 	Scope   string `json:"scope"`
 	State   string `json:"state"`
+	// RemoteOwner は向こうの子（リモートのとき）。台帳と照らしてから採る。
+	RemoteOwner *RemoteOwner `json:"remote_owner,omitempty"`
 }
 
 // 実行面 → campd
@@ -98,6 +113,8 @@ const (
 	MsgDropped = "dropped" // 溢れて捨てた。**黙って消さない**
 	MsgSSHRes  = "ssh_result"
 	MsgCtlRes  = "control_result"
+
+	MsgSSHResolved = "ssh_resolved"
 )
 
 // campd → 実行面
@@ -112,6 +129,10 @@ const (
 	MsgSSHScan = "ssh_scan" // ~/.ssh/config を**読んで**寄こせ
 	MsgControl = "control"  // 子へ制御フレームを1つ投げて、答えを寄こせ
 	MsgError   = "error"
+
+	// MsgSSHResolve は `ssh -G <alias>` の結果を寄こせ。**繋がない。**
+	// 許すときに行き先を固定するのに使う。
+	MsgSSHResolve = "ssh_resolve"
 )
 
 // 状態機械。**この5つ以外の状態を作らない。**
@@ -168,6 +189,14 @@ const (
 	turnTimeout = 60 * time.Minute // 1ターンが終わらない
 	startGrace  = 60 * time.Second // started が返ってこない
 	stopGrace   = 2 * time.Minute  // 止めろと言ったのに止まらない
+
+	// 向こうの sh が名乗るまで待つ長さ。ssh の接続（ConnectTimeout 20秒）と
+	// ログインを含む。startGrace より短くしておく。
+	headerWait = 45 * time.Second
+	// 向こうを見に行く ssh 1本の長さ。
+	reapWait = 30 * time.Second
+	// 向こうを確かめられなかった孤児を、もう一度見に行くまでの間。
+	remoteReapEvery = 5 * time.Minute
 )
 
 // validState は知らない状態を弾く。

@@ -50,6 +50,62 @@ test('タブがURLに乗る', async () => {
   await waitFor(() => expect(screen.getByText(/読むだけ/)).toBeTruthy())
 })
 
+// ---- 向こうで起こす（2026-09-11）----------------------------------------------
+
+const hostsPayload = [
+  { id: 1, alias: 'far', allowed: true, source: 'ssh_config', seen_at: '', updated_at: '',
+    pinned: { hostname: 'far.example', user: 'me', port: '22', hostkeys: ['SHA256:abc'] } },
+  // 行き先が固定されていない許可。起こせない。
+  { id: 2, alias: 'old', allowed: true, source: 'ssh_config', seen_at: '', updated_at: '' },
+  // 鍵を固定していない古い固定。これも起こせない。
+  { id: 4, alias: 'keyless', allowed: true, source: 'ssh_config', seen_at: '', updated_at: '',
+    pinned: { hostname: 'k.example' } },
+  { id: 3, alias: 'nope', allowed: false, source: 'ssh_config', seen_at: '', updated_at: '' },
+]
+
+test('起こせる先は、許して行き先を固定した接続先だけ', async () => {
+  stub((u) => (u.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }))
+  show()
+  const sel = await screen.findByLabelText('どこで起こすか')
+  await waitFor(() => expect(within(sel).getByText(/far/)).toBeTruthy())
+  expect(within(sel).queryByText(/old/)).toBeNull()
+  expect(within(sel).queryByText(/nope/)).toBeNull()
+  expect(within(sel).queryByText(/keyless/)).toBeNull()
+})
+
+test('起こすときに接続先を渡す', async () => {
+  const posts: unknown[] = []
+  vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)))
+    const body = url.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }
+    return { ok: true, status: 200, json: async () => body, text: async () => '' } as unknown as Response
+  })
+  show()
+  const sel = await screen.findByLabelText('どこで起こすか')
+  await waitFor(() => expect(within(sel).getByText(/far/)).toBeTruthy())
+  fireEvent.change(sel, { target: { value: 'far' } })
+  fireEvent.change(screen.getByPlaceholderText(/far の上の場所/), { target: { value: '/srv/work' } })
+  fireEvent.click(screen.getByText('起こす'))
+  await waitFor(() => expect(posts).toContainEqual({ cwd: '/srv/work', host: 'far' }))
+})
+
+test('台帳は固定した行き先を出し、固定の無い許可には許し直すよう言う', async () => {
+  stub((u) => (u.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }))
+  show('/runtime?tab=ssh')
+  await waitFor(() => expect(screen.getByText('me@far.example・鍵 1')).toBeTruthy())
+  // 固定の無い許可と、鍵の無い固定の2つ。
+  expect(screen.getAllByText(/許し直す/).length).toBe(2)
+})
+
+test('向こうのセッションはホスト名つきで出る', async () => {
+  stub((u) => (u.startsWith('/api/runtime')
+    ? { agent_connected: true, sessions: [{ id: 'r1', cwd: '/srv/work', host: 'far', state: 'idle',
+        requested_by: 'user', created_at: '', updated_at: '' }] }
+    : []))
+  show()
+  await waitFor(() => expect(screen.getByText('far:/srv/work')).toBeTruthy())
+})
+
 // ---- 終わったもの（2026-09-11）------------------------------------------------
 
 const base = { requested_by: 'user', created_at: '2026-09-11T01:00:00Z', updated_at: '', state: 'exited' }

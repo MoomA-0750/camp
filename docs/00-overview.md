@@ -27,13 +27,15 @@ general-console（lpve VM 200・Fedora 44・4コア/16GB/128GB）
     │     ├── MCP サーバー（stdio・読み取り専用）
     │     └── SQLite（履歴の独立保持・全文検索・使用量集計・監査ログ）
     ├── campd agent（本人のユーザー）── claude -p 双方向stream-json
-    │     └── /run/camp/agent.sock で campd と話す
+    │     ├── /run/camp/agent.sock で campd と話す
+    │     └── ssh <alias> ── 向こうの sh ── claude（D-028）
     └── Vault 作業コピー（= 正本）
 ```
 
 campd は `claude` を起こせない（`ProtectHome=read-only` と `NoNewPrivileges`）。
 起こすのは本人のユーザーで動く実行面 `campd agent`（D-025）。
-他ホストへの SSH は台帳と許可リストまで作ってあり、実際のリモート起動はまだ無い。
+他ホストへは SSH 越しに起こせる（D-028、2026-09-11）。向こうに常駐するものは置かず、
+実行面が `ssh <alias>` で小さな sh を起こし、その子として `claude` が動く。
 
 クライアントは全部同じAPIを叩く薄いクライアントにする。Android・Wear OSを後から足すときに実装を1本化するため。
 

@@ -23,6 +23,15 @@ type Record struct {
 	BootID  string `json:"boot_id,omitempty"`
 	Scope   string `json:"scope,omitempty"`
 
+	// Host は ssh の Host 名。空ならこのマシン（2026-09-11 から）。
+	// そのとき上の pid / 起動時刻は**手元の ssh** を指す。
+	Host string `json:"host,omitempty"`
+	// 向こうで起きた子。**実行面の報告で、campd は確かめられない。**
+	RemotePID     int    `json:"remote_pid,omitempty"`
+	RemoteStarted uint64 `json:"remote_started,omitempty"`
+	RemoteBootID  string `json:"remote_boot_id,omitempty"`
+	RemoteScope   string `json:"remote_scope,omitempty"`
+
 	ExitCode   *int   `json:"exit_code,omitempty"`
 	ExitReason string `json:"exit_reason,omitempty"`
 	EndedAt    string `json:"ended_at,omitempty"`
@@ -43,6 +52,15 @@ func (r Record) Owner() Owner {
 	return Owner{PID: r.PID, Started: r.Started, BootID: r.BootID}
 }
 
+// remoteOwner は向こうの子の身元。このマシンの行なら nil。
+func (r Record) remoteOwner() *RemoteOwner {
+	if r.Host == "" {
+		return nil
+	}
+	return &RemoteOwner{Host: r.Host, PID: r.RemotePID, Started: r.RemoteStarted,
+		BootID: r.RemoteBootID, Scope: r.RemoteScope, Cwd: r.Cwd}
+}
+
 // Live は「まだ終わっていない」状態か。
 func (r Record) Live() bool {
 	return r.State != StateExited
@@ -57,9 +75,19 @@ func insert(db *store.DB, r Record) error {
 		return fmt.Errorf("知らない状態: %s", r.State)
 	}
 	_, err := db.Exec(`
-		insert into runtime_sessions(id, cwd, state, requested_by, created_at, updated_at)
-		values(?,?,?,?,?,?)`,
-		r.ID, r.Cwd, r.State, r.RequestedBy, r.CreatedAt, r.UpdatedAt)
+		insert into runtime_sessions(id, cwd, state, requested_by, created_at, updated_at, host)
+		values(?,?,?,?,?,?,?)`,
+		r.ID, r.Cwd, r.State, r.RequestedBy, r.CreatedAt, r.UpdatedAt, nzs(r.Host))
+	return err
+}
+
+// setRemote は向こうの子の身元を書く。cwd は向こうで実際に降りた場所に直す。
+func setRemote(db *store.DB, id string, o RemoteOwner) error {
+	_, err := db.Exec(`
+		update runtime_sessions
+		set cwd=?, remote_pid=?, remote_started=?, remote_boot_id=?, remote_scope=?, updated_at=?
+		where id=?`,
+		o.Cwd, o.PID, o.Started, nzs(o.BootID), nzs(o.Scope), now(), id)
 	return err
 }
 
@@ -176,7 +204,10 @@ func Get(db *store.DB, id string) (Record, error) {
 var selectCols = `
 	select id, coalesce(claude_id,''), cwd, state, requested_by, created_at, updated_at,
 	       coalesce(pid,0), coalesce(proc_started,0), coalesce(boot_id,''),
-	       coalesce(scope,''), exit_code, coalesce(exit_reason,''), coalesce(ended_at,''),
+	       coalesce(scope,''),
+	       coalesce(host,''), coalesce(remote_pid,0), coalesce(remote_started,0),
+	       coalesce(remote_boot_id,''), coalesce(remote_scope,''),
+	       exit_code, coalesce(exit_reason,''), coalesce(ended_at,''),
 	       coalesce(end_cause,''), coalesce(end_state,''),
 	       (select count(*) from approvals a where a.session_id = runtime_sessions.id),
 	       (select count(*) from approvals a where a.session_id = runtime_sessions.id
@@ -194,6 +225,7 @@ func scanOne(s scanner) (Record, error) {
 	var code sql.NullInt64
 	err := s.Scan(&r.ID, &r.ClaudeID, &r.Cwd, &r.State, &r.RequestedBy,
 		&r.CreatedAt, &r.UpdatedAt, &r.PID, &r.Started, &r.BootID, &r.Scope,
+		&r.Host, &r.RemotePID, &r.RemoteStarted, &r.RemoteBootID, &r.RemoteScope,
 		&code, &r.ExitReason, &r.EndedAt, &r.EndCause, &r.EndState,
 		&r.Asked, &r.LeftWaiting, &r.TimedOut)
 	if err != nil {

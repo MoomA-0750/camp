@@ -32,6 +32,16 @@ type Agent struct {
 	// SSHConfig は読む場所。**読むだけ。書き戻す経路をこの型に持たせない。**
 	SSHConfig string
 
+	// リモート起動（agent_remote.go）。
+	SSH       string // ssh の実体。テストで差し替える
+	SSHKeygen string // 固定する鍵の指紋を読む
+	// SSHFile は ssh に -F で渡す config。空なら ssh の既定に任せる
+	// （既定のときに -F を付けると /etc/ssh/ssh_config が読まれなくなる）。
+	SSHFile    string
+	HeaderWait time.Duration // 向こうの sh が名乗るまで
+	ReapWait   time.Duration // 向こうを見に行く ssh 1本
+	ReapRetry  time.Duration // 見に行けなかったとき、もう一度行くまで
+
 	mu   sync.Mutex
 	kids map[string]*child
 	// stopWanted は「まだ生まれていない子」への停止指示。
@@ -61,12 +71,19 @@ type child struct {
 	turn bool
 	// logBroken は落とし先へ書けなくなったか。**黙って続けない。**
 	logBroken bool
+	// remote は ssh の向こうの子。このマシンの子なら nil。
+	remote *RemoteOwner
+	// deliberate は Camp が止めに入ったか。**止めて ssh が 255 で終わったのを、
+	// 接続が切れたと読まないため。**
+	deliberate bool
 }
 
 // NewAgent は実行面を作る。
 func NewAgent(sock, claude string) *Agent {
 	a := &Agent{Sock: sock, Claude: claude, Scope: true,
 		LogDir: DefaultLogDir(), SSHConfig: DefaultSSHConfig(),
+		SSH: "ssh", SSHKeygen: "ssh-keygen", SSHFile: os.Getenv("CAMP_SSH_CONFIG"),
+		HeaderWait: headerWait, ReapWait: reapWait, ReapRetry: 3 * time.Second,
 		kids: map[string]*child{}, stopWanted: map[string]string{}}
 	a.Command = a.defaultCommand
 	return a
@@ -137,8 +154,10 @@ func (a *Agent) held() []Held {
 			state = StateRunning
 		}
 		k.mu.Unlock()
+		// 向こうの身元も名乗る。**started が campd に届く前に campd が落ちると、
+		// 台帳は向こうの pid を知らないまま**になり、あとで始末できない（codex の指摘）。
 		out = append(out, Held{ID: id, Token: k.token, PID: pid,
-			Started: st, BootID: BootID(), Scope: k.scope, State: state})
+			Started: st, BootID: BootID(), Scope: k.scope, State: state, RemoteOwner: k.remote})
 	}
 	return out
 }
@@ -201,7 +220,11 @@ func (a *Agent) Run() error {
 		case MsgWelcome:
 			// 受理された。
 		case MsgStart:
-			go a.start(m)
+			if m.Remote != nil {
+				go a.startRemote(m)
+			} else {
+				go a.start(m)
+			}
 		case MsgInput:
 			a.toChild(m, userFrame(m.Text))
 		case MsgApprove:
@@ -214,6 +237,8 @@ func (a *Agent) Run() error {
 			go a.tail(m)
 		case MsgSSHScan:
 			go a.scanSSH(m)
+		case MsgSSHResolve:
+			go a.resolveSSH(m)
 		case MsgControl:
 			go a.control(m)
 		case MsgError:
@@ -373,6 +398,12 @@ func (a *Agent) start(m Msg) {
 func (a *Agent) drain(k *child, r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLine)
+	a.drainScanner(k, sc)
+}
+
+// drainScanner は読みかけの scanner から続ける。リモートでは向こうの sh の
+// 名乗り（1行目）を読んだあとで、同じ scanner をここへ渡す。
+func (a *Agent) drainScanner(k *child, sc *bufio.Scanner) {
 	var dropped int64
 	for sc.Scan() {
 		line := sc.Bytes()
@@ -546,7 +577,7 @@ func (a *Agent) stop(m Msg) {
 		k.mu.Unlock()
 		return
 	}
-	k.kill()
+	a.killChild(k)
 }
 
 // kill は孫まで止める。
@@ -573,7 +604,7 @@ func (a *Agent) stopAll(why string) {
 	a.mu.Unlock()
 	for _, k := range kids {
 		fmt.Fprintf(os.Stderr, "camp agent: %s を止める（%s）\n", k.id, why)
-		k.kill()
+		a.killChild(k)
 	}
 }
 
@@ -582,6 +613,10 @@ func (a *Agent) stopAll(why string) {
 // **campd に言われた pid をそのまま撃たない。** 起動時刻が一致しなければ、
 // それは同じ番号を取った他人のプロセスで、撃てば無関係なものを殺す。
 func (a *Agent) reap(m Msg) {
+	if m.RemoteOwner != nil {
+		a.reapOrphanRemote(m)
+		return
+	}
 	o := Owner{PID: m.PID, Started: m.Started, BootID: m.BootID}
 	alive, known := o.Alive()
 	if !known {

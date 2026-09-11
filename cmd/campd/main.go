@@ -2333,8 +2333,15 @@ func cmdRuntime(args []string) error {
 		return nil
 	}
 	for _, r := range rows {
+		where := r.Cwd
+		if r.Host != "" {
+			where = r.Host + ":" + r.Cwd
+		}
 		fmt.Printf("%-10s %-9s pid=%-7d %s\n  cwd=%s\n",
-			firstN(r.ID, 8), r.State, r.PID, r.CreatedAt, r.Cwd)
+			firstN(r.ID, 8), r.State, r.PID, r.CreatedAt, where)
+		if r.Host != "" && r.RemotePID != 0 {
+			fmt.Printf("  向こうの pid=%d\n", r.RemotePID)
+		}
 		if r.ClaudeID != "" {
 			fmt.Printf("  claude=%s\n", r.ClaudeID)
 		}
@@ -2367,6 +2374,7 @@ func cmdAllow(args []string) error {
 	fs := flag.NewFlagSet("allow", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
 	note := fs.String("note", "", "覚え書き")
+	host := fs.String("host", "", "向こうの接続先（ssh の Host 名）。空ならこのマシン")
 	rest, err := parseAround(fs, args)
 	if err != nil {
 		return err
@@ -2381,40 +2389,60 @@ func cmdAllow(args []string) error {
 	if len(rest) > 0 {
 		sub = rest[0]
 	}
+	at := func(p string) string {
+		if *host == "" {
+			return p
+		}
+		return *host + ":" + p
+	}
 	switch sub {
 	case "", "list":
-		rows, err := session.ListAllowed(db)
+		rows, err := session.ListAllAllowed(db)
 		if err != nil {
 			return err
 		}
 		if len(rows) == 0 {
 			fmt.Println("空。**この状態では1本も起こせない**（既定は deny）。")
-			fmt.Println("足すなら: campd allow add <ディレクトリ>")
+			fmt.Println("足すなら: campd allow add <ディレクトリ>（向こうなら -host <alias>）")
 			return nil
 		}
 		for _, a := range rows {
-			fmt.Printf("%s\n  足したのは %s（%s）%s\n", a.Path, a.AddedBy, a.AddedAt, a.Note)
+			p := a.Path
+			if a.Host != "" {
+				p = a.Host + ":" + a.Path
+			}
+			fmt.Printf("%s\n  足したのは %s（%s）%s\n", p, a.AddedBy, a.AddedAt, a.Note)
 		}
 		return nil
 
 	case "add":
 		if len(rest) < 2 {
-			return fmt.Errorf("ディレクトリを指す: campd allow add <dir>")
+			return fmt.Errorf("ディレクトリを指す: campd allow add [-host <alias>] <dir>")
 		}
-		a, err := session.AddAllowed(db, rest[1], *note, "cli")
+		var a session.Allowed
+		if *host == "" {
+			a, err = session.AddAllowed(db, rest[1], *note, "cli")
+		} else {
+			a, err = session.AddRemoteAllowed(db, *host, rest[1], *note, "cli")
+		}
 		if err != nil {
 			return err
 		}
 		audit.Append(db, audit.Entry{Actor: "cli", Action: "allowlist.add",
-			Target: a.Path, Detail: *note, Outcome: audit.OK})
-		fmt.Printf("許した: %s\n", a.Path)
+			Target: at(a.Path), Detail: *note, Outcome: audit.OK})
+		fmt.Printf("許した: %s\n", at(a.Path))
 		return nil
 
 	case "remove", "rm":
 		if len(rest) < 2 {
-			return fmt.Errorf("パスを指す: campd allow remove <path>")
+			return fmt.Errorf("パスを指す: campd allow remove [-host <alias>] <path>")
 		}
-		ok, err := session.RemoveAllowed(db, rest[1])
+		var ok bool
+		if *host == "" {
+			ok, err = session.RemoveAllowed(db, rest[1])
+		} else {
+			ok, err = session.RemoveRemoteAllowed(db, *host, rest[1])
+		}
 		if err != nil {
 			return err
 		}
@@ -2423,11 +2451,11 @@ func cmdAllow(args []string) error {
 			out = audit.Error
 		}
 		audit.Append(db, audit.Entry{Actor: "cli", Action: "allowlist.remove",
-			Target: rest[1], Outcome: out})
+			Target: at(rest[1]), Outcome: out})
 		if !ok {
-			return fmt.Errorf("その行は無い（実パスで指す）: %s", rest[1])
+			return fmt.Errorf("その行は無い（書いたとおりのパスで指す）: %s", at(rest[1]))
 		}
-		fmt.Printf("外した: %s\n", rest[1])
+		fmt.Printf("外した: %s\n", at(rest[1]))
 		return nil
 	}
 	return fmt.Errorf("知らない副命令: %s（list / add / remove）", sub)
@@ -2467,13 +2495,29 @@ func cmdSSH(args []string) error {
 				mark = "許"
 			}
 			fmt.Printf("%s %-20s %s@%s:%d %s\n", mark, d.Alias, d.User, d.HostName, d.Port, d.Note)
+			if d.Allowed {
+				if d.Pinned.Pinned() {
+					fmt.Printf("     固定した行き先: %s（信じるホスト鍵 %d 個）\n", d.Pinned, len(d.Pinned.HostKeys))
+				} else {
+					fmt.Println("     **行き先（ホスト鍵）が固定されていない（起こせない）。画面から許し直す**")
+				}
+			}
+			if d.ClaudePath != "" {
+				fmt.Printf("     claude: %s\n", d.ClaudePath)
+			}
 		}
-		fmt.Println("\n（許 = 許可済み。**リモート起動は Phase 3 では行わない**）")
+		fmt.Println("\n（許 = 許可済み。起こせるのは行き先を固定したものだけ）")
 		return nil
 
 	case "allow", "deny":
 		if len(rest) < 2 {
 			return fmt.Errorf("エイリアスを指す: campd ssh %s <alias>", sub)
+		}
+		// **許すのは画面から。** 許すときに `ssh -G` で行き先を固定するが、
+		// ~/.ssh を読めるのは実行面だけで、ここ（camp ユーザー）からは読めない。
+		// 外すほうは狭める向きなので、ここからでもできる。
+		if sub == "allow" {
+			return fmt.Errorf("許すのは画面から（行き先を ssh -G で固定するのに実行面が要る。camp ユーザーからは ~/.ssh を読めない）")
 		}
 		on := sub == "allow"
 		if err := session.SetDestinationAllowed(db, rest[1], on); err != nil {
