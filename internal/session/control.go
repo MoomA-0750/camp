@@ -226,7 +226,10 @@ func (c *Control) dropAgent(a *agentConn) {
 	c.s.audit("", "agent.disconnect", a.who,
 		fmt.Sprintf("実行面が落ちた。見張っていたのは %d 本", len(ids)), audit.Error)
 	for _, id := range ids {
-		_ = setState(c.s.db, id, StateOrphaned)
+		// **子は実行面と一緒に終わる**（stdin が閉じる）。それを仕様とした
+		// （2026-09-11、本人）。このあと Tick が居なくなったのを見て閉じるときに、
+		// 理由が「実行面が落ちた」になるよう控えておく。
+		_ = markOrphaned(c.s.db, id, EndAgentLost)
 		c.s.audit(id, "session.orphan", "", "実行面が落ちた", audit.Error)
 	}
 }
@@ -307,6 +310,8 @@ func (c *Control) readopt(held []Held) {
 		s.mu.Unlock()
 		_ = setOwner(s.db, h.ID, o, scope)
 		_ = setState(s.db, h.ID, r.State)
+		// 見張りは戻った。「見張りが外れていた」の控えはもう理由にならない。
+		_ = clearOrphanCause(s.db, h.ID)
 		s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
 			"実行面がまだ抱えていたので引き取り直した（"+r.State+"）", audit.OK)
 	}
@@ -368,7 +373,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 				s.audit(m.Session, "session.started", strconv.Itoa(m.PID),
 					fmt.Sprintf("uid %d のプロセスを名乗った（実行面は %d）", uid, c.allowUID),
 					audit.Denied)
-				s.fail(m.Session, "実行面と違うユーザーのプロセスを名乗った")
+				s.fail(m.Session, "実行面と違うユーザーのプロセスを名乗った", EndStartFailed)
 				return
 			}
 		}
@@ -405,13 +410,17 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		}
 		s.mu.Lock()
 		ls.last = s.Now()
+		idle := false
 		switch m.Kind {
 		case "result":
 			// ターンが終わった。次の入力を受けられる。
+			// **止めに入っているものは idle に戻さない**（孫まで止める途中）。
 			if ls.rec.State == StateRunning {
 				ls.rec.State = StateIdle
+				idle = true
 			}
 			ls.turn = time.Time{}
+			ls.interrupted = time.Time{}
 		case "control_request/can_use_tool":
 			if m.ReqID != "" {
 				ls.asked[m.ReqID] = true
@@ -419,7 +428,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		}
 		s.mu.Unlock()
 
-		if m.Kind == "result" {
+		if idle {
 			_ = setState(s.db, m.Session, StateIdle)
 		}
 		if m.ClaudeID != "" {
@@ -436,7 +445,9 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		s.mu.Lock()
 		delete(s.live, m.Session)
 		s.mu.Unlock()
-		_ = finish(s.db, m.Session, m.Code, m.Reason)
+		// 止めろと言ってあれば、控えてある理由（本人が止めた・放置で閉じた）が残る。
+		// 何も言っていないのに終わったなら、子が自分で終わった。
+		_ = finish(s.db, m.Session, m.Code, m.Reason, EndSelf, false)
 		s.CloseApprovals(m.Session)
 		out := audit.OK
 		if m.Code != 0 {
@@ -448,7 +459,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		if _, ok := s.check(m); !ok {
 			return
 		}
-		s.fail(m.Session, m.Error)
+		s.fail(m.Session, m.Error, EndStartFailed)
 
 	case MsgReaped:
 		// **始末したという申告を、そのまま信じない。** /proc を見る。
@@ -465,7 +476,8 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID),
 				"始末したと言われたが、確かめられなかった", audit.Error)
 		default:
-			_ = finish(s.db, m.Session, m.Code, "孤児を始末した: "+m.Reason)
+			_ = finish(s.db, m.Session, m.Code, "孤児を始末した: "+m.Reason, EndReaped, true)
+			s.CloseApprovals(m.Session)
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, audit.OK)
 		}
 

@@ -4,8 +4,8 @@ import {
   api, type Approval, type ContextPayload, type LogLine,
   type PlanLimit, type RuntimeUsage,
 } from '../api'
-import { Empty, Failed, Loading, short, tokens, useAsync } from '../ui'
-import { StateBadge } from './Runtime'
+import { Empty, Failed, Loading, clock, short, tokens, useAsync } from '../ui'
+import { ApprovalSummary, StateBadge, atEndLabel, endLabel } from './Runtime'
 
 // 走っているセッション1本。
 //
@@ -27,8 +27,10 @@ export default function RuntimeDetail() {
   const [live, setLive] = useState(false)
   const [tick, setTick] = useState(0)
 
-  const list = useAsync(() => api.runtime(), [tick])
-  const rec = (list.data?.sessions ?? []).find((s) => s.id === id)
+  // **1本を直接引く。** 一覧から探すと、一覧に載っていないものを開けない
+  // （一覧は走っているものだけ。終わったものは「終わったもの」から開く）。
+  const one = useAsync(() => api.runtimeOne(id), [id, tick])
+  const rec = one.data
   const waiting = useAsync(() => api.runtimeApprovals(id), [id, tick])
 
   // 流れは**この箱の中だけ**を動かす。ページごと動かすと、上に出ている
@@ -47,7 +49,7 @@ export default function RuntimeDetail() {
   // だけになる（枠は全体で16本）。代わりに1度だけ読んで並べる。
   // **状態が分かるまで繋がない。** 分かる前に繋ぐと、終わったセッションを
   // 開いただけでも一瞬だけ枠を取る。
-  const known = !!list.data
+  const known = !!one.data
   const done = rec?.state === 'exited'
   const streaming = wantLive && known && !done
 
@@ -134,9 +136,17 @@ export default function RuntimeDetail() {
         <p className="sub muted">
           起こしたのは {short(rec.created_at)} / pid {rec.pid || '—'}
           {rec.claude_id ? <> / 会話記録 <code>{rec.claude_id.slice(0, 8)}</code></> : null}
-          {rec.exit_reason ? <> / 終わり: {rec.exit_reason}</> : null}
         </p>
       )}
+      {rec?.state === 'exited' && (
+        <p className="sub">
+          {short(rec.ended_at ?? '')} に終わった: <strong>{endLabel(rec.end_cause)}</strong>
+          {rec.end_state ? <>（{atEndLabel(rec.end_state)}）</> : null}
+          {' · 承認 '}<ApprovalSummary s={rec} />
+          {rec.exit_reason ? <span className="muted"> · {rec.exit_reason}</span> : null}
+        </p>
+      )}
+      {one.error && <Failed error={one.error} />}
 
       <Ask id={id} rows={waiting} onAnswered={() => setTick((v) => v + 1)} />
 
@@ -190,7 +200,7 @@ export default function RuntimeDetail() {
           <div className="stream" ref={box} onScroll={onScroll}>
             {shown.map((ln) => (
               <div key={ln.seq} className="frame">
-                <span className="muted mono">{ln.at.slice(11, 19)}</span>{' '}
+                <span className="muted mono">{clock(ln.at)}</span>{' '}
                 <span className="kind">{ln.kind}</span>{' '}
                 <span className="mono">{summarize(ln)}</span>
               </div>

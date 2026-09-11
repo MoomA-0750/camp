@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import Runtime from './Runtime'
 
@@ -27,7 +27,7 @@ function show(path = '/runtime') {
 test('sessions が null でも落ちない', async () => {
   stub((u) => (u.startsWith('/api/runtime') ? { agent_connected: true, sessions: null } : []))
   show()
-  await waitFor(() => expect(screen.getByText(/まだ1本も起こしていない/)).toBeTruthy())
+  await waitFor(() => expect(screen.getByText(/いま走っているものは無い/)).toBeTruthy())
 })
 
 test('許可リストが null でも落ちない', async () => {
@@ -48,4 +48,64 @@ test('タブがURLに乗る', async () => {
   stub(() => ({ agent_connected: true, sessions: [] }))
   show('/runtime?tab=ssh')
   await waitFor(() => expect(screen.getByText(/読むだけ/)).toBeTruthy())
+})
+
+// ---- 終わったもの（2026-09-11）------------------------------------------------
+
+const base = { requested_by: 'user', created_at: '2026-09-11T01:00:00Z', updated_at: '', state: 'exited' }
+const ended = {
+  sessions: [
+    { ...base, id: 'a1', cwd: '/w/a', ended_at: '2026-09-11T02:00:00Z',
+      end_cause: 'user_stop', end_state: 'running', exit_code: -1,
+      approvals_asked: 2, approvals_left_waiting: 1, approvals_timed_out: 0 },
+    { ...base, id: 'a2', cwd: '/w/b', ended_at: '2026-09-11T01:30:00Z',
+      end_cause: 'idle_timeout', end_state: 'idle', exit_code: 0,
+      approvals_asked: 1, approvals_left_waiting: 0, approvals_timed_out: 1 },
+    // 記録を始める前に終わったもの。終わり方は無い。
+    { ...base, id: 'a3', cwd: '/w/c', ended_at: '2026-09-10T00:00:00Z',
+      approvals_asked: 0, approvals_left_waiting: 0, approvals_timed_out: 0 },
+  ],
+  next: '2026-09-10T00:00:00Z|a3',
+  counts: { all: 12, mid: 1, waiting: 1, ignored: 1, unknown: 1, user_stop: 1, idle_timeout: 1 },
+}
+
+// 本人が探したいもの——動いている途中で終わった・承認を待たせたまま終わった・
+// 承認を期限切れにした——が、1行ずつ見分けられる。
+test('終わったものに、終わり方・そのとき・承認の内訳が出る', async () => {
+  stub((u) => (u.startsWith('/api/runtime/ended') ? ended : { agent_connected: true, sessions: [] }))
+  show('/runtime?tab=ended')
+  const table = await screen.findByRole('table')
+  const rows = within(table).getAllByRole('row')
+  expect(within(rows[1]).getByText('本人が止めた')).toBeTruthy()
+  expect(within(rows[1]).getByText('動いている途中')).toBeTruthy()
+  expect(within(rows[1]).getByText('待たせたまま 1')).toBeTruthy()
+  expect(within(rows[2]).getByText('放置で閉じた')).toBeTruthy()
+  expect(within(rows[2]).getByText('期限切れ 1')).toBeTruthy()
+  // 記録の無いものを、推し量って埋めない。
+  expect(within(rows[3]).getByText('記録なし')).toBeTruthy()
+  // 件数は頁ではなく全体。
+  expect(screen.getByText('12')).toBeTruthy()
+  expect(screen.getByText('さらに古いもの')).toBeTruthy()
+})
+
+// 絞り込みと続きは URL に乗り、そのまま API へ渡る。
+test('絞り込みと続きがURLに乗る', async () => {
+  const urls: string[] = []
+  stub((u) => {
+    urls.push(u)
+    return u.startsWith('/api/runtime/ended') ? ended : { agent_connected: true, sessions: [] }
+  })
+  show('/runtime?tab=ended&kind=waiting')
+  await waitFor(() => expect(urls.some((u) => u === '/api/runtime/ended?kind=waiting')).toBe(true))
+
+  fireEvent.click(await screen.findByText('さらに古いもの'))
+  await waitFor(() => expect(urls.some((u) => u.includes('kind=waiting') && u.includes('before='))).toBe(true))
+})
+
+test('終わったものが無いと、そう出る', async () => {
+  stub((u) => (u.startsWith('/api/runtime/ended')
+    ? { sessions: [], counts: { all: 0 } }
+    : { agent_connected: true, sessions: [] }))
+  show('/runtime?tab=ended')
+  await waitFor(() => expect(screen.getByText(/まだ1本も終わっていない/)).toBeTruthy())
 })

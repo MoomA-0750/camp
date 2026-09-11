@@ -26,6 +26,16 @@ type Record struct {
 	ExitCode   *int   `json:"exit_code,omitempty"`
 	ExitReason string `json:"exit_reason,omitempty"`
 	EndedAt    string `json:"ended_at,omitempty"`
+
+	// どう終わったか（end.go）。2026-09-11 より前に終わった行は空のまま。
+	EndCause string `json:"end_cause,omitempty"`
+	// 終わる直前に何をしていたか（starting / idle / running）。
+	EndState string `json:"end_state,omitempty"`
+
+	// 承認の内訳。**終わったあとで「待たせたまま終わった」を選り分けるため。**
+	Asked       int `json:"approvals_asked"`
+	LeftWaiting int `json:"approvals_left_waiting"` // 答えないうちにセッションが終わった
+	TimedOut    int `json:"approvals_timed_out"`    // 答えないうちに期限が切れた
 }
 
 // Owner はこの行が指しているプロセス。
@@ -54,13 +64,52 @@ func insert(db *store.DB, r Record) error {
 }
 
 // setState は状態だけを進める。
+//
+// **stopping と orphaned へは入れない。** そこへは markStopping / markOrphaned で
+// 入る——手前の状態を控えないと、終わったときに「何をしていたか」が消える。
 func setState(db *store.DB, id, state string) error {
 	if !validState(state) {
 		return fmt.Errorf("知らない状態: %s", state)
 	}
+	if state == StateStopping || state == StateOrphaned {
+		return fmt.Errorf("%s へは setState で入れない", state)
+	}
 	_, err := db.Exec(
 		`update runtime_sessions set state=?, updated_at=? where id=?`,
 		state, now(), id)
+	return err
+}
+
+// markStopping は止めに入ったことを書く。cause は「このまま終われば、これが理由」。
+func markStopping(db *store.DB, id, cause string) error {
+	_, err := db.Exec(`
+		update runtime_sessions
+		set prev_state = case when state in (?, ?) then prev_state else state end,
+		    state = ?, end_cause = ?, updated_at = ?
+		where id = ? and state <> ?`,
+		StateStopping, StateOrphaned, StateStopping, cause, now(), id, StateExited)
+	return err
+}
+
+// markOrphaned は見張りが外れたことを書く。
+//
+// 止めろと言ってあったなら、その理由を残す（止めろと言ったものが終わっただけ）。
+func markOrphaned(db *store.DB, id, cause string) error {
+	_, err := db.Exec(`
+		update runtime_sessions
+		set prev_state = case when state in (?, ?) then prev_state else state end,
+		    state = ?, end_cause = coalesce(end_cause, ?), updated_at = ?
+		where id = ? and state <> ?`,
+		StateStopping, StateOrphaned, StateOrphaned, cause, now(), id, StateExited)
+	return err
+}
+
+// clearOrphanCause は引き取り直したときに、見張りが外れていたという控えを消す。
+// 止めろと言ってあった控えは残す。
+func clearOrphanCause(db *store.DB, id string) error {
+	_, err := db.Exec(`
+		update runtime_sessions set end_cause = null
+		where id = ? and end_cause in (?, ?)`, id, EndAgentLost, EndUnseen)
 	return err
 }
 
@@ -84,11 +133,23 @@ func setClaudeID(db *store.DB, id, claudeID string) error {
 }
 
 // finish は終わりを書く。**一度 exited にしたら上書きしない。**
-func finish(db *store.DB, id string, code int, reason string) error {
+//
+// cause は「他に理由が控えていなければ、これ」。止めろと言ったあとで子が
+// 終わったなら、控えてある理由（本人が止めた・放置で閉じた）のほうが正しい。
+// override なら控えを無視する（止まらなかった・起こせなかった・始末した）。
+//
+// end_state は終わる直前に何をしていたか。stopping / orphaned はその手前を採る。
+// **SQLite の UPDATE は右辺を更新前の値で読む**ので、同じ文の中で state を
+// 見てから exited にできる。
+func finish(db *store.DB, id string, code int, reason, cause string, override bool) error {
 	_, err := db.Exec(`
 		update runtime_sessions
-		set state=?, exit_code=?, exit_reason=?, ended_at=?, updated_at=?
+		set end_state = case when state in (?, ?) then coalesce(prev_state, state) else state end,
+		    end_cause = case when ? then ? else coalesce(end_cause, ?) end,
+		    state=?, exit_code=?, exit_reason=?, ended_at=?, updated_at=?
 		where id=? and state<>?`,
+		StateStopping, StateOrphaned,
+		override, cause, cause,
 		StateExited, code, reason, now(), now(), id, StateExited)
 	return err
 }
@@ -98,10 +159,30 @@ func get(db *store.DB, id string) (Record, error) {
 	return scanOne(db.QueryRow(selectCols+` where id=?`, id))
 }
 
-const selectCols = `
+// ErrNotFound はその id の行が無いとき。
+var ErrNotFound = fmt.Errorf("そのセッションは無い")
+
+// Get は1行読む。画面が1本を開くときに使う（一覧に載っていない古いものも開ける）。
+func Get(db *store.DB, id string) (Record, error) {
+	r, err := get(db, id)
+	if err == sql.ErrNoRows {
+		return r, ErrNotFound
+	}
+	return r, err
+}
+
+// 承認の数えは approvals の reason から採る。**別の列に写さない**——
+// 写すと、承認が閉じられた時刻と数えた時刻がずれたときに食い違う。
+var selectCols = `
 	select id, coalesce(claude_id,''), cwd, state, requested_by, created_at, updated_at,
 	       coalesce(pid,0), coalesce(proc_started,0), coalesce(boot_id,''),
-	       coalesce(scope,''), exit_code, coalesce(exit_reason,''), coalesce(ended_at,'')
+	       coalesce(scope,''), exit_code, coalesce(exit_reason,''), coalesce(ended_at,''),
+	       coalesce(end_cause,''), coalesce(end_state,''),
+	       (select count(*) from approvals a where a.session_id = runtime_sessions.id),
+	       (select count(*) from approvals a where a.session_id = runtime_sessions.id
+	          and a.reason = '` + BySessionEnd + `'),
+	       (select count(*) from approvals a where a.session_id = runtime_sessions.id
+	          and a.reason = '` + ByTimeout + `')
 	from runtime_sessions`
 
 type scanner interface {
@@ -113,7 +194,8 @@ func scanOne(s scanner) (Record, error) {
 	var code sql.NullInt64
 	err := s.Scan(&r.ID, &r.ClaudeID, &r.Cwd, &r.State, &r.RequestedBy,
 		&r.CreatedAt, &r.UpdatedAt, &r.PID, &r.Started, &r.BootID, &r.Scope,
-		&code, &r.ExitReason, &r.EndedAt)
+		&code, &r.ExitReason, &r.EndedAt, &r.EndCause, &r.EndState,
+		&r.Asked, &r.LeftWaiting, &r.TimedOut)
 	if err != nil {
 		return r, err
 	}
@@ -124,14 +206,9 @@ func scanOne(s scanner) (Record, error) {
 	return r, nil
 }
 
-// listLive は終わっていない行を全部読む。再起動後の照合に使う。
-func listLive(db *store.DB) ([]Record, error) {
-	rows, err := db.Query(selectCols+` where state<>? order by created_at`, StateExited)
-	if err != nil {
-		return nil, err
-	}
+func scanAll(rows *sql.Rows) ([]Record, error) {
 	defer rows.Close()
-	var out []Record
+	out := []Record{} // **nil を返さない**（JSON で null になる）
 	for rows.Next() {
 		r, err := scanOne(rows)
 		if err != nil {
@@ -142,7 +219,28 @@ func listLive(db *store.DB) ([]Record, error) {
 	return out, rows.Err()
 }
 
-// List は画面と CLI 用。新しい順に n 件。
+// listLive は終わっていない行を全部読む。再起動後の照合に使う。
+func listLive(db *store.DB) ([]Record, error) {
+	rows, err := db.Query(selectCols+` where state<>? order by created_at`, StateExited)
+	if err != nil {
+		return nil, err
+	}
+	return scanAll(rows)
+}
+
+// ListLive は終わっていないものを新しい順に全部。画面の「走っているもの」。
+//
+// 同時に走らせられるのは高々数本なので上限は置かない。孤児も入る——
+// **見張りが外れているだけで、まだ終わっていない。**
+func ListLive(db *store.DB) ([]Record, error) {
+	rows, err := db.Query(selectCols+` where state<>? order by created_at desc`, StateExited)
+	if err != nil {
+		return nil, err
+	}
+	return scanAll(rows)
+}
+
+// List は CLI 用。状態を問わず新しい順に n 件。
 //
 // **1件も無いときは空の配列を返す。nil を返さない。**
 // Go の nil スライスは JSON で `null` になる。受け取る側が「配列が来る」
@@ -156,14 +254,5 @@ func List(db *store.DB, n int) ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []Record{}
-	for rows.Next() {
-		r, err := scanOne(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return scanAll(rows)
 }

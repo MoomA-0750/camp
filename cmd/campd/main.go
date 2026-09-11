@@ -2338,8 +2338,21 @@ func cmdRuntime(args []string) error {
 		if r.ClaudeID != "" {
 			fmt.Printf("  claude=%s\n", r.ClaudeID)
 		}
+		if r.State == session.StateExited {
+			fmt.Printf("  終わり=%s", session.EndLabel(r.EndCause))
+			if r.EndState != "" {
+				fmt.Printf(" / そのとき %s", r.EndState)
+			}
+			if r.LeftWaiting > 0 {
+				fmt.Printf(" / 承認 %d 件を待たせたまま", r.LeftWaiting)
+			}
+			if r.TimedOut > 0 {
+				fmt.Printf(" / 承認 %d 件が期限切れ", r.TimedOut)
+			}
+			fmt.Println()
+		}
 		if r.ExitReason != "" {
-			fmt.Printf("  終わり=%s\n", r.ExitReason)
+			fmt.Printf("  理由=%s\n", r.ExitReason)
 		}
 	}
 	return nil

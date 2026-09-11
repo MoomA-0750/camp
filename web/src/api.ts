@@ -125,9 +125,17 @@ export type RuntimeSession = {
   requested_by: string; created_at: string; updated_at: string
   pid?: number; scope?: string
   exit_code?: number; exit_reason?: string; ended_at?: string
+  // どう終わったか（2026-09-11 から）。それより前に終わったものには無い。
+  end_cause?: string; end_state?: string
+  approvals_asked?: number; approvals_left_waiting?: number; approvals_timed_out?: number
 }
 
 export type RuntimeList = { agent_connected: boolean; sessions: RuntimeSession[] }
+
+// 終わったセッションの1頁。counts は頁に関係なく全体の件数。
+export type RuntimeEnded = {
+  sessions: RuntimeSession[]; next?: string; counts: Record<string, number>
+}
 
 export type LogLine = { seq: number; at: string; kind: string; frame?: unknown }
 
@@ -298,6 +306,10 @@ export const api = {
     fetchJSON<{ ambiguous: Ref[]; dangling: Ref[] }>('/api/vault/issues'),
 
   runtime: () => fetchJSON<RuntimeList>('/api/runtime'),
+  runtimeOne: (id: string) =>
+    fetchJSON<RuntimeSession>(`/api/runtime/${encodeURIComponent(id)}`),
+  runtimeEnded: (kind = '', before = '') =>
+    fetchJSON<RuntimeEnded>('/api/runtime/ended' + qs({ kind, before })),
   runtimeStart: (cwd: string) => postJSON<RuntimeSession>('/api/runtime', { cwd }),
   runtimeInput: (id: string, text: string) =>
     postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/input`, { text }),

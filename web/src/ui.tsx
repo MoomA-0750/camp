@@ -36,11 +36,35 @@ export function Empty({ children }: { children: React.ReactNode }) {
   return <p className="muted">{children}</p>
 }
 
-/** 日時は「YYYY-MM-DD HH:MM」まで。秒より下は一覧では見ない。 */
+/**
+ * 日時は「YYYY-MM-DD HH:MM」まで。秒より下は一覧では見ない。
+ *
+ * **時差の付いたものは手元の時刻に直す。** DB は UTC（末尾 Z）で持っているので、
+ * 文字列を切るだけだと 9 時間ずれて見える（2026-09-11、17:15 に終わったものが
+ * 08:15 と出ていた。承認の期限も同じだけずれていた）。時差の無いものはそのまま。
+ */
 export function short(ts?: string) {
   if (!ts || ts.length < 16) return ts ?? ''
+  const d = zoned(ts)
+  if (d) return `${ymd(d)} ${p2(d.getHours())}:${p2(d.getMinutes())}`
   return ts.slice(0, 10) + ' ' + ts.slice(11, 16)
 }
+
+/** 時刻だけ（HH:MM:SS）。流れの1行に使う。時差の扱いは short と同じ。 */
+export function clock(ts?: string) {
+  if (!ts) return ''
+  const d = zoned(ts)
+  if (d) return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+  return ts.slice(11, 19)
+}
+
+function zoned(ts: string): Date | null {
+  if (!/(Z|[+-]\d\d:?\d\d)$/.test(ts)) return null
+  const d = new Date(ts)
+  return isNaN(d.getTime()) ? null : d
+}
+const p2 = (n: number) => String(n).padStart(2, '0')
+const ymd = (d: Date) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`
 
 export function num(n: number) {
   return n.toLocaleString('ja-JP')

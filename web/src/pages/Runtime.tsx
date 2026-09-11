@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api } from '../api'
+import { api, type RuntimeSession } from '../api'
 import { Empty, Failed, Loading, short, useAsync } from '../ui'
 
 // Camp が起こしたセッションの一覧と、新しく起こす口。
@@ -46,6 +46,8 @@ export default function Runtime() {
     }
     setSp(next)
   }
+  // タブを移るときは、そのタブにしか意味の無い絞り込みを落とす。
+  const go = (t: string) => set({ tab: t, kind: '', before: '' })
 
   return (
     <>
@@ -53,19 +55,25 @@ export default function Runtime() {
       <p className="sub muted">Camp が起こしたセッション。</p>
 
       <div className="tabs">
-        <button className={tab === 'sessions' ? 'on' : ''} onClick={() => set({ tab: '' })}>
+        <button className={tab === 'sessions' ? 'on' : ''} onClick={() => go('')}>
           走っているもの
         </button>
-        <button className={tab === 'allow' ? 'on' : ''} onClick={() => set({ tab: 'allow' })}>
+        <button className={tab === 'ended' ? 'on' : ''} onClick={() => go('ended')}>
+          終わったもの
+        </button>
+        <button className={tab === 'allow' ? 'on' : ''} onClick={() => go('allow')}>
           許可した場所
         </button>
-        <button className={tab === 'ssh' ? 'on' : ''} onClick={() => set({ tab: 'ssh' })}>
+        <button className={tab === 'ssh' ? 'on' : ''} onClick={() => go('ssh')}>
           接続先の台帳
         </button>
       </div>
 
       {tab === 'allow' && <Allowlist reload={() => setN((v) => v + 1)} rows={allow} />}
       {tab === 'ssh' && <SSHLedger />}
+      {tab === 'ended' && (
+        <Ended kind={sp.get('kind') ?? ''} before={sp.get('before') ?? ''} set={set} />
+      )}
       {tab === 'sessions' && (
         <>
           {list.loading && <Loading />}
@@ -86,7 +94,7 @@ export default function Runtime() {
           {err && <Failed error={err} />}
 
           {!list.loading && !list.error && sessions.length === 0 && (
-            <Empty>まだ1本も起こしていない。</Empty>
+            <Empty>いま走っているものは無い。</Empty>
           )}
           {sessions.length > 0 && (
             <table>
@@ -94,7 +102,6 @@ export default function Runtime() {
                 <tr>
                   <th className="nowrap">状態</th><th>場所</th>
                   <th className="nowrap">起こした時刻</th><th className="num">pid</th>
-                  <th>終わり</th>
                 </tr>
               </thead>
               <tbody>
@@ -111,7 +118,6 @@ export default function Runtime() {
                     </td>
                     <td className="nowrap">{short(s.created_at)}</td>
                     <td className="num">{s.pid || ''}</td>
-                    <td className="muted">{s.exit_reason ?? ''}</td>
                   </tr>
                 ))}
               </tbody>
@@ -129,6 +135,127 @@ export function StateBadge({ state }: { state: string }) {
     stopping: '停止中', exited: '終了', orphaned: '孤児',
   }
   return <span className={'badge s-' + state}>{label[state] ?? state}</span>
+}
+
+// 終わり方。**DB には決まった語だけが入っている**（internal/session/end.go）。
+// 文はここで作る。
+const END_LABEL: Record<string, string> = {
+  self: '子が自分で終わった',
+  user_stop: '本人が止めた',
+  idle_timeout: '放置で閉じた',
+  turn_timeout: 'ターンが長すぎて止めた',
+  stop_timeout: '止まらず見張りを諦めた',
+  start_failed: '起こせなかった',
+  agent_lost: '実行面が落ちた',
+  unseen: '見ていない間に終わっていた',
+  reaped: '残っていたものを始末した',
+}
+const CAUSES = Object.keys(END_LABEL)
+
+const AT_END: Record<string, string> = {
+  running: '動いている途中', idle: '待機中', starting: '起動中',
+}
+
+// 横断的な絞り込み。本人が探したいのはここ（2026-09-11）。
+const KINDS: [string, string][] = [
+  ['', 'すべて'],
+  ['mid', '動いている途中で終わった'],
+  ['waiting', '承認を待たせたまま終わった'],
+  ['ignored', '承認を期限切れにした'],
+]
+
+// endLabel は終わり方の文。**記録を始める前に終わったものは「記録なし」**
+// ——理由の文から推し量って埋めない。
+export function endLabel(cause?: string): string {
+  if (!cause) return '記録なし'
+  return END_LABEL[cause] ?? cause
+}
+
+export function atEndLabel(state?: string): string {
+  if (!state) return ''
+  return AT_END[state] ?? state
+}
+
+function Ended({ kind, before, set }: {
+  kind: string
+  before: string
+  set: (patch: Record<string, string>) => void
+}) {
+  const page = useAsync(() => api.runtimeEnded(kind, before), [kind, before])
+  const rows = page.data?.sessions ?? []
+  const counts = page.data?.counts ?? {}
+  const next = page.data?.next ?? ''
+
+  const chip = (k: string, label: string) => (
+    <button key={k || 'all'} className={kind === k ? 'on' : ''}
+      onClick={() => set({ kind: k, before: '' })}>
+      {label} <span className="muted">{counts[k || 'all'] ?? 0}</span>
+    </button>
+  )
+
+  return (
+    <>
+      <div className="chips">{KINDS.map(([k, l]) => chip(k, l))}</div>
+      <div className="chips">
+        {CAUSES.filter((c) => (counts[c] ?? 0) > 0 || kind === c).map((c) => chip(c, END_LABEL[c]))}
+        {((counts.unknown ?? 0) > 0 || kind === 'unknown') && chip('unknown', '記録なし')}
+      </div>
+
+      {page.loading && <Loading />}
+      {page.error && <Failed error={page.error} />}
+      {!page.loading && !page.error && rows.length === 0 && (
+        <Empty>{kind ? '当てはまるものは無い。' : 'まだ1本も終わっていない。'}</Empty>
+      )}
+      {rows.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              {/* 探したいもの（終わり方・そのとき・承認）を、長いパスより前に置く。
+                  狭い画面ではパスの手前までしか見えない（2026-09-11、400px で撮った）。 */}
+              <th className="nowrap">終わった時刻</th>
+              <th className="nowrap">終わり方</th><th className="nowrap">そのとき</th>
+              <th className="nowrap">承認</th><th>場所</th><th className="num nowrap">コード</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((s) => (
+              <tr key={s.id}>
+                <td className="nowrap">
+                  <Link to={`/runtime/${s.id}`}>{short(s.ended_at ?? '')}</Link>
+                </td>
+                <td className="nowrap">{endLabel(s.end_cause)}</td>
+                <td className="nowrap">{atEndLabel(s.end_state)}</td>
+                <td className="nowrap"><ApprovalSummary s={s} /></td>
+                <td className="mono wrap"><Link to={`/runtime/${s.id}`}>{s.cwd}</Link></td>
+                <td className="num">{s.exit_code ?? ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {(before || next) && (
+        <p className="sub">
+          {before && <button onClick={() => set({ before: '' })}>最新に戻る</button>}{' '}
+          {next && <button onClick={() => set({ before: next })}>さらに古いもの</button>}
+        </p>
+      )}
+    </>
+  )
+}
+
+// 承認の内訳。**待たせたまま・期限切れは目立たせる**（探したいのはそこ）。
+export function ApprovalSummary({ s }: { s: RuntimeSession }) {
+  const asked = s.approvals_asked ?? 0
+  if (asked === 0) return <span className="muted">—</span>
+  const left = s.approvals_left_waiting ?? 0
+  const late = s.approvals_timed_out ?? 0
+  return (
+    <>
+      {asked} 件
+      {left > 0 && <> · <span className="warn-text">待たせたまま {left}</span></>}
+      {late > 0 && <> · <span className="warn-text">期限切れ {late}</span></>}
+    </>
+  )
 }
 
 function Allowlist({ rows, reload }: {

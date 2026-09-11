@@ -8,7 +8,7 @@ function stub(rows: unknown) {
   } as unknown as Response))
 }
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
 
 const base = {
   id: 1, agent: 'claude-code', kind: 'five_hour', source: 'statusline',
@@ -25,11 +25,13 @@ test('記録が無いときは値ではなく理由を出す', async () => {
 })
 
 // 値そのものより「いつ観測した値か」が要る。TUI を開いていない間は更新されない。
+// 観測時刻は手元の時刻で出す（DB は UTC。2026-09-11 まで UTC のまま出ていた）。
 test('観測時刻を必ず添える', async () => {
+  vi.stubEnv('TZ', 'Asia/Tokyo')
   stub([{ ...base, ends_at: new Date(Date.now() + 2 * 3600_000).toISOString() }])
   render(<Limits />)
   await waitFor(() => expect(screen.getByText('21%')).toBeTruthy())
-  expect(screen.getByText(/2026-09-02 09:45 時点/)).toBeTruthy()
+  expect(screen.getByText(/2026-09-02 18:45 時点/)).toBeTruthy()
   expect(screen.getByText(/あと 1時間5[0-9]分/)).toBeTruthy()
 })
 

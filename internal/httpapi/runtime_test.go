@@ -444,7 +444,7 @@ func TestTooManyOpenStreamsAreRefused(t *testing.T) {
 func TestEmptyListsComeBackAsArraysNotNull(t *testing.T) {
 	ts, c, _ := runtimeServer(t)
 	for _, path := range []string{
-		"/api/runtime", "/api/allowlist", "/api/ssh",
+		"/api/runtime", "/api/runtime/ended", "/api/allowlist", "/api/ssh",
 	} {
 		r, err := c.Get(ts.URL + path)
 		if err != nil {
@@ -456,4 +456,92 @@ func TestEmptyListsComeBackAsArraysNotNull(t *testing.T) {
 			t.Errorf("%s が null を含む: %s", path, b)
 		}
 	}
+}
+
+// 終わったものは走っているものの一覧から外れ、別の口から終わり方つきで引ける。
+// 1本は、どちらの一覧に載っていなくても直に開ける（2026-09-11）。
+func TestEndedSessionsHaveTheirOwnListAndCanBeOpened(t *testing.T) {
+	ts, c, sup := runtimeServer(t)
+	db := dbOf(t, ts)
+	work := allowDir(t, c, ts)
+	rec, err := sup.Start("test", work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := func(ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatal("待っても起きなかった")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	stateOf := func() string {
+		r, err := session.Get(db, rec.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.State
+	}
+	until(func() bool { return stateOf() == session.StateIdle })
+	if err := sup.Stop(rec.ID, session.StopTerminate); err != nil {
+		t.Fatal(err)
+	}
+	until(func() bool { return stateOf() == session.StateExited })
+
+	get := func(path string, want int, v any) {
+		t.Helper()
+		r, err := c.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		if r.StatusCode != want {
+			t.Fatalf("%s が %d（%d のはず）", path, r.StatusCode, want)
+		}
+		if v != nil {
+			json.NewDecoder(r.Body).Decode(v)
+		}
+	}
+
+	var live struct {
+		Sessions []struct{ ID string } `json:"sessions"`
+	}
+	get("/api/runtime", 200, &live)
+	for _, s := range live.Sessions {
+		if s.ID == rec.ID {
+			t.Fatal("終わったものが「走っているもの」に残っている")
+		}
+	}
+
+	var ended struct {
+		Sessions []struct {
+			ID       string `json:"id"`
+			EndCause string `json:"end_cause"`
+			EndState string `json:"end_state"`
+		} `json:"sessions"`
+		Counts map[string]int `json:"counts"`
+	}
+	get("/api/runtime/ended", 200, &ended)
+	if len(ended.Sessions) != 1 || ended.Sessions[0].ID != rec.ID ||
+		ended.Sessions[0].EndCause != session.EndUserStop || ended.Sessions[0].EndState != session.StateIdle {
+		t.Fatalf("終わったものの一覧が違う: %+v", ended.Sessions)
+	}
+	if ended.Counts["all"] != 1 || ended.Counts[session.EndUserStop] != 1 {
+		t.Fatalf("件数が違う: %v", ended.Counts)
+	}
+
+	var one struct {
+		ID       string `json:"id"`
+		EndCause string `json:"end_cause"`
+	}
+	get("/api/runtime/"+rec.ID, 200, &one)
+	if one.ID != rec.ID || one.EndCause != session.EndUserStop {
+		t.Fatalf("1本を開けない: %+v", one)
+	}
+
+	get("/api/runtime/無い", 404, nil)
+	get("/api/runtime/ended?kind=bogus", 400, nil)
 }

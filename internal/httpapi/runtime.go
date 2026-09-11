@@ -26,6 +26,8 @@ func (s *Server) runtimeRoutes() {
 	}
 	m := s.mux
 	m.HandleFunc("GET /api/runtime", s.handleRuntimeList)
+	m.HandleFunc("GET /api/runtime/ended", s.handleRuntimeEnded)
+	m.HandleFunc("GET /api/runtime/{id}", s.handleRuntimeOne)
 	m.HandleFunc("POST /api/runtime", s.handleRuntimeStart)
 	m.HandleFunc("POST /api/runtime/{id}/input", s.handleRuntimeInput)
 	m.HandleFunc("POST /api/runtime/{id}/stop", s.handleRuntimeStop)
@@ -36,8 +38,10 @@ func (s *Server) runtimeRoutes() {
 	m.HandleFunc("GET /api/runtime/{id}/stream", s.handleRuntimeStream)
 }
 
+// handleRuntimeList は終わっていないものを全部。**終わったものは /ended に分けた。**
+// 混ぜると、走っているものが終わったものの山に埋もれる。
 func (s *Server) handleRuntimeList(w http.ResponseWriter, r *http.Request) {
-	rows, err := session.List(s.db, atoi(r.URL.Query().Get("limit")))
+	rows, err := session.ListLive(s.db)
 	if err != nil {
 		s.fail(w, r, http.StatusInternalServerError, err.Error())
 		return
@@ -46,6 +50,37 @@ func (s *Server) handleRuntimeList(w http.ResponseWriter, r *http.Request) {
 		"agent_connected": s.sessions.AgentConnected(),
 		"sessions":        rows,
 	})
+}
+
+// handleRuntimeEnded は終わったセッションを1頁ぶん。
+// `?kind=` で絞り（mid / waiting / ignored / unknown / 終わり方の語）、
+// `?before=` で続きを引く。件数は頁に関係なく全体を返す。
+func (s *Server) handleRuntimeEnded(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page, err := session.ListEnded(s.db, session.EndedQuery{
+		Kind: q.Get("kind"), Before: q.Get("before"), Limit: atoi(q.Get("limit")),
+	})
+	switch {
+	case errors.Is(err, session.ErrBadQuery):
+		s.fail(w, r, http.StatusBadRequest, err.Error())
+	case err != nil:
+		s.fail(w, r, http.StatusInternalServerError, err.Error())
+	default:
+		writeJSON(w, http.StatusOK, page)
+	}
+}
+
+// handleRuntimeOne は1本。**一覧に載っていない古いものも開ける。**
+func (s *Server) handleRuntimeOne(w http.ResponseWriter, r *http.Request) {
+	rec, err := session.Get(s.db, r.PathValue("id"))
+	switch {
+	case errors.Is(err, session.ErrNotFound):
+		s.fail(w, r, http.StatusNotFound, err.Error())
+	case err != nil:
+		s.fail(w, r, http.StatusInternalServerError, err.Error())
+	default:
+		writeJSON(w, http.StatusOK, rec)
+	}
 }
 
 func (s *Server) handleRuntimeStart(w http.ResponseWriter, r *http.Request) {

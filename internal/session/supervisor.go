@@ -49,6 +49,9 @@ type liveSession struct {
 	last time.Time
 	// turn はターンが始まった時刻。ゼロならターン中ではない。
 	turn time.Time
+	// interrupted はターンが長すぎて中断を投げた時刻。ゼロなら投げていない。
+	// **中断が効かなければ、しばらく待ってから孫まで止める。**
+	interrupted time.Time
 	// asked は待っている承認。M28 で画面に出す。
 	asked map[string]bool
 	// logBroken は落とし先へ書けなくなったか。画面に出す。
@@ -111,12 +114,15 @@ func (s *Supervisor) Reconcile() (ghosts, orphans, unknown int, err error) {
 				fmt.Sprintf("pid %d の生死を判定できなかった", r.PID), audit.Error)
 		case alive:
 			orphans++
-			_ = setState(s.db, r.ID, StateOrphaned)
+			_ = markOrphaned(s.db, r.ID, EndUnseen)
 			s.audit(r.ID, "session.orphan", r.Cwd,
 				fmt.Sprintf("campd の再起動後も pid %d が生きている", r.PID), audit.OK)
 		default:
 			ghosts++
-			_ = finish(s.db, r.ID, -1, "campd の再起動後に居なかった")
+			_ = finish(s.db, r.ID, -1, "campd の再起動後に居なかった", EndUnseen, false)
+			// **待っていた承認を「待っている」まま残さない。** 残すと、あとで
+			// 期限切れとして閉じられ、「答えずに放置した」に数えられてしまう。
+			s.CloseApprovals(r.ID)
 			s.audit(r.ID, "session.ghost", r.Cwd,
 				fmt.Sprintf("pid %d はもう居ない", r.PID), audit.OK)
 		}
@@ -211,6 +217,7 @@ func (s *Supervisor) Input(id, text string) error {
 	}
 	ls.rec.State = StateRunning
 	ls.turn = s.Now()
+	ls.interrupted = time.Time{}
 	ls.last = s.Now()
 	token := ls.token
 	s.mu.Unlock()
@@ -220,8 +227,18 @@ func (s *Supervisor) Input(id, text string) error {
 	return agent.send(Msg{T: MsgInput, Session: id, Token: token, Text: text})
 }
 
-// Stop は止める。mode は StopInterrupt か StopTerminate。
+// Stop は止める。mode は StopInterrupt か StopTerminate。**本人が止めるときの口。**
+//
+// 中断（interrupt）はターンを止めるだけで、セッションは終わらない。
+// **状態も変えない**——running なら result が来て idle に戻る。2026-09-11 まで
+// 中断でも stopping にしていたので、中断した途端に入力を受けなくなり、
+// 2分後には「止まらない」として生きている子を exited と書いていた。
 func (s *Supervisor) Stop(id, mode string) error {
+	return s.stop(id, mode, EndUserStop)
+}
+
+// stop は止める。cause は、terminate でこのまま終わったときの理由。
+func (s *Supervisor) stop(id, mode, cause string) error {
 	if mode != StopInterrupt && mode != StopTerminate {
 		return fmt.Errorf("知らない止め方: %s", mode)
 	}
@@ -235,13 +252,19 @@ func (s *Supervisor) Stop(id, mode string) error {
 		s.mu.Unlock()
 		return ErrNoAgent
 	}
-	ls.rec.State = StateStopping
+	if mode == StopTerminate {
+		ls.rec.State = StateStopping
+	}
 	ls.last = s.Now()
 	token := ls.token
 	s.mu.Unlock()
 
-	_ = setState(s.db, id, StateStopping)
-	s.audit(id, "session.stop", mode, "", audit.OK)
+	detail := ""
+	if mode == StopTerminate {
+		_ = markStopping(s.db, id, cause)
+		detail = cause
+	}
+	s.audit(id, "session.stop", mode, detail, audit.OK)
 	return agent.send(Msg{T: MsgStop, Session: id, Token: token, Mode: mode})
 }
 
@@ -344,12 +367,13 @@ func (s *Supervisor) AgentConnected() bool {
 	return s.agent != nil
 }
 
-// fail は起こせなかった・届かなかったセッションを閉じる。
-func (s *Supervisor) fail(id, reason string) {
+// fail は起こせなかった・止まらなかったセッションを閉じる。
+// **控えてある理由より、こちらが正しい**（止めろと言ったが止まらなかった、など）。
+func (s *Supervisor) fail(id, reason, cause string) {
 	s.mu.Lock()
 	delete(s.live, id)
 	s.mu.Unlock()
-	_ = finish(s.db, id, -1, reason)
+	_ = finish(s.db, id, -1, reason, cause, true)
 	s.CloseApprovals(id)
 	s.audit(id, "session.exit", "", reason, audit.Error)
 }
@@ -367,7 +391,7 @@ func (s *Supervisor) CloseApprovals(id string) {
 // Tick は時間切れを回収する。呼ぶ側が周期を決める（テストでは直接呼ぶ）。
 func (s *Supervisor) Tick() {
 	type action struct {
-		id, mode, why string
+		id, mode, why, cause string
 	}
 	var todo []action
 	var dead []action
@@ -378,22 +402,35 @@ func (s *Supervisor) Tick() {
 		switch ls.rec.State {
 		case StateStarting:
 			if now.Sub(ls.last) > s.StartAfter {
-				dead = append(dead, action{id: id, why: "起動が確認できないまま時間切れ"})
+				dead = append(dead, action{id: id, why: "起動が確認できないまま時間切れ",
+					cause: EndStartFailed})
 			}
 		case StateRunning:
-			if !ls.turn.IsZero() && now.Sub(ls.turn) > s.TurnAfter {
-				todo = append(todo, action{id, StopInterrupt, "ターンが長すぎる"})
+			if ls.turn.IsZero() || now.Sub(ls.turn) <= s.TurnAfter {
+				break
+			}
+			// **まず中断。効かなければ孫まで止める。** 中断を投げっぱなしにすると、
+			// 効かない子は running のまま枠を1つ握り続ける。
+			switch {
+			case ls.interrupted.IsZero():
+				ls.interrupted = now
+				todo = append(todo, action{id, StopInterrupt, "ターンが長すぎる", EndTurnTimeout})
+			case now.Sub(ls.interrupted) > s.StopAfter:
+				todo = append(todo, action{id, StopTerminate,
+					"ターンが長すぎ、中断も効かない", EndTurnTimeout})
 			}
 		case StateIdle:
 			if now.Sub(ls.last) > s.IdleAfter {
-				todo = append(todo, action{id, StopTerminate, "何も来ないまま時間が経った"})
+				todo = append(todo, action{id, StopTerminate,
+					"何も来ないまま時間が経った", EndIdleTimeout})
 			}
 		case StateStopping:
 			// **止めろと言ったのに止まらない。** 実行面が受け取り損ねた・
 			// 子が signal を無視した、どちらもありうる。放っておくと
 			// stopping のまま永久に残るので、期限を切って諦める。
 			if now.Sub(ls.last) > s.StopAfter {
-				dead = append(dead, action{id: id, why: "止めろと言ったのに止まらない"})
+				dead = append(dead, action{id: id, why: "止めろと言ったのに止まらない",
+					cause: EndStopTimeout})
 			}
 		}
 	}
@@ -444,11 +481,11 @@ func (s *Supervisor) Tick() {
 	s.sweepOrphans()
 
 	for _, a := range dead {
-		s.fail(a.id, a.why)
+		s.fail(a.id, a.why, a.cause)
 	}
 	for _, a := range todo {
 		s.audit(a.id, "session.timeout", a.mode, a.why, audit.Timeout)
-		_ = s.Stop(a.id, a.mode)
+		_ = s.stop(a.id, a.mode, a.cause)
 	}
 }
 
@@ -477,7 +514,8 @@ func (s *Supervisor) sweepOrphans() {
 		if alive || !known {
 			continue
 		}
-		_ = finish(s.db, r.ID, -1, "見張る者が居ないうちに終わっていた")
+		// 実行面が落ちて孤児にしたのなら、控えてある「実行面が落ちた」が残る。
+		_ = finish(s.db, r.ID, -1, "見張る者が居ないうちに終わっていた", EndUnseen, false)
 		s.CloseApprovals(r.ID)
 		s.audit(r.ID, "session.ghost", "",
 			fmt.Sprintf("孤児にしていた pid %d はもう居ない", r.PID), audit.OK)

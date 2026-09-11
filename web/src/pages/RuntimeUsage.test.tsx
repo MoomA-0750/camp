@@ -54,6 +54,7 @@ afterEach(() => vi.unstubAllGlobals())
 test('残量タブに、枠・トークン内訳・コンテキスト・同時実行が出る', async () => {
   stub((u) => {
     if (u.includes('/usage')) return usage
+    if (u === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
     if (u.startsWith('/api/runtime/')) return []
     return { agent_connected: true, sessions: [] }
   })
@@ -84,6 +85,7 @@ test('残量が取れないと、その理由が出る', async () => {
     if (u.includes('/usage')) {
       return { running: 0, max: 4, usage_error: '子が答えない', context_error: '子が答えない' }
     }
+    if (u === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
     if (u.startsWith('/api/runtime/')) return []
     return { agent_connected: true, sessions: [] }
   })
@@ -109,8 +111,9 @@ test('終わったセッションでは EventSource を開かない', async () =
     ok: true, status: 200,
     json: async () => {
       if (url.includes('/log')) return { lines: [{ seq: 1, at: '2026-09-06T00:00:00Z', kind: 'result' }], gap: false, newest: 1, dropped: 0 }
-      if (url.startsWith('/api/runtime/')) return []
-      return { agent_connected: true, sessions: [{ id: 'abc', state: 'exited', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+      if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
+      if (url === '/api/runtime/abc') return { id: 'abc', state: 'exited', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
   } as unknown as Response))
@@ -137,8 +140,9 @@ test('live=0 なら走っていても流さない', async () => {
     ok: true, status: 200,
     json: async () => {
       if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
-      if (url.startsWith('/api/runtime/')) return []
-      return { agent_connected: true, sessions: [{ id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+      if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
+      if (url === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
   } as unknown as Response))
@@ -168,8 +172,9 @@ test('control_response は流れから畳み、件数を出す', async () => {
           gap: false, newest: 4, dropped: 0,
         }
       }
-      if (url.startsWith('/api/runtime/')) return []
-      return { agent_connected: true, sessions: [{ id: 'abc', state: 'exited', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+      if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
+      if (url === '/api/runtime/abc') return { id: 'abc', state: 'exited', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
   } as unknown as Response))
@@ -200,8 +205,9 @@ test('上へ遡ったら、新しい行が来ても引き戻さない', async ()
     ok: true, status: 200,
     json: async () => {
       if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
-      if (url.startsWith('/api/runtime/')) return []
-      return { agent_connected: true, sessions: [{ id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+      if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
+      if (url === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
   } as unknown as Response))
@@ -262,8 +268,9 @@ test('繋ぎ直しは、受け取った続きから', async () => {
     ok: true, status: 200,
     json: async () => {
       if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
-      if (url.startsWith('/api/runtime/')) return []
-      return { agent_connected: true, sessions: [{ id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }] }
+      if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
+      if (url === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
   } as unknown as Response))

@@ -181,11 +181,26 @@ button { white-space: nowrap; }
 td.wrap { overflow-wrap: anywhere; width: 100%; }
 /* 横に長い表は、ページ全体ではなく表だけを滑らせる。 */
 .scroll-x { overflow-x: auto; }
+/* 狭い画面では、表が頁ごと横へはみ出さないよう表の中で滑らせる。
+   パスの列が1文字幅まで潰れて縦に伸びないよう、幅の下限も置く
+   （2026-09-11、400px で撮って実際にそうなった）。 */
+@media (max-width: 46rem) {
+  table:not(.grid) { display: block; overflow-x: auto; }
+  td.wrap { min-width: 14rem; }
+}
 .tabs button {
   background: none; border: 1px solid var(--line); border-radius: .35rem;
   padding: .25rem .7rem; color: var(--muted); cursor: pointer;
 }
 .tabs button.on { color: var(--fg); border-color: var(--accent); }
+
+/* 絞り込みの札。タブ（頁を移る）と見分けがつくよう、形を変える。 */
+.chips { display: flex; flex-wrap: wrap; gap: .35rem; margin: 0 0 .6rem; }
+.chips button {
+  background: none; border: 1px solid var(--line); border-radius: 999px;
+  padding: .15rem .65rem; color: var(--muted); cursor: pointer; font-size: .9em;
+}
+.chips button.on { color: var(--fg); border-color: var(--accent); }
 
 /* 見えていない範囲があること・上限に達したことは、目立たせる。
    **黙って飛ばさない**のが設計なので、表示でも黙らせない。 */
