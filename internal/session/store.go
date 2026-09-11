@@ -10,7 +10,11 @@ import (
 
 // Record は runtime_sessions の1行。
 type Record struct {
-	ID          string `json:"id"`
+	ID string `json:"id"`
+	// Agent は起こしたエージェント（claude / codex）。2026-09-11 より前の行は claude。
+	Agent string `json:"agent"`
+	// ClaudeID はエージェント自身のセッション id。Claude なら session_id、
+	// Codex ならスレッド id（列名は変えない。名前を変える移行のほうが危ない）。
 	ClaudeID    string `json:"claude_id,omitempty"`
 	Cwd         string `json:"cwd"`
 	State       string `json:"state"`
@@ -74,10 +78,13 @@ func insert(db *store.DB, r Record) error {
 	if !validState(r.State) {
 		return fmt.Errorf("知らない状態: %s", r.State)
 	}
+	if !validAgent(agentOr(r.Agent)) {
+		return fmt.Errorf("知らないエージェント: %s", r.Agent)
+	}
 	_, err := db.Exec(`
-		insert into runtime_sessions(id, cwd, state, requested_by, created_at, updated_at, host)
-		values(?,?,?,?,?,?,?)`,
-		r.ID, r.Cwd, r.State, r.RequestedBy, r.CreatedAt, r.UpdatedAt, nzs(r.Host))
+		insert into runtime_sessions(id, cwd, state, requested_by, created_at, updated_at, host, agent)
+		values(?,?,?,?,?,?,?,?)`,
+		r.ID, r.Cwd, r.State, r.RequestedBy, r.CreatedAt, r.UpdatedAt, nzs(r.Host), agentOr(r.Agent))
 	return err
 }
 
@@ -202,7 +209,7 @@ func Get(db *store.DB, id string) (Record, error) {
 // 承認の数えは approvals の reason から採る。**別の列に写さない**——
 // 写すと、承認が閉じられた時刻と数えた時刻がずれたときに食い違う。
 var selectCols = `
-	select id, coalesce(claude_id,''), cwd, state, requested_by, created_at, updated_at,
+	select id, agent, coalesce(claude_id,''), cwd, state, requested_by, created_at, updated_at,
 	       coalesce(pid,0), coalesce(proc_started,0), coalesce(boot_id,''),
 	       coalesce(scope,''),
 	       coalesce(host,''), coalesce(remote_pid,0), coalesce(remote_started,0),
@@ -223,7 +230,7 @@ type scanner interface {
 func scanOne(s scanner) (Record, error) {
 	var r Record
 	var code sql.NullInt64
-	err := s.Scan(&r.ID, &r.ClaudeID, &r.Cwd, &r.State, &r.RequestedBy,
+	err := s.Scan(&r.ID, &r.Agent, &r.ClaudeID, &r.Cwd, &r.State, &r.RequestedBy,
 		&r.CreatedAt, &r.UpdatedAt, &r.PID, &r.Started, &r.BootID, &r.Scope,
 		&r.Host, &r.RemotePID, &r.RemoteStarted, &r.RemoteBootID, &r.RemoteScope,
 		&code, &r.ExitReason, &r.EndedAt, &r.EndCause, &r.EndState,

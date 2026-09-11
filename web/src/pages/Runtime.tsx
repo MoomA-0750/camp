@@ -26,6 +26,7 @@ export default function Runtime() {
 
   const [cwd, setCwd] = useState('')
   const [host, setHost] = useState('')
+  const [agent, setAgent] = useState('claude')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -33,7 +34,7 @@ export default function Runtime() {
     setErr('')
     setBusy(true)
     try {
-      await api.runtimeStart(cwd, host)
+      await api.runtimeStart(cwd, host, agent)
       setCwd('')
       setN((v) => v + 1)
     } catch (e) {
@@ -90,7 +91,18 @@ export default function Runtime() {
           )}
 
           <form className="filters" onSubmit={(e) => { e.preventDefault(); void start() }}>
-            <select value={host} onChange={(e) => setHost(e.target.value)} aria-label="どこで起こすか">
+            <select value={agent} aria-label="どのエージェントで起こすか"
+              onChange={(e) => {
+                setAgent(e.target.value)
+                // Codex はまだこのマシンだけ（向こうのホストは後のタスク）。
+                if (e.target.value === 'codex') setHost('')
+              }}>
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+            </select>
+            <select value={host} onChange={(e) => setHost(e.target.value)} aria-label="どこで起こすか"
+              disabled={agent === 'codex'}
+              title={agent === 'codex' ? 'Codex はまだこのマシンだけで起こせる' : undefined}>
               <option value="">このマシン</option>
               {startable.map((d) => (
                 <option key={d.alias} value={d.alias}>{d.alias}（{pinLabel(d.pinned)}）</option>
@@ -114,7 +126,7 @@ export default function Runtime() {
             <table>
               <thead>
                 <tr>
-                  <th className="nowrap">状態</th><th>場所</th>
+                  <th className="nowrap">状態</th><th className="nowrap">エージェント</th><th>場所</th>
                   <th className="nowrap">起こした時刻</th><th className="num">pid</th>
                 </tr>
               </thead>
@@ -127,6 +139,7 @@ export default function Runtime() {
                           リンクにする。 */}
                       <Link to={`/runtime/${s.id}`}><StateBadge state={s.state} /></Link>
                     </td>
+                    <td className="nowrap">{agentLabel(s.agent)}</td>
                     <td className="mono wrap">
                       <Link to={`/runtime/${s.id}`}>{where(s)}</Link>
                     </td>
@@ -141,6 +154,11 @@ export default function Runtime() {
       )}
     </>
   )
+}
+
+// agentLabel はエージェントの名前。**無ければ Claude Code**（2026-09-11 より前の行）。
+export function agentLabel(a?: string): string {
+  return a === 'codex' ? 'Codex' : 'Claude Code'
 }
 
 // where は起こした場所。向こうなら `host:/path`。

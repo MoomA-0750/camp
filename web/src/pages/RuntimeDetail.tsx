@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import {
-  api, type Approval, type ContextPayload, type LogLine,
-  type PlanLimit, type RuntimeUsage,
+  api, type Approval, type CodexContext, type CodexRateLimits, type CodexWindow,
+  type ContextPayload, type LogLine, type PlanLimit, type RuntimeUsage,
 } from '../api'
 import { Empty, Failed, Loading, clock, short, tokens, useAsync } from '../ui'
-import { ApprovalSummary, StateBadge, atEndLabel, endLabel } from './Runtime'
+import { ApprovalSummary, StateBadge, agentLabel, atEndLabel, endLabel } from './Runtime'
 
 // 走っているセッション1本。
 //
@@ -83,7 +83,11 @@ export default function RuntimeDetail() {
         if (ln.seq <= lastSeq.current) return
         lastSeq.current = ln.seq
         setLines((prev) => (prev.length > 2000 ? [...prev.slice(-1500), ln] : [...prev, ln]))
-        if (ln.kind === 'result' || ln.kind.startsWith('control_request')) {
+        // ターンの終わりと承認の要求で、状態と承認を取り直す。
+        // Codex は turn/completed と request/…（ターンを始められなかったときは camp/input_failed）。
+        if (ln.kind === 'result' || ln.kind.startsWith('control_request') ||
+          ln.kind === 'turn/completed' || ln.kind.startsWith('request/') ||
+          ln.kind === 'camp/input_failed') {
           setTick((v) => v + 1) // 状態と承認を取り直す
         }
       } catch { /* 読めない行は捨てる */ }
@@ -134,6 +138,7 @@ export default function RuntimeDetail() {
       </h2>
       {rec && (
         <p className="sub muted">
+          {agentLabel(rec.agent)} /{' '}
           起こしたのは {short(rec.created_at)} /{' '}
           {rec.host
             ? <>手元の ssh の pid {rec.pid || '—'} / {rec.host} の pid {rec.remote_pid || '—'}</>
@@ -169,7 +174,7 @@ export default function RuntimeDetail() {
       {tab === 'history' && <History id={id} />}
       {tab === 'stream' && (
         <>
-          <Talk id={id} state={rec?.state} onSent={() => setTick((v) => v + 1)} />
+          <Talk id={id} state={rec?.state} agent={rec?.agent} onSent={() => setTick((v) => v + 1)} />
           <p className="sub muted">
             {!known ? '状態を確かめている'
               : !wantLive ? '流していない（live=0）'
@@ -220,6 +225,9 @@ export default function RuntimeDetail() {
 function summarize(ln: LogLine): string {
   const f = ln.frame as Record<string, unknown> | undefined
   if (!f) return ''
+  if (f.jsonrpc || f.method || (f.id !== undefined && ('result' in f || 'error' in f))) {
+    return summarizeCodex(f)
+  }
   const msg = f.message as { content?: unknown } | undefined
   if (Array.isArray(msg?.content)) {
     return msg.content
@@ -234,6 +242,52 @@ function summarize(ln: LogLine): string {
       .slice(0, 300)
   }
   if (typeof msg?.content === 'string') return msg.content.slice(0, 300)
+  return ''
+}
+
+// summarizeCodex は Codex（JSON-RPC）の1行を畳む。途中経過は来ない
+// （実行面が断っている）ので、完成した item とターンの終わりだけを文にする。
+export function summarizeCodex(f: Record<string, unknown>): string {
+  const method = f.method as string | undefined
+  const p = (f.params ?? {}) as Record<string, unknown>
+  if (!method) {
+    const e = f.error as { message?: string } | undefined
+    return e?.message ? `エラー: ${e.message}`.slice(0, 300) : ''
+  }
+  const item = p.item as Record<string, unknown> | undefined
+  switch (method) {
+    case 'item/completed': {
+      if (!item) return ''
+      if (item.type === 'agentMessage') return String(item.text ?? '').slice(0, 300)
+      if (item.type === 'userMessage') {
+        const c = (item.content as { text?: string }[] | undefined) ?? []
+        return c.map((x) => x.text ?? '').join(' ').slice(0, 300)
+      }
+      if (item.type === 'commandExecution') {
+        return `[${String(item.status ?? '')}] ${String(item.command ?? '')}`.slice(0, 300)
+      }
+      if (item.type === 'fileChange') {
+        const ch = (item.changes as { path?: string }[] | undefined) ?? []
+        return `[${String(item.status ?? '')}] ` + ch.map((c) => c.path).join(', ').slice(0, 300)
+      }
+      if (item.type === 'mcpToolCall') {
+        return `[MCP ${String(item.server ?? '')}/${String(item.tool ?? '')}] ${String(item.status ?? '')}`
+      }
+      return `[${String(item.type)}]`
+    }
+    case 'turn/completed': {
+      const t = p.turn as { status?: string } | undefined
+      return `ターンが終わった（${t?.status ?? '?'}）`
+    }
+    case 'item/commandExecution/requestApproval':
+      return `承認を求めている: ${String(p.command ?? '')}`.slice(0, 300)
+    case 'item/fileChange/requestApproval':
+      return '承認を求めている: ファイル変更'
+    case 'error': {
+      const e = p.error as { message?: string } | undefined
+      return `エラー: ${e?.message ?? ''}`.slice(0, 300)
+    }
+  }
   return ''
 }
 
@@ -284,13 +338,39 @@ function prettyDetail(d?: string): string {
   if (!d) return ''
   try {
     const o = JSON.parse(d) as Record<string, unknown>
+    if (o.agent === 'codex') return codexDetail(o)
     return JSON.stringify(o.input ?? o, null, 1).slice(0, 1200)
   } catch {
     return d.slice(0, 1200)
   }
 }
 
-function Talk({ id, state, onSent }: { id: string; state?: string; onSent: () => void }) {
+// codexDetail は Codex の承認の中身。**差分は切り詰めない**——途中までの中身で許させない
+// （画面へ渡せない大きさのものは、実行面が見せずに断っている）。
+export function codexDetail(o: Record<string, unknown>): string {
+  const p = (o.params ?? {}) as Record<string, unknown>
+  const lines: string[] = []
+  if (o.method === 'item/commandExecution/requestApproval') {
+    lines.push(`$ ${String(p.command ?? '（コマンドが無い）')}`)
+    if (p.cwd) lines.push(`場所: ${String(p.cwd)}`)
+    if (p.networkApprovalContext) {
+      lines.push(`ネットワーク: ${JSON.stringify(p.networkApprovalContext)}`)
+    }
+  } else {
+    const ch = (o.changes as { path?: string; kind?: { type?: string }; diff?: string }[]
+      | undefined) ?? []
+    for (const c of ch) {
+      lines.push(`--- ${c.kind?.type ?? '?'}: ${c.path ?? ''}`)
+      if (c.diff) lines.push(c.diff)
+    }
+  }
+  if (typeof p.reason === 'string' && p.reason) lines.push(`理由: ${p.reason}`)
+  return lines.join('\n')
+}
+
+function Talk({ id, state, agent, onSent }: {
+  id: string; state?: string; agent?: string; onSent: () => void
+}) {
   const [text, setText] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -334,7 +414,89 @@ function Talk({ id, state, onSent }: { id: string; state?: string; onSent: () =>
           </button>
         </div>
       </form>
+      {agent === 'codex' && (
+        <p className="sub muted">
+          Codex の「中断」はターンを止めるが、<strong>走っていたコマンドは残る</strong>
+          （Codex の作り。2026-09-11 実測）。確実に止めるなら「止める」。
+          MCP のツールは Codex の作りとして承認を訊いてこない。
+        </p>
+      )}
       {err && <Failed error={err} />}
+    </>
+  )
+}
+
+// codexWindowLabel は枠の長さ（分）を名前にする。実測は 300 と 10080。
+function codexWindowLabel(mins?: number): string {
+  if (mins === 300) return '5時間'
+  if (mins === 10080) return '週'
+  return mins ? `${mins}分` : '枠'
+}
+
+// CodexUsage は Codex の残量。**形が Claude と違う**（account/rateLimits/read と、
+// 実行面が控えている thread/tokenUsage/updated）。どちらもモデルを呼ばない。
+function CodexUsage({ d }: { d: RuntimeUsage }) {
+  const rl = d.usage as unknown as CodexRateLimits | undefined
+  const tu = (d.context as unknown as CodexContext | undefined)?.tokenUsage
+  const windows = [rl?.rateLimits?.primary, rl?.rateLimits?.secondary]
+    .filter((w): w is CodexWindow => !!w)
+    .map((w): PlanLimit => ({
+      kind: codexWindowLabel(w.windowDurationMins), percent: w.usedPercent,
+      resets_at: w.resetsAt ? new Date(w.resetsAt * 1000).toISOString() : undefined,
+    }))
+  const total = tu?.total
+  return (
+    <>
+      {d.warning && <p className="warn">{d.warning}</p>}
+      <p className="sub muted">
+        同時に走っているのは {d.running} / {d.max} 本（4コア）。
+        {rl?.rateLimits?.planType ? ` / プラン ${rl.rateLimits.planType}` : ''}
+      </p>
+
+      <h3>プラン枠</h3>
+      {(d.usage_error || rl?.error) && <Failed error={d.usage_error || rl?.error || ''} />}
+      {!d.usage_error && !rl?.error && windows.length === 0 && <Empty>枠の情報が来ていない。</Empty>}
+      {windows.length > 0 && (
+        <div className="windows">
+          {windows.map((l) => <LimitCard key={l.kind} l={l} />)}
+        </div>
+      )}
+
+      <h3>トークン（このスレッド）</h3>
+      {d.context_error && <Failed error={d.context_error} />}
+      {!total ? (
+        <Empty>まだ1度もモデルを呼んでいない。</Empty>
+      ) : (
+        <>
+          <p>
+            {tokens(total.totalTokens ?? 0)}
+            {tu?.modelContextWindow ? <> / コンテキスト {tokens(tu.modelContextWindow)}</> : null}
+          </p>
+          <div className="scroll-x">
+            <table>
+              <thead>
+                <tr>
+                  <th className="num">入力</th><th className="num">キャッシュ読み</th>
+                  <th className="num">出力</th><th className="num">推論</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td className="num">{tokens(total.inputTokens ?? 0)}</td>
+                  <td className="num">{tokens(total.cachedInputTokens ?? 0)}</td>
+                  <td className="num">{tokens(total.outputTokens ?? 0)}</td>
+                  <td className="num">{tokens(total.reasoningOutputTokens ?? 0)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      <details>
+        <summary>返ってきたものをそのまま見る</summary>
+        <Json v={{ usage: d.usage, context: d.context }} />
+      </details>
     </>
   )
 }
@@ -352,6 +514,7 @@ function Usage({ id }: { id: string }) {
   if (u.loading) return <Loading />
   if (u.error) return <Failed error={u.error} />
   const d = u.data as RuntimeUsage
+  if (d.agent === 'codex') return <CodexUsage d={d} />
   const limits = d.usage?.rate_limits?.limits ?? []
   const models = Object.entries(d.usage?.session?.model_usage ?? {})
 
@@ -518,7 +681,8 @@ function History({ id }: { id: string }) {
             <td className="muted">
               {a.reason === 'timeout' ? '期限切れ'
                 : a.reason === 'session_ended' ? 'セッションが終わった'
-                  : a.reason === 'user' ? '本人' : ''}
+                  : a.reason === 'user' ? '本人'
+                    : a.reason === 'withdrawn' ? '取り下げ（子へ届いていない）' : ''}
             </td>
           </tr>
         ))}

@@ -151,9 +151,26 @@ func (s *Supervisor) Start(requestedBy, cwd string) (Record, error) {
 	return s.StartOn(requestedBy, "", cwd)
 }
 
-// StartOn は host（空ならこのマシン）に新しいセッションを起こす。
-// **起こすのは実行面だが、決めるのはここ。**
+// StartOn は host（空ならこのマシン）に Claude Code のセッションを起こす。
 func (s *Supervisor) StartOn(requestedBy, host, cwd string) (Record, error) {
+	return s.StartAgent(requestedBy, host, cwd, AgentClaude)
+}
+
+// StartAgent は host（空ならこのマシン）に agent（claude / codex）のセッションを起こす。
+// **起こすのは実行面だが、決めるのはここ。**
+func (s *Supervisor) StartAgent(requestedBy, host, cwd, agent string) (Record, error) {
+	agent = agentOr(agent)
+	if !validAgent(agent) {
+		err := fmt.Errorf("知らないエージェント: %q（claude か codex）", agent)
+		s.audit("", "session.start", cwd, err.Error(), audit.Denied)
+		return Record{}, err
+	}
+	if agent == AgentCodex && host != "" {
+		// 向こうのホストで Codex は後のタスク（dev/active/phase3.6-plan.md）。
+		err := errors.New("Codex はまだ向こうのホストでは起こせない（このマシンだけ）")
+		s.audit("", "session.start", host+":"+cwd, err.Error(), audit.Denied)
+		return Record{}, err
+	}
 	// **照合するのは campd 側。** 実行面は本人のユーザーで動くので、
 	// そこでの照合は迂回できる。ここが唯一の境界。
 	var real, root, target string
@@ -184,7 +201,7 @@ func (s *Supervisor) StartOn(requestedBy, host, cwd string) (Record, error) {
 	token := newID() + newID()
 	t := s.Now().UTC()
 	rec := Record{
-		ID: id, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
+		ID: id, Agent: agent, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
 		CreatedAt: t.Format(time.RFC3339), UpdatedAt: t.Format(time.RFC3339),
 		Host: host,
 	}
@@ -198,13 +215,20 @@ func (s *Supervisor) StartOn(requestedBy, host, cwd string) (Record, error) {
 		s.audit("", "session.start", target, ErrNoAgent.Error(), audit.Denied)
 		return Record{}, ErrNoAgent
 	}
+	if !s.agent.can(agent) {
+		// **古い実行面に Codex を頼まない。** 読まれない欄は黙って落ち、claude が起きる。
+		s.mu.Unlock()
+		err := fmt.Errorf("いまの実行面は %s を起こせない（codex が無いか、実行面が古い。camp-agent を入れ替える）", agent)
+		s.audit("", "session.start", target, err.Error(), audit.Denied)
+		return Record{}, err
+	}
 	if n := len(s.live); n >= s.maxConc {
 		s.mu.Unlock()
 		err := fmt.Errorf("同時に走らせる上限（%d本）に達している", s.maxConc)
 		s.audit("", "session.start", target, err.Error(), audit.Denied)
 		return Record{}, err
 	}
-	agent := s.agent
+	ac := s.agent
 	s.live[id] = &liveSession{rec: rec, token: token, last: s.Now(), asked: map[string]bool{}}
 	s.mu.Unlock()
 
@@ -217,10 +241,10 @@ func (s *Supervisor) StartOn(requestedBy, host, cwd string) (Record, error) {
 		return Record{}, err
 	}
 
-	s.audit(id, "session.start", target, "実行面へ起動を依頼した", audit.OK)
+	s.audit(id, "session.start", target, "実行面へ起動を依頼した（"+agent+"）", audit.OK)
 
-	if err := agent.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root,
-		Remote: spec}); err != nil {
+	if err := ac.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root,
+		Remote: spec, Agent: agent}); err != nil {
 		// **「届かなかった」を「起きなかった」と確定しない。**
 		// 途中まで書けていれば実行面は子を起こしている。ここで exited と
 		// 書くと、あとから来る started も、繋ぎ直しの名乗りも弾いてしまい、
@@ -424,6 +448,26 @@ func (s *Supervisor) CloseApprovals(id string) {
 	}
 	s.audit(id, "tool.approve", "",
 		fmt.Sprintf("セッションが終わったので %d 件を拒否として閉じた", n), audit.Denied)
+}
+
+// withdrawAsk は実行面が取り下げた承認を閉じる（Codex）。
+//
+// 実行面が断った（訊いたあとで差分が変わった）・Codex 側で片付いた・答えが子へ届かなかった。
+// **台帳を「待っている」や「本人が許した」のまま残さない**——実際には子へ届いていない。
+func (s *Supervisor) withdrawAsk(m Msg) {
+	s.mu.Lock()
+	if ls := s.live[m.Session]; ls != nil {
+		delete(ls.asked, m.ReqID)
+	}
+	s.mu.Unlock()
+	ok, err := withdraw(s.db, m.Session, m.ReqID, s.Now())
+	if err != nil {
+		s.audit(m.Session, "tool.approve", m.ReqID, "取り下げを記録できない: "+err.Error(), audit.Error)
+		return
+	}
+	if ok {
+		s.auditFromAgent(m.Session, "tool.withdrawn", m.ReqID, m.Error, audit.Denied)
+	}
 }
 
 // Tick は時間切れを回収する。呼ぶ側が周期を決める（テストでは直接呼ぶ）。

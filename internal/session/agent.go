@@ -38,9 +38,22 @@ type Agent struct {
 	// SSHFile は ssh に -F で渡す config。空なら ssh の既定に任せる
 	// （既定のときに -F を付けると /etc/ssh/ssh_config が読まれなくなる）。
 	SSHFile    string
-	HeaderWait time.Duration // 向こうの sh が名乗るまで
+	HeaderWait time.Duration // 向こうの sh が名乗るまで・Codex が話し始めるまで
 	ReapWait   time.Duration // 向こうを見に行く ssh 1本
 	ReapRetry  time.Duration // 見に行けなかったとき、もう一度行くまで
+
+	// Codex（codex.go）。
+	Codex       string // codex の実体。空なら Codex は起こさない
+	CodexHome   string // Camp 専用の置き場（CODEX_HOME にする）
+	CodexSource string // 本人の置き場（道具とログインを借りる。**書かない**）
+	// CodexCommand はテストで差し替える。既定は systemd-run で包んだ `codex app-server`。
+	CodexCommand func(id string) *exec.Cmd
+	// CodexWithoutScope は scope 無しでも Codex を起こしてよいか。**テストの偽物のためだけ。**
+	CodexWithoutScope bool
+
+	// scope の後始末を確かめる口（scope.go）。テストで差し替える。nil なら systemd に訊く。
+	ScopeProcs func(scope string) ([]int, error)
+	ScopeStop  func(scope string) error
 
 	mu   sync.Mutex
 	kids map[string]*child
@@ -76,16 +89,30 @@ type child struct {
 	// deliberate は Camp が止めに入ったか。**止めて ssh が 255 で終わったのを、
 	// 接続が切れたと読まないため。**
 	deliberate bool
+	// codex は Codex の子の状態（codex.go）。Claude の子なら nil。
+	codex *codexState
+	// dropped は落とし先が溢れて捨てた数（最後に campd へ言った値）。
+	dropped int64
 }
 
-// NewAgent は実行面を作る。
+// agent は子のエージェント。
+func (k *child) agent() string {
+	if k.codex != nil {
+		return AgentCodex
+	}
+	return AgentClaude
+}
+
+// NewAgent は実行面を作る。Codex は Codex の実体を入れたときだけ起こせる。
 func NewAgent(sock, claude string) *Agent {
 	a := &Agent{Sock: sock, Claude: claude, Scope: true,
 		LogDir: DefaultLogDir(), SSHConfig: DefaultSSHConfig(),
 		SSH: "ssh", SSHKeygen: "ssh-keygen", SSHFile: os.Getenv("CAMP_SSH_CONFIG"),
 		HeaderWait: headerWait, ReapWait: reapWait, ReapRetry: 3 * time.Second,
+		CodexHome: DefaultCodexHome(), CodexSource: DefaultCodexSource(),
 		kids: map[string]*child{}, stopWanted: map[string]string{}}
 	a.Command = a.defaultCommand
+	a.CodexCommand = a.defaultCodexCommand
 	return a
 }
 
@@ -127,7 +154,10 @@ func (a *Agent) Dial(version string) error {
 		return fmt.Errorf("制御口へ繋げない（%s）: %w", a.Sock, err)
 	}
 	a.conn = c
-	if err := a.send(Msg{T: MsgHello, Version: version, Held: a.held()}); err != nil {
+	// **起こせるエージェントも名乗る。** 名乗らないと、campd は Codex を頼んでよいか
+	// 分からない（古い実行面は claude を起こしてしまう）。
+	if err := a.send(Msg{T: MsgHello, Version: version, Held: a.held(),
+		Agents: a.agents()}); err != nil {
 		c.Close()
 		return err
 	}
@@ -156,8 +186,13 @@ func (a *Agent) held() []Held {
 		k.mu.Unlock()
 		// 向こうの身元も名乗る。**started が campd に届く前に campd が落ちると、
 		// 台帳は向こうの pid を知らないまま**になり、あとで始末できない（codex の指摘）。
-		out = append(out, Held{ID: id, Token: k.token, PID: pid,
-			Started: st, BootID: BootID(), Scope: k.scope, State: state, RemoteOwner: k.remote})
+		h := Held{ID: id, Token: k.token, PID: pid, Started: st, BootID: BootID(),
+			Scope: k.scope, State: state, RemoteOwner: k.remote, Agent: k.agent()}
+		if k.codex != nil {
+			// **待っている承認も名乗る。** campd が居ない間に来たものは台帳に無い。
+			h.Waiting = k.codex.waiting()
+		}
+		out = append(out, h)
 	}
 	return out
 }
@@ -220,9 +255,17 @@ func (a *Agent) Run() error {
 		case MsgWelcome:
 			// 受理された。
 		case MsgStart:
-			if m.Remote != nil {
+			switch agent := agentOr(m.Agent); {
+			case agent == AgentCodex && m.Remote == nil:
+				go a.startCodex(m)
+			case agent != AgentClaude:
+				// **知らないものを claude で代わりに起こさない。**
+				a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
+					Error: fmt.Sprintf("この実行面は %s を %s で起こせない", agent,
+						map[bool]string{true: "向こうのホスト", false: "このマシン"}[m.Remote != nil])})
+			case m.Remote != nil:
 				go a.startRemote(m)
-			} else {
+			default:
 				go a.start(m)
 			}
 		case MsgInput:
@@ -382,13 +425,19 @@ func (a *Agent) start(m Msg) {
 	k.mu.Lock()
 	k.dead = true
 	k.mu.Unlock()
+	// **子が終わっても、scope に残りが居るかもしれない。** 数えて止め、止め切れなければそう言う。
+	left := a.leftovers(k)
+	if left != 0 {
+		reason += leftoverNote(left)
+	}
 	if k.log != nil {
 		k.log.Close()
 	}
 	a.mu.Lock()
 	delete(a.kids, m.Session)
 	a.mu.Unlock()
-	a.send(Msg{T: MsgExited, Session: m.Session, Token: m.Token, Code: code, Reason: reason})
+	a.send(Msg{T: MsgExited, Session: m.Session, Token: m.Token, Code: code, Reason: reason,
+		Leftover: left})
 }
 
 // drain は子の stdout を読み続け、種類だけを campd へ渡す。
@@ -404,7 +453,6 @@ func (a *Agent) drain(k *child, r io.Reader) {
 // drainScanner は読みかけの scanner から続ける。リモートでは向こうの sh の
 // 名乗り（1行目）を読んだあとで、同じ scanner をここへ渡す。
 func (a *Agent) drainScanner(k *child, sc *bufio.Scanner) {
-	var dropped int64
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -419,32 +467,14 @@ func (a *Agent) drainScanner(k *child, sc *bufio.Scanner) {
 		if kind == "control_response" {
 			deliverControl(k, f)
 		}
-		// **読み手より先に、必ず落とす。** ここが読み手待ちになると子が詰まる。
-		if k.log != nil {
-			if _, err := k.log.Append(kind, line); err != nil {
-				// **一度でも書けなくなったら、そう言う。**
-				// 黙って続けると、落とし先には穴があるのに gap も立たない。
-				fmt.Fprintf(os.Stderr, "camp agent: 落とせない: %v\n", err)
-				k.mu.Lock()
-				first := !k.logBroken
-				k.logBroken = true
-				k.mu.Unlock()
-				if first {
-					a.send(Msg{T: MsgDropped, Session: k.id, Token: k.token,
-						Dropped: -1, Error: "落とし先へ書けない: " + err.Error()})
-				}
-			}
-			if _, _, d := k.log.Stats(); d > dropped {
-				dropped = d
-				a.send(Msg{T: MsgDropped, Session: k.id, Token: k.token, Dropped: d})
-			}
-		}
+		a.record(k, kind, line)
 		if kind == "result" {
 			k.mu.Lock()
 			k.turn = false
 			k.mu.Unlock()
 		}
-		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: kind}
+		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: kind,
+			TurnEnd: kind == "result", Ask: kind == "control_request/can_use_tool"}
 		if s, ok := f["session_id"].(string); ok {
 			m.ClaudeID = s
 		}
@@ -492,6 +522,31 @@ func FrameKind(f map[string]any) string {
 	return t
 }
 
+// record は1行を落とし先へ残す。**読み手より先に、必ず落とす。** ここが読み手待ちに
+// なると子が詰まる。Claude と Codex で同じ。
+func (a *Agent) record(k *child, kind string, line []byte) {
+	if k.log == nil {
+		return
+	}
+	if _, err := k.log.Append(kind, line); err != nil {
+		// **一度でも書けなくなったら、そう言う。**
+		// 黙って続けると、落とし先には穴があるのに gap も立たない。
+		fmt.Fprintf(os.Stderr, "camp agent: 落とせない: %v\n", err)
+		k.mu.Lock()
+		first := !k.logBroken
+		k.logBroken = true
+		k.mu.Unlock()
+		if first {
+			a.send(Msg{T: MsgDropped, Session: k.id, Token: k.token,
+				Dropped: -1, Error: "落とし先へ書けない: " + err.Error()})
+		}
+	}
+	if _, _, d := k.log.Stats(); d > k.dropped {
+		k.dropped = d
+		a.send(Msg{T: MsgDropped, Session: k.id, Token: k.token, Dropped: d})
+	}
+}
+
 func (a *Agent) toChild(m Msg, frame []byte) {
 	a.mu.Lock()
 	k := a.kids[m.Session]
@@ -499,15 +554,59 @@ func (a *Agent) toChild(m Msg, frame []byte) {
 	if k == nil || k.token != m.Token {
 		return
 	}
+	if k.codex != nil {
+		// Codex は JSON-RPC。Claude 用に組んだ frame は使わず、状態から組み直す。
+		var err error
+		switch m.T {
+		case MsgInput:
+			frame, err = k.codex.input(m.Text)
+		case MsgApprove:
+			frame, err = k.codex.approve(m.ReqID, m.Behavior)
+		default:
+			err = fmt.Errorf("Codex へ渡せない種類: %s", m.T)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "camp agent: %s: %v\n", k.id[:8], err)
+			if m.T == MsgInput {
+				// **渡せなかったターンを、終わったターンとして返す。** 黙ると campd は
+				// running のまま入力を受けなくなる。
+				a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/input_failed",
+					TurnEnd: true, Error: "入力を渡せなかった: " + err.Error()})
+			}
+			if m.T == MsgApprove {
+				// **届かなかった答えを、届いたことにしない。** campd の台帳は「本人が答えた」の
+				// ままになるので、取り下げとして返す（Fable の実装後レビュー 2）。
+				a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/withdrawn",
+					ReqID: m.ReqID, Withdrawn: true, Error: "答えが子へ届かなかった: " + err.Error()})
+			}
+			return
+		}
+	}
 	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.dead {
+	dead := k.dead
+	var err error
+	if !dead {
+		if m.T == MsgInput {
+			k.turn = true // result が返るまでターン中
+		}
+		_, err = k.stdin.Write(append(frame, '\n'))
+	}
+	k.mu.Unlock()
+	if dead || err == nil {
+		// 死んでいれば exited が来て、待っていた承認はそこで閉じる。
 		return
 	}
-	if m.T == MsgInput {
-		k.turn = true // result が返るまでターン中
+	// **書けなかったことを、届いたことにしない**（codex の outer gate の指摘 2）。
+	// campd の台帳は「本人が答えた」「入力を渡した」のまま残るので、そう返す。
+	fmt.Fprintf(os.Stderr, "camp agent: %s へ書けない: %v\n", k.id[:8], err)
+	switch m.T {
+	case MsgApprove:
+		a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/withdrawn",
+			ReqID: m.ReqID, Withdrawn: true, Error: "答えを子へ書けなかった: " + err.Error()})
+	case MsgInput:
+		a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/input_failed",
+			TurnEnd: true, Error: "入力を子へ書けなかった: " + err.Error()})
 	}
-	k.stdin.Write(append(frame, '\n'))
 }
 
 // DenyReason は拒否の理由。**空にしない。**
@@ -562,6 +661,16 @@ func (a *Agent) stop(m Msg) {
 	}
 	a.mu.Unlock()
 	if k.token != m.Token {
+		return
+	}
+	if m.Mode == StopInterrupt && k.codex != nil {
+		// Codex の中断はターン id が要る。まだ無ければ、来たところで投げる（codex.go）。
+		// **走っていた工具は残る**（実測）。確実に止めるのは terminate。
+		if b := k.codex.interrupt(); b != nil {
+			if err := k.write(b); err != nil {
+				fmt.Fprintf(os.Stderr, "camp agent: %s を中断できない: %v\n", k.id[:8], err)
+			}
+		}
 		return
 	}
 	if m.Mode == StopInterrupt {
@@ -623,12 +732,27 @@ func (a *Agent) reap(m Msg) {
 		a.send(Msg{T: MsgReaped, Session: m.Session, Reason: "確かめられなかった"})
 		return
 	}
+	// scope に触るのは、そのセッションの scope 名のときだけ（campd の台帳の値でも照らす）。
+	scope := ""
+	if m.Scope == scopeName(m.Session) {
+		scope = m.Scope
+	}
 	if !alive {
-		a.send(Msg{T: MsgReaped, Session: m.Session, Reason: "もう居なかった"})
+		// **本体は居なくても、scope に残りが居るかもしれない**（Codex のコマンドは別の
+		// セッションに居る）。数えて止め、止め切れなければそう言う。
+		left, known := a.sweepScope(scope)
+		if !known {
+			left = -1
+		}
+		reason := "もう居なかった"
+		if left != 0 {
+			reason += leftoverNote(left)
+		}
+		a.send(Msg{T: MsgReaped, Session: m.Session, Reason: reason, Leftover: left})
 		return
 	}
-	if m.Scope != "" {
-		exec.Command("systemctl", "--user", "stop", m.Scope).Run()
+	if scope != "" {
+		exec.Command("systemctl", "--user", "stop", scope).Run()
 	}
 	if a2, _ := o.Alive(); a2 {
 		syscall.Kill(-m.PID, syscall.SIGTERM)
@@ -637,7 +761,15 @@ func (a *Agent) reap(m Msg) {
 			syscall.Kill(-m.PID, syscall.SIGKILL)
 		}
 	}
-	a.send(Msg{T: MsgReaped, Session: m.Session, Reason: "止めた"})
+	left, known := a.sweepScope(scope)
+	if !known {
+		left = -1
+	}
+	reason := "止めた"
+	if left != 0 {
+		reason += leftoverNote(left)
+	}
+	a.send(Msg{T: MsgReaped, Session: m.Session, Reason: reason, Leftover: left})
 }
 
 // tail は画面が要求した範囲だけを返す。**境界を越えるのはここだけ。**
@@ -731,6 +863,10 @@ func (a *Agent) control(m Msg) {
 	if k == nil || k.token != m.Token {
 		out.Error = "そのセッションは走っていない"
 		a.send(out)
+		return
+	}
+	if k.codex != nil {
+		a.controlCodex(k, m)
 		return
 	}
 	childReq := "camp-ctl-" + newID()

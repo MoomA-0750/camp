@@ -69,6 +69,25 @@ func answer(db *store.DB, sessionID, reqID, behavior, reason string, now time.Ti
 	return n > 0, err
 }
 
+// ByWithdrawn は、実行面が取り下げた（その承認はもう子に届かない）。
+// 答えていたなら、その答えは**子に届いていない**。
+const ByWithdrawn = "withdrawn"
+
+// withdraw は承認を「取り下げられた」で閉じる。答え済みの行も上書きする——
+// 「本人が許した」と残っていても、実際には子へ届いていないので。
+func withdraw(db *store.DB, sessionID, reqID string, now time.Time) (bool, error) {
+	r, err := db.Exec(`
+		update approvals set answered_at=coalesce(answered_at, ?), behavior=coalesce(behavior, 'deny'),
+		       reason=?
+		where session_id=? and request_id=? and coalesce(reason,'') <> ?`,
+		now.UTC().Format(time.RFC3339), ByWithdrawn, sessionID, reqID, ByWithdrawn)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n > 0, err
+}
+
 // reopen は答えを取り消して待ちに戻す。**子へ届かなかったときだけ。**
 func reopen(db *store.DB, sessionID, reqID string) error {
 	_, err := db.Exec(`

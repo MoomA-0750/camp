@@ -88,11 +88,13 @@ func (s *Server) handleRuntimeStart(w http.ResponseWriter, r *http.Request) {
 		Cwd string `json:"cwd"`
 		// Host は ssh の Host 名。空ならこのマシン。
 		Host string `json:"host"`
+		// Agent は claude か codex。空なら claude。
+		Agent string `json:"agent"`
 	}
 	if !s.readBody(w, r, &body) {
 		return
 	}
-	rec, err := s.sessions.StartOn("user", body.Host, body.Cwd)
+	rec, err := s.sessions.StartAgent("user", body.Host, body.Cwd, body.Agent)
 	if err != nil {
 		code := http.StatusBadRequest
 		if errors.Is(err, session.ErrNoAgent) {
@@ -302,6 +304,11 @@ func (s *Server) handleRuntimeApprovals(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleRuntimeUsage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	out := map[string]any{}
+	// どのエージェントか。**中身の形が違う**ので画面が読み分ける
+	// （Claude は get_usage の形、Codex は account/rateLimits/read と tokenUsage）。
+	if rec, err := session.Get(s.db, id); err == nil {
+		out["agent"] = rec.Agent
+	}
 
 	if b, err := s.sessions.Control(id, "get_usage"); err != nil {
 		out["usage_error"] = err.Error()

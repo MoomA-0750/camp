@@ -97,6 +97,40 @@ test('台帳は固定した行き先を出し、固定の無い許可には許�
   expect(screen.getAllByText(/許し直す/).length).toBe(2)
 })
 
+// ---- Codex（2026-09-11）--------------------------------------------------------
+
+test('Codex を選ぶと agent を渡し、ホストは選べなくなる', async () => {
+  const posts: unknown[] = []
+  vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)))
+    const body = url.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }
+    return { ok: true, status: 200, json: async () => body, text: async () => '' } as unknown as Response
+  })
+  show()
+  const host = await screen.findByLabelText('どこで起こすか') as HTMLSelectElement
+  await waitFor(() => expect(within(host).getByText(/far/)).toBeTruthy())
+  fireEvent.change(host, { target: { value: 'far' } })
+  fireEvent.change(screen.getByLabelText('どのエージェントで起こすか'), { target: { value: 'codex' } })
+  // Codex はまだこのマシンだけ。選んでいたホストも外れる。
+  expect(host.disabled).toBe(true)
+  expect(host.value).toBe('')
+  fireEvent.change(screen.getByPlaceholderText(/起こす場所/), { target: { value: '/w/x' } })
+  fireEvent.click(screen.getByText('起こす'))
+  await waitFor(() => expect(posts).toContainEqual({ cwd: '/w/x', agent: 'codex' }))
+})
+
+test('一覧にエージェントが出る（無ければ Claude Code）', async () => {
+  stub((u) => (u.startsWith('/api/runtime')
+    ? { agent_connected: true, sessions: [
+        { id: 'c1', agent: 'codex', cwd: '/w/x', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' },
+        { id: 'c2', cwd: '/w/y', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' }] }
+    : []))
+  show()
+  const table = await screen.findByRole('table')
+  expect(within(table).getByText('Codex')).toBeTruthy()
+  expect(within(table).getByText('Claude Code')).toBeTruthy()
+})
+
 test('向こうのセッションはホスト名つきで出る', async () => {
   stub((u) => (u.startsWith('/api/runtime')
     ? { agent_connected: true, sessions: [{ id: 'r1', cwd: '/srv/work', host: 'far', state: 'idle',

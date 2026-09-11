@@ -13,6 +13,11 @@ import (
 // の既定値がそこを指していて、差し替えを忘れると静かに漏れる。
 // 「気をつける」では再発するので、数えて落とす。
 func TestMain(m *testing.M) {
+	// 偽の `codex app-server` として起こされたなら、それだけをして抜ける（fakecodex_test.go）。
+	if os.Getenv("CAMP_FAKE_CODEX") != "" {
+		fakeCodexMain()
+		return
+	}
 	dir := DefaultLogDir()
 	before := countFiles(dir)
 	code := m.Run()

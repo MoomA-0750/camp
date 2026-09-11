@@ -42,6 +42,17 @@ type agentConn struct {
 	c   net.Conn
 	who string
 	mu  sync.Mutex
+	// agents はこの実行面が起こせるエージェント（hello で名乗る）。
+	// **名乗らない古い実行面は claude だけ。** Codex を頼むと claude が起きてしまう（Fable 7）。
+	agents []string
+}
+
+// can は agent を起こせる実行面か。
+func (a *agentConn) can(agent string) bool {
+	if len(a.agents) == 0 {
+		return agent == AgentClaude
+	}
+	return contains(a.agents, agent)
 }
 
 func (a *agentConn) send(m Msg) error {
@@ -175,10 +186,12 @@ func (c *Control) handle(conn net.Conn) {
 		c.s.audit("", "agent.connect", who, "既に繋がっているので断った", audit.Denied)
 		return
 	}
+	a.agents = hello.Agents
 	c.s.agent = a
 	c.s.mu.Unlock()
 
-	c.s.audit("", "agent.connect", who, "実行面が繋がった（version="+hello.Version+"）", audit.OK)
+	c.s.audit("", "agent.connect", who, fmt.Sprintf("実行面が繋がった（version=%s、起こせる=%v）",
+		hello.Version, agentsOf(a)), audit.OK)
 	a.send(Msg{T: MsgWelcome})
 	// **引き取り直しが先。** 先に孤児を始末すると、実行面がまだ抱えている
 	// 子まで殺してしまう（campd を入れ替えるたびにセッションが飛ぶ）。
@@ -316,6 +329,12 @@ func (c *Control) readopt(held []Held) {
 			s.audit(h.ID, "session.readopt", ro.Host, "このマシンの行なのに向こうの子を名乗った", audit.Denied)
 			continue
 		}
+		// **エージェントも台帳と照らす。** Claude の行を Codex の子で乗っ取らせない（逆も）。
+		if got, want := agentOr(h.Agent), agentOr(r.Agent); got != want {
+			s.audit(h.ID, "session.readopt", got,
+				fmt.Sprintf("台帳は %s なのに %s の子を名乗った", want, got), audit.Denied)
+			continue
+		}
 		s.mu.Lock()
 		if s.live[h.ID] != nil {
 			s.mu.Unlock()
@@ -345,6 +364,34 @@ func (c *Control) readopt(held []Held) {
 		_ = clearOrphanCause(s.db, h.ID)
 		s.audit(h.ID, "session.readopt", strconv.Itoa(h.PID),
 			"実行面がまだ抱えていたので引き取り直した（"+r.State+"）", audit.OK)
+		s.adoptWaiting(h)
+	}
+}
+
+// adoptWaiting は実行面が名乗った「待っている承認」を台帳に採る。
+//
+// **campd が居ない間に来た承認は、台帳に無い。** 採らないと画面に出ず、期限切れの拒否も
+// 掛からず、子は答えを待ったまま長く止まる（Fable の設計レビュー 5）。知っているものは足さない。
+func (s *Supervisor) adoptWaiting(h Held) {
+	if len(h.Waiting) == 0 {
+		return
+	}
+	known := map[string]bool{}
+	if rows, err := ApprovalHistory(s.db, h.ID, 500); err == nil {
+		for _, a := range rows {
+			known[a.RequestID] = true
+		}
+	}
+	for _, w := range h.Waiting {
+		if w.ReqID == "" || known[w.ReqID] {
+			continue
+		}
+		s.recordAsk(Msg{Session: h.ID, Token: h.Token, ReqID: w.ReqID, Text: w.Tool, Frame: w.Detail})
+		s.mu.Lock()
+		if ls := s.live[h.ID]; ls != nil {
+			ls.asked[w.ReqID] = true
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -428,11 +475,21 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			o.BootID = BootID()
 		}
 
+		// **頼んだエージェントが起きたか。** 古い実行面は agent を読まずに claude を起こす
+		// （Fable 7）。台帳と違うものを走らせたままにしない。
+		s.mu.Lock()
+		host, want := ls.rec.Host, agentOr(ls.rec.Agent)
+		s.mu.Unlock()
+		if got := agentOr(m.Agent); got != want {
+			why := fmt.Sprintf("%s を頼んだのに %s が起きた", want, got)
+			_ = a.send(Msg{T: MsgStop, Session: m.Session, Token: m.Token, Mode: StopTerminate})
+			s.audit(m.Session, "session.started", strconv.Itoa(m.PID), why, audit.Denied)
+			s.fail(m.Session, why, EndStartFailed)
+			return
+		}
+
 		// **向こうの身元は確かめられない。** 実行面の報告を記録するだけ。
 		// ただし、頼んだホストのものか・許した場所の中と言っているかは照らす。
-		s.mu.Lock()
-		host := ls.rec.Host
-		s.mu.Unlock()
 		ro := m.RemoteOwner
 		if host != "" {
 			why := ""
@@ -468,6 +525,10 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		s.mu.Unlock()
 
 		_ = setOwner(s.db, m.Session, o, m.Scope)
+		if m.ClaudeID != "" {
+			// Codex は話し始める前にスレッド id が決まっている。
+			_ = setClaudeID(s.db, m.Session, m.ClaudeID)
+		}
 		if ro != nil {
 			_ = setRemote(s.db, m.Session, *ro)
 			s.auditFromAgent(m.Session, "session.started", host,
@@ -481,23 +542,28 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		if !ok {
 			return
 		}
+		// 駆動器が畳んだ意味を読む。**古い実行面は欄を立てない**ので、Claude の種類も読む。
+		turnEnd := m.TurnEnd || m.Kind == "result"
+		isAsk := (m.Ask || m.Kind == "control_request/can_use_tool") && m.ReqID != ""
 		s.mu.Lock()
 		ls.last = s.Now()
-		idle := false
-		switch m.Kind {
-		case "result":
+		idle, escalate := false, false
+		if turnEnd {
 			// ターンが終わった。次の入力を受けられる。
 			// **止めに入っているものは idle に戻さない**（孫まで止める途中）。
 			if ls.rec.State == StateRunning {
 				ls.rec.State = StateIdle
 				idle = true
 			}
+			// **Codex の中断は効くが、走っていた工具は残る**（実測）。ターンが長すぎて
+			// Camp が中断を投げ、それで終わったなら、続けて止める。Claude の
+			// 「中断が効かなければ止める」には届かないので（Fable 8）。
+			escalate = !ls.interrupted.IsZero() && agentOr(ls.rec.Agent) == AgentCodex
 			ls.turn = time.Time{}
 			ls.interrupted = time.Time{}
-		case "control_request/can_use_tool":
-			if m.ReqID != "" {
-				ls.asked[m.ReqID] = true
-			}
+		}
+		if isAsk {
+			ls.asked[m.ReqID] = true
 		}
 		s.mu.Unlock()
 
@@ -507,8 +573,21 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		if m.ClaudeID != "" {
 			_ = setClaudeID(s.db, m.Session, m.ClaudeID)
 		}
-		if m.Kind == "control_request/can_use_tool" && m.ReqID != "" {
+		if isAsk {
 			s.recordAsk(m)
+		}
+		if m.Withdrawn && m.ReqID != "" {
+			// 実行面が取り下げた承認を、待っているまま残さない。
+			s.withdrawAsk(m)
+		} else if m.Error != "" {
+			// 断った・方針が変わった・ターンが失敗した。**黙って流さない。**
+			// 実行面が何度でも起こせるので枠の中で。
+			s.auditFromAgent(m.Session, "session.frame", m.Kind, m.Error, audit.Error)
+		}
+		if escalate {
+			s.audit(m.Session, "session.timeout", StopTerminate,
+				"中断でターンは終わったが、Codex は走っていた工具を残すので止める", audit.Timeout)
+			_ = s.stop(m.Session, StopTerminate, EndTurnTimeout)
 		}
 
 	case MsgExited:
@@ -536,10 +615,16 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 				"向こうを確かめられないので孤児として残す: "+m.Reason, audit.Error)
 			return
 		}
-		_ = finish(s.db, m.Session, m.Code, m.Reason, cause, false)
+		override := false
+		if m.Leftover != 0 {
+			// **止め切れていない（確かめられない）ものを「子が自分で終わった」と書かない。**
+			// 見張りを諦めた、と書く（Phase 3.6 の outer gate で codex が指摘）。
+			cause, override = EndStopTimeout, true
+		}
+		_ = finish(s.db, m.Session, m.Code, m.Reason, cause, override)
 		s.CloseApprovals(m.Session)
 		out := audit.OK
-		if m.Code != 0 {
+		if m.Code != 0 || m.Leftover != 0 {
 			out = audit.Error
 		}
 		s.audit(m.Session, "session.exit", strconv.Itoa(m.Code), m.Reason, out)
@@ -569,9 +654,14 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID),
 				"始末したと言われたが、確かめられなかった", audit.Error)
 		default:
-			_ = finish(s.db, m.Session, m.Code, "孤児を始末した: "+m.Reason, EndReaped, true)
+			// 止め切れていない（確かめられない）残りがあるなら、「始末した」とは書かない。
+			cause, out := EndReaped, audit.OK
+			if m.Leftover != 0 {
+				cause, out = EndStopTimeout, audit.Error
+			}
+			_ = finish(s.db, m.Session, m.Code, "孤児を始末した: "+m.Reason, cause, true)
 			s.CloseApprovals(m.Session)
-			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, audit.OK)
+			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, out)
 		}
 
 	case MsgTailRes, MsgSSHRes, MsgCtlRes, MsgSSHResolved:

@@ -2274,6 +2274,9 @@ func cmdAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	sock := fs.String("sock", defaultAgentSock(), "制御口のパス")
 	claudeBin := fs.String("claude", defaultClaudeBin(), "claude の実体")
+	codexBin := fs.String("codex", defaultCodexBin(), "codex の実体（無ければ Codex は起こさない）")
+	codexHome := fs.String("codex-home", session.DefaultCodexHome(),
+		"Camp 専用の Codex の置き場（本人の ~/.codex とは別。起こすたびに設定を作り直す）")
 	scope := fs.Bool("scope", true, "systemd の transient scope で包む（孫まで止めるため）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -2287,8 +2290,18 @@ func cmdAgent(args []string) error {
 
 	a := session.NewAgent(*sock, *claudeBin)
 	a.Scope = *scope
+	a.CodexHome = *codexHome
+	if _, err := os.Stat(*codexBin); err == nil {
+		a.Codex = *codexBin
+	}
 	fmt.Printf("実行面    %s\nclaude    %s\nscope     %v\n落とし先  %s\n",
 		*sock, *claudeBin, *scope, a.LogDir)
+	if a.CanCodex() {
+		fmt.Printf("codex     %s（置き場 %s、道具とログインは %s から借りる）\n",
+			a.Codex, a.CodexHome, a.CodexSource)
+	} else {
+		fmt.Printf("codex     起こさない（実体 %s が無いか、scope を使わない構成）\n", *codexBin)
+	}
 	fmt.Println("**DB には触らない。** 起こす・渡す・止める、それだけ。")
 	// 繋ぎ直しながら動き続ける。**campd の入れ替えで子を殺さない。**
 	if err := a.Serve(Version); err != nil {
@@ -2309,6 +2322,20 @@ func defaultClaudeBin() string {
 		return filepath.Join(home, ".local/bin/claude")
 	}
 	return "claude"
+}
+
+// defaultCodexBin は `codex` の実体。無ければ実行面は Codex を起こさない。
+func defaultCodexBin() string {
+	if p := os.Getenv("CAMP_CODEX_BIN"); p != "" {
+		return p
+	}
+	if p, err := exec.LookPath("codex"); err == nil {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local/bin/codex")
+	}
+	return "codex"
 }
 
 // cmdRuntime は Camp が起こしたセッションの台帳を見る。**読むだけ。**
@@ -2337,13 +2364,14 @@ func cmdRuntime(args []string) error {
 		if r.Host != "" {
 			where = r.Host + ":" + r.Cwd
 		}
-		fmt.Printf("%-10s %-9s pid=%-7d %s\n  cwd=%s\n",
-			firstN(r.ID, 8), r.State, r.PID, r.CreatedAt, where)
+		fmt.Printf("%-10s %-9s %-6s pid=%-7d %s\n  cwd=%s\n",
+			firstN(r.ID, 8), r.State, r.Agent, r.PID, r.CreatedAt, where)
 		if r.Host != "" && r.RemotePID != 0 {
 			fmt.Printf("  向こうの pid=%d\n", r.RemotePID)
 		}
 		if r.ClaudeID != "" {
-			fmt.Printf("  claude=%s\n", r.ClaudeID)
+			// Codex ならスレッド id。
+			fmt.Printf("  %s=%s\n", r.Agent, r.ClaudeID)
 		}
 		if r.State == session.StateExited {
 			fmt.Printf("  終わり=%s", session.EndLabel(r.EndCause))

@@ -74,6 +74,9 @@ type Msg struct {
 	RemoteEnd string `json:"remote_end,omitempty"`
 	// exited: SSH の接続が切れて終わったか。
 	ConnLost bool `json:"conn_lost,omitempty"`
+	// exited: 子が終わったあと scope に残り、止められなかったものの数。-1 は確かめられなかった。
+	// **止め切れていないものを「終わった」と書かないため**（scope.go）。
+	Leftover int `json:"leftover,omitempty"`
 
 	// ssh_resolve / ssh_resolved: `ssh -G` で alias がいまどこを指すか
 	Alias    string    `json:"alias,omitempty"`
@@ -83,6 +86,33 @@ type Msg struct {
 	Version string `json:"version,omitempty"`
 	// Held は実行面がいま抱えている子。**campd を入れ替えても殺さないため。**
 	Held []Held `json:"held,omitempty"`
+
+	// Agent は起こすエージェント（start）・起こしたエージェント（started）。
+	// **空は claude と読む**——Phase 3.6 より前の実行面は名乗らない。
+	Agent string `json:"agent,omitempty"`
+	// Agents は実行面が起こせるエージェント（hello）。空なら claude だけ（古い実行面）。
+	Agents []string `json:"agents,omitempty"`
+
+	// frame（実行面 → campd）: 駆動器が畳んだ意味。**種類の文字列を campd が読み分けない**
+	// （Claude の result と Codex の turn/completed を、どちらも TurnEnd で伝える）。
+	TurnEnd bool `json:"turn_end,omitempty"`
+	Ask     bool `json:"ask,omitempty"` // 承認の要求。ReqID・Text（工具）・Frame（中身）を添える
+	// Interrupted は中断でターンが終わった（Codex）。**走っていた工具は残りうる。**
+	Interrupted bool `json:"interrupted,omitempty"`
+	// Withdrawn は ReqID の承認が、答えを待つものではなくなった（Codex）。実行面が断った
+	// （訊いたあとで差分が変わった）・Codex 側で片付いた・答えが子へ届かなかった。
+	// **campd の台帳を「待っている」のまま残さない**（Fable の実装後レビュー 2）。
+	Withdrawn bool `json:"withdrawn,omitempty"`
+}
+
+// HeldAsk は実行面が抱えている、まだ答えていない承認1つ。
+//
+// 引き取り直しで名乗る。**campd が入れ替わっている間に来た承認が台帳から消えないように**
+// （Fable の設計レビュー 5）。
+type HeldAsk struct {
+	ReqID  string          `json:"request_id"`
+	Tool   string          `json:"tool"`
+	Detail json.RawMessage `json:"detail,omitempty"`
 }
 
 // Held は実行面が抱えている子1つ。campd はこれを見て引き取り直す。
@@ -98,6 +128,10 @@ type Held struct {
 	State   string `json:"state"`
 	// RemoteOwner は向こうの子（リモートのとき）。台帳と照らしてから採る。
 	RemoteOwner *RemoteOwner `json:"remote_owner,omitempty"`
+	// Agent はその子のエージェント。空は claude（古い実行面）。**台帳と違えば採らない。**
+	Agent string `json:"agent,omitempty"`
+	// Waiting はその子がまだ答えを待っている承認。campd が居ない間に来たものも名乗る。
+	Waiting []HeldAsk `json:"waiting,omitempty"`
 }
 
 // 実行面 → campd

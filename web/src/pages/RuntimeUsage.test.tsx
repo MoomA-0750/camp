@@ -306,3 +306,41 @@ test('繋ぎ直しは、受け取った続きから', async () => {
   await waitFor(() => expect(urls.length).toBeGreaterThan(before))
   expect(urls[urls.length - 1]).toContain('since=3')
 })
+
+// Codex の残量は形が違う（2026-09-11 に本物の codex app-server から返ってきた形。値は丸めた）。
+// account/rateLimits/read の5時間枠・週枠と、実行面が控えている thread/tokenUsage/updated。
+test('Codex の残量タブに、5時間枠・週枠・プラン・トークンが出る', async () => {
+  const later = Math.floor(Date.now() / 1000) + 3 * 3600
+  stub((u) => {
+    if (u.includes('/usage')) {
+      return {
+        agent: 'codex', running: 1, max: 4,
+        usage: { rateLimits: { planType: 'plus',
+          primary: { usedPercent: 73, windowDurationMins: 300, resetsAt: later },
+          secondary: { usedPercent: 78, windowDurationMins: 10080, resetsAt: later } } },
+        context: { tokenUsage: { total: { totalTokens: 16497, inputTokens: 16378,
+          cachedInputTokens: 11904, outputTokens: 119, reasoningOutputTokens: 0 },
+          modelContextWindow: 258400 } },
+      }
+    }
+    if (u === '/api/runtime/cx') {
+      return { id: 'cx', agent: 'codex', state: 'idle', cwd: '/w', requested_by: 'u',
+        created_at: '', updated_at: '' }
+    }
+    if (u.startsWith('/api/runtime/')) return []
+    return { agent_connected: true, sessions: [] }
+  })
+  render(
+    <MemoryRouter initialEntries={['/runtime/cx?tab=usage&live=0']}>
+      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
+    </MemoryRouter>)
+
+  await waitFor(() => expect(screen.getByText(/プラン plus/)).toBeTruthy())
+  expect(screen.getByText('5時間')).toBeTruthy()
+  expect(screen.getByText('73%')).toBeTruthy()
+  expect(screen.getByText('週')).toBeTruthy()
+  expect(screen.getByText('78%')).toBeTruthy()
+  expect(screen.getByText(/16k \/ コンテキスト 258k/)).toBeTruthy()
+  // Claude の形（モデル別の費用）は出さない。
+  expect(screen.queryByText('キャッシュ作成')).toBeNull()
+})

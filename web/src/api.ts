@@ -121,7 +121,9 @@ export type Backup = {
 // ---- Phase 3: Camp が起こしたセッション ------------------------------------
 
 export type RuntimeSession = {
-  id: string; claude_id?: string; cwd: string; state: string
+  // agent は claude か codex（2026-09-11 から。それより前は claude）。
+  // claude_id はエージェント自身のセッション id（Codex ならスレッド id）。
+  id: string; agent?: string; claude_id?: string; cwd: string; state: string
   requested_by: string; created_at: string; updated_at: string
   pid?: number; scope?: string
   // ssh の Host 名。無ければこのマシン（2026-09-11 から）。そのとき pid は手元の ssh。
@@ -189,7 +191,24 @@ export type ContextPayload = {
   categories?: { name: string; tokens: number }[]
   totalTokens?: number; maxTokens?: number; percentage?: number
 }
+/** Codex の残量。account/rateLimits/read の中身（2026-09-11 実測、codex-cli 0.154.0）。 */
+export type CodexWindow = { usedPercent: number; windowDurationMins?: number; resetsAt?: number }
+export type CodexRateLimits = {
+  rateLimits?: { planType?: string; primary?: CodexWindow; secondary?: CodexWindow }
+  error?: string
+}
+/** thread/tokenUsage/updated の控え（実行面が手元に持っているもの）。 */
+export type CodexTokens = {
+  totalTokens?: number; inputTokens?: number; cachedInputTokens?: number
+  outputTokens?: number; reasoningOutputTokens?: number
+}
+export type CodexContext = {
+  tokenUsage?: { total?: CodexTokens; last?: CodexTokens; modelContextWindow?: number } | null
+}
+
 export type RuntimeUsage = {
+  // agent で中身の形が変わる。codex なら usage は CodexRateLimits、context は CodexContext。
+  agent?: string
   usage?: UsagePayload; usage_error?: string
   context?: ContextPayload; context_error?: string
   running: number; max: number; warning?: string
@@ -321,8 +340,9 @@ export const api = {
     fetchJSON<RuntimeSession>(`/api/runtime/${encodeURIComponent(id)}`),
   runtimeEnded: (kind = '', before = '') =>
     fetchJSON<RuntimeEnded>('/api/runtime/ended' + qs({ kind, before })),
-  runtimeStart: (cwd: string, host = '') =>
-    postJSON<RuntimeSession>('/api/runtime', host ? { cwd, host } : { cwd }),
+  runtimeStart: (cwd: string, host = '', agent = 'claude') =>
+    postJSON<RuntimeSession>('/api/runtime',
+      { cwd, ...(host ? { host } : {}), ...(agent !== 'claude' ? { agent } : {}) }),
   runtimeInput: (id: string, text: string) =>
     postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/input`, { text }),
   runtimeStop: (id: string, mode: 'interrupt' | 'terminate') =>

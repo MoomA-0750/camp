@@ -192,3 +192,51 @@ result を待つ」形で書いたら、`can_use_tool` が2つ来て、2つ目�
   手元の ssh も終わらない
 - 1行目に向こうの sh が身元（pid・起動時刻・boot_id・scope・実パス）を名乗る。
   ログインシェルが何かを吐いても、それより前の行はフレームとして扱わない
+
+---
+
+## 11. Codex を駆動する（2026-09-11、codex-cli 0.154.0）
+
+口は `codex app-server`（stdio の JSON-RPC、1行1メッセージ）。`codex exec --json` は承認を
+返せない（非対話）ので使わない。測り方は `dev/scripts/probe_codex.py`・`probe_codex_config.py`、
+設計は `dev/active/phase3.6-plan.md`、決定は D-029。
+
+```
+→ initialize {clientInfo, capabilities:{optOutNotificationMethods:[…]}}   ← {userAgent, codexHome, …}
+→ initialized
+→ thread/start {cwd, approvalPolicy:"untrusted", approvalsReviewer:"user", sandbox:"workspace-write"}
+                                                   ← {thread:{id}, approvalPolicy, approvalsReviewer, sandbox, cwd, …}
+→ turn/start {threadId, input:[{type:"text", text}]}   ← {turn:{id}}、以後 turn/started … turn/completed
+← item/commandExecution/requestApproval {id:0, command, cwd, …}   → {id:0, result:{decision:"accept"|"decline"}}
+← item/fileChange/requestApproval {id:1, itemId}                   （差分は直前の item/started の changes）
+→ turn/interrupt {threadId, turnId}                ← turn/completed {status:"interrupted"}
+→ account/rateLimits/read                          ← {rateLimits:{primary, secondary, planType}}（モデルを呼ばない）
+```
+
+| 測ったこと | 結果 |
+|---|---|
+| 承認 | サーバーからの**要求**として来る。1ターンに2つ来た。id は整数の 0 から |
+| 断る（`decline`） | そのコマンドだけ `declined` になり、ターンは続く。理由を渡す欄は無い |
+| ファイル変更の承認 | 要求そのものに差分が無い。直前の `item/started`（fileChange）の `changes` にある |
+| `untrusted` + `workspace-write` | `touch`・`rm`・作業場所の中のファイル作成も訊いてきた |
+| 中断 | ターンは `interrupted` で終わる。**走っていたコマンドは残る**（15 秒後も生きていた） |
+| stdin を閉じる／SIGTERM | 0.06 秒で終わる。走っていたコマンドも 1 秒後には居ない |
+| 子 | app-server の子（MainThread・node_repl・codex-code-mode）は**別々のプロセスグループ**。コマンドは `codex-linux-sandbox` の下で**別のセッション** |
+| 途中経過 | `optOutNotificationMethods` で止まる（`mcpServer/startupStatus/updated` 10 → 0） |
+| `thread/start` の応答 | 効いた方針が返る。本人の `config.toml` より引数が勝った |
+
+**本人の Codex の設定を引き継ぐと、承認を通らずに走る経路がある**（Fable の設計レビューで指摘され、測った）:
+
+| 測ったこと | 結果 |
+|---|---|
+| 本人の `rules/default.rules` に allow のあるコマンド | 承認要求なしで走った。`curl` は `networkAccess:false` なのに外へ出た（sandbox の外で走る） |
+| MCP のツール | 承認要求なしで走った。**Codex には MCP の承認の要求そのものが無い** |
+| `thread/start`（`workspace-write`） | 本人の `config.toml` に `[projects."<cwd>"] trust_level="trusted"` を書き足した（`read-only` では書かない） |
+
+したがって Camp は **専用の `CODEX_HOME`** で起こす。設定は起こすたびに本人の `config.toml` から
+作り直し、rules と信頼済みの場所は持ち込まない（同じ置き場で、それまで訊かずに走ったコマンドが
+承認を訊いてきたことを確かめた）。MCP・プラグイン・モデルは同じになる。ログインは `auth.json` の
+symlink で共有し、鍵の更新を強制しても symlink が保たれ本体が更新されることを確かめた。
+
+**確かめていない**: Codex 自身に承認待ちの期限があるか（Camp は 4分30秒で自分から断る）。
+権限の拡張・質問・MCP の問い合わせに断りを返したときの振る舞い（偽物でしか試せていない）。
