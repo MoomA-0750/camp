@@ -1,17 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import {
-  api, type Approval, type CodexContext, type CodexRateLimits, type CodexWindow,
-  type ContextPayload, type LogLine, type PlanLimit, type RuntimeUsage,
+  api, type Approval, type AskView, type LogLine, type RuntimeUsage, type UsageTable,
+  type UsageWindow,
 } from '../api'
 import { Empty, Failed, Loading, clock, short, tokens, useAsync } from '../ui'
-import { ApprovalSummary, StateBadge, agentLabel, atEndLabel, endLabel } from './Runtime'
+import { ApprovalSummary, StateBadge, atEndLabel, endLabel, permLabel } from './Runtime'
 
 // 走っているセッション1本。
 //
 // **流れてくるものは SSE で受ける。** 子は読み手を待たない——実行面が
 // 子の隣に落としていて、ここはそれをカーソルで追いかけるだけ。画面を
 // 閉じても子は走り続けるし、開き直せば続きから届く。
+//
+// **どのエージェントかを読み分けない**（D-031）。表示名・振る舞いの説明・流れの一言・承認の中身・
+// 残量は、駆動器が共通の形に直したものが API から来る。
 export default function RuntimeDetail() {
   const { id = '' } = useParams()
   const [sp, setSp] = useSearchParams()
@@ -42,6 +45,18 @@ export default function RuntimeDetail() {
   // どこまで受け取ったか。**繋ぎ直しのたびに先頭から流し直させない。**
   // 覚えていないと、繋ぎ直すたびに同じ行が積み上がる（2026-09-07 に実測）。
   const lastSeq = useRef(0)
+
+  // 状態と承認を取り直す。**どの行で取り直すかを、フレームの種類で決めない**（種類は
+  // エージェントごとに違う）。行が来たら、少し待ってまとめて取り直す。
+  const refresh = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  useEffect(() => () => { if (refresh.current) clearTimeout(refresh.current) }, [])
+  const soon = () => {
+    if (refresh.current) return
+    refresh.current = setTimeout(() => {
+      refresh.current = undefined
+      setTick((v) => v + 1)
+    }, 400)
+  }
 
   // SSE で追いかける。**繋がなくても子は走る**ので、切れても壊れない。
   //
@@ -83,13 +98,7 @@ export default function RuntimeDetail() {
         if (ln.seq <= lastSeq.current) return
         lastSeq.current = ln.seq
         setLines((prev) => (prev.length > 2000 ? [...prev.slice(-1500), ln] : [...prev, ln]))
-        // ターンの終わりと承認の要求で、状態と承認を取り直す。
-        // Codex は turn/completed と request/…（ターンを始められなかったときは camp/input_failed）。
-        if (ln.kind === 'result' || ln.kind.startsWith('control_request') ||
-          ln.kind === 'turn/completed' || ln.kind.startsWith('request/') ||
-          ln.kind === 'camp/input_failed') {
-          setTick((v) => v + 1) // 状態と承認を取り直す
-        }
+        soon()
       } catch { /* 読めない行は捨てる */ }
     }
     es.addEventListener('gap', (e) => {
@@ -97,11 +106,12 @@ export default function RuntimeDetail() {
       try { setGap(JSON.parse((e as MessageEvent).data).dropped ?? 0) } catch { setGap(-1) }
     })
     return () => es.close()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, streaming])
 
-  // Camp が子へ投げた制御の返事は、会話ではない（残量の取得など）。
+  // Camp が子へ投げた問い合わせのやりとりは、会話ではない（残量の取得など。駆動器が印を付ける）。
   // **落とし先からは消さない。** 画面で畳むだけ。
-  const shown = lines.filter((l) => l.kind !== 'control_response')
+  const shown = lines.filter((l) => !l.own)
   const hidden = lines.length - shown.length
 
   useEffect(() => {
@@ -129,6 +139,7 @@ export default function RuntimeDetail() {
     setSp(next)
   }
 
+  const sid = rec?.agent_session_id ?? rec?.claude_id
   return (
     <>
       <p className="crumbs"><Link to="/runtime">← セッション駆動</Link></p>
@@ -138,12 +149,12 @@ export default function RuntimeDetail() {
       </h2>
       {rec && (
         <p className="sub muted">
-          {agentLabel(rec.agent)} /{' '}
+          {rec.agent_label ?? rec.agent}（確認の度合い {permLabel(rec.perm)}） /{' '}
           起こしたのは {short(rec.created_at)} /{' '}
           {rec.host
             ? <>手元の ssh の pid {rec.pid || '—'} / {rec.host} の pid {rec.remote_pid || '—'}</>
             : <>pid {rec.pid || '—'}</>}
-          {rec.claude_id ? <> / 会話記録 <code>{rec.claude_id.slice(0, 8)}</code></> : null}
+          {sid ? <> / 会話記録 <code>{sid.slice(0, 8)}</code></> : null}
         </p>
       )}
       {rec?.state === 'exited' && (
@@ -174,7 +185,8 @@ export default function RuntimeDetail() {
       {tab === 'history' && <History id={id} />}
       {tab === 'stream' && (
         <>
-          <Talk id={id} state={rec?.state} agent={rec?.agent} onSent={() => setTick((v) => v + 1)} />
+          <Talk id={id} state={rec?.state} notes={rec?.agent_notes}
+            onSent={() => setTick((v) => v + 1)} />
           <p className="sub muted">
             {!known ? '状態を確かめている'
               : !wantLive ? '流していない（live=0）'
@@ -210,7 +222,7 @@ export default function RuntimeDetail() {
               <div key={ln.seq} className="frame">
                 <span className="muted mono">{clock(ln.at)}</span>{' '}
                 <span className="kind">{ln.kind}</span>{' '}
-                <span className="mono">{summarize(ln)}</span>
+                <span className="mono">{ln.summary ?? ''}</span>
               </div>
             ))}
           </div>
@@ -218,77 +230,6 @@ export default function RuntimeDetail() {
       )}
     </>
   )
-}
-
-// summarize はフレームの中身を1行に畳む。**全文はここでは出さない**
-// （会話そのものは取り込まれたあと「セッション」側で読む）。
-function summarize(ln: LogLine): string {
-  const f = ln.frame as Record<string, unknown> | undefined
-  if (!f) return ''
-  if (f.jsonrpc || f.method || (f.id !== undefined && ('result' in f || 'error' in f))) {
-    return summarizeCodex(f)
-  }
-  const msg = f.message as { content?: unknown } | undefined
-  if (Array.isArray(msg?.content)) {
-    return msg.content
-      .map((b) => {
-        const x = b as { type?: string; text?: string; name?: string }
-        if (x.type === 'text') return (x.text ?? '').slice(0, 200)
-        if (x.type === 'tool_use') return `[${x.name}]`
-        if (x.type === 'tool_result') return '[結果]'
-        return `[${x.type}]`
-      })
-      .join(' ')
-      .slice(0, 300)
-  }
-  if (typeof msg?.content === 'string') return msg.content.slice(0, 300)
-  return ''
-}
-
-// summarizeCodex は Codex（JSON-RPC）の1行を畳む。途中経過は来ない
-// （実行面が断っている）ので、完成した item とターンの終わりだけを文にする。
-export function summarizeCodex(f: Record<string, unknown>): string {
-  const method = f.method as string | undefined
-  const p = (f.params ?? {}) as Record<string, unknown>
-  if (!method) {
-    const e = f.error as { message?: string } | undefined
-    return e?.message ? `エラー: ${e.message}`.slice(0, 300) : ''
-  }
-  const item = p.item as Record<string, unknown> | undefined
-  switch (method) {
-    case 'item/completed': {
-      if (!item) return ''
-      if (item.type === 'agentMessage') return String(item.text ?? '').slice(0, 300)
-      if (item.type === 'userMessage') {
-        const c = (item.content as { text?: string }[] | undefined) ?? []
-        return c.map((x) => x.text ?? '').join(' ').slice(0, 300)
-      }
-      if (item.type === 'commandExecution') {
-        return `[${String(item.status ?? '')}] ${String(item.command ?? '')}`.slice(0, 300)
-      }
-      if (item.type === 'fileChange') {
-        const ch = (item.changes as { path?: string }[] | undefined) ?? []
-        return `[${String(item.status ?? '')}] ` + ch.map((c) => c.path).join(', ').slice(0, 300)
-      }
-      if (item.type === 'mcpToolCall') {
-        return `[MCP ${String(item.server ?? '')}/${String(item.tool ?? '')}] ${String(item.status ?? '')}`
-      }
-      return `[${String(item.type)}]`
-    }
-    case 'turn/completed': {
-      const t = p.turn as { status?: string } | undefined
-      return `ターンが終わった（${t?.status ?? '?'}）`
-    }
-    case 'item/commandExecution/requestApproval':
-      return `承認を求めている: ${String(p.command ?? '')}`.slice(0, 300)
-    case 'item/fileChange/requestApproval':
-      return '承認を求めている: ファイル変更'
-    case 'error': {
-      const e = p.error as { message?: string } | undefined
-      return `エラー: ${e?.message ?? ''}`.slice(0, 300)
-    }
-  }
-  return ''
 }
 
 // Ask は待っている承認。**列として出す**——1ターンに複数来る（実測）。
@@ -322,7 +263,7 @@ function Ask({ id, rows, onAnswered }: {
           <div>
             <strong>{a.tool}</strong>{' '}
             <span className="muted">期限 {short(a.expires_at)}</span>
-            <pre className="mono small">{prettyDetail(a.detail)}</pre>
+            <pre className="mono small">{askText(a.detail)}</pre>
           </div>
           <div className="ask-buttons">
             <button onClick={() => void answer(a.request_id, 'allow')}>許可</button>
@@ -334,42 +275,36 @@ function Ask({ id, rows, onAnswered }: {
   )
 }
 
-function prettyDetail(d?: string): string {
+// askText は承認の中身を文にする。**共通の形（view）だけを見る**——どのエージェントでも同じ。
+// **差分は切り詰めない**——途中までの中身で許させない（画面へ渡せない大きさのものは、駆動器が
+// 見せずに断っている）。共通の形の無い古い行は、中身をそのまま出す。
+export function askText(d?: string): string {
   if (!d) return ''
   try {
-    const o = JSON.parse(d) as Record<string, unknown>
-    if (o.agent === 'codex') return codexDetail(o)
-    return JSON.stringify(o.input ?? o, null, 1).slice(0, 1200)
+    const o = JSON.parse(d) as { view?: AskView; input?: unknown }
+    const v = o.view
+    if (!v) return JSON.stringify(o.input ?? o, null, 1).slice(0, 1200)
+    const lines: string[] = []
+    if (v.what === 'command') {
+      lines.push(`$ ${v.command ?? '（コマンドが無い）'}`)
+      if (v.cwd) lines.push(`場所: ${v.cwd}${v.outside ? '  ← 起こした場所の外' : ''}`)
+    } else if (v.what === 'file') {
+      for (const c of v.changes ?? []) {
+        lines.push(`--- ${c.kind || '?'}: ${c.path}`)
+        if (c.patch) lines.push(c.patch)
+      }
+    } else {
+      lines.push(JSON.stringify(v.input ?? {}, null, 1))
+    }
+    if (v.reason) lines.push(`理由: ${v.reason}`)
+    return lines.join('\n')
   } catch {
     return d.slice(0, 1200)
   }
 }
 
-// codexDetail は Codex の承認の中身。**差分は切り詰めない**——途中までの中身で許させない
-// （画面へ渡せない大きさのものは、実行面が見せずに断っている）。
-export function codexDetail(o: Record<string, unknown>): string {
-  const p = (o.params ?? {}) as Record<string, unknown>
-  const lines: string[] = []
-  if (o.method === 'item/commandExecution/requestApproval') {
-    lines.push(`$ ${String(p.command ?? '（コマンドが無い）')}`)
-    if (p.cwd) lines.push(`場所: ${String(p.cwd)}`)
-    if (p.networkApprovalContext) {
-      lines.push(`ネットワーク: ${JSON.stringify(p.networkApprovalContext)}`)
-    }
-  } else {
-    const ch = (o.changes as { path?: string; kind?: { type?: string }; diff?: string }[]
-      | undefined) ?? []
-    for (const c of ch) {
-      lines.push(`--- ${c.kind?.type ?? '?'}: ${c.path ?? ''}`)
-      if (c.diff) lines.push(c.diff)
-    }
-  }
-  if (typeof p.reason === 'string' && p.reason) lines.push(`理由: ${p.reason}`)
-  return lines.join('\n')
-}
-
-function Talk({ id, state, agent, onSent }: {
-  id: string; state?: string; agent?: string; onSent: () => void
+function Talk({ id, state, notes, onSent }: {
+  id: string; state?: string; notes?: string[]; onSent: () => void
 }) {
   const [text, setText] = useState('')
   const [err, setErr] = useState('')
@@ -414,95 +349,15 @@ function Talk({ id, state, agent, onSent }: {
           </button>
         </div>
       </form>
-      {agent === 'codex' && (
-        <p className="sub muted">
-          Codex の「中断」はターンを止めるが、<strong>走っていたコマンドは残る</strong>
-          （Codex の作り。2026-09-11 実測）。確実に止めるなら「止める」。
-          MCP のツールは Codex の作りとして承認を訊いてこない。
-        </p>
-      )}
+      {/* そのエージェント固有の振る舞い（駆動器の説明をそのまま出す）。 */}
+      {(notes ?? []).map((n) => <p key={n} className="sub muted">{n}</p>)}
       {err && <Failed error={err} />}
     </>
   )
 }
 
-// codexWindowLabel は枠の長さ（分）を名前にする。実測は 300 と 10080。
-function codexWindowLabel(mins?: number): string {
-  if (mins === 300) return '5時間'
-  if (mins === 10080) return '週'
-  return mins ? `${mins}分` : '枠'
-}
-
-// CodexUsage は Codex の残量。**形が Claude と違う**（account/rateLimits/read と、
-// 実行面が控えている thread/tokenUsage/updated）。どちらもモデルを呼ばない。
-function CodexUsage({ d }: { d: RuntimeUsage }) {
-  const rl = d.usage as unknown as CodexRateLimits | undefined
-  const tu = (d.context as unknown as CodexContext | undefined)?.tokenUsage
-  const windows = [rl?.rateLimits?.primary, rl?.rateLimits?.secondary]
-    .filter((w): w is CodexWindow => !!w)
-    .map((w): PlanLimit => ({
-      kind: codexWindowLabel(w.windowDurationMins), percent: w.usedPercent,
-      resets_at: w.resetsAt ? new Date(w.resetsAt * 1000).toISOString() : undefined,
-    }))
-  const total = tu?.total
-  return (
-    <>
-      {d.warning && <p className="warn">{d.warning}</p>}
-      <p className="sub muted">
-        同時に走っているのは {d.running} / {d.max} 本（4コア）。
-        {rl?.rateLimits?.planType ? ` / プラン ${rl.rateLimits.planType}` : ''}
-      </p>
-
-      <h3>プラン枠</h3>
-      {(d.usage_error || rl?.error) && <Failed error={d.usage_error || rl?.error || ''} />}
-      {!d.usage_error && !rl?.error && windows.length === 0 && <Empty>枠の情報が来ていない。</Empty>}
-      {windows.length > 0 && (
-        <div className="windows">
-          {windows.map((l) => <LimitCard key={l.kind} l={l} />)}
-        </div>
-      )}
-
-      <h3>トークン（このスレッド）</h3>
-      {d.context_error && <Failed error={d.context_error} />}
-      {!total ? (
-        <Empty>まだ1度もモデルを呼んでいない。</Empty>
-      ) : (
-        <>
-          <p>
-            {tokens(total.totalTokens ?? 0)}
-            {tu?.modelContextWindow ? <> / コンテキスト {tokens(tu.modelContextWindow)}</> : null}
-          </p>
-          <div className="scroll-x">
-            <table>
-              <thead>
-                <tr>
-                  <th className="num">入力</th><th className="num">キャッシュ読み</th>
-                  <th className="num">出力</th><th className="num">推論</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td className="num">{tokens(total.inputTokens ?? 0)}</td>
-                  <td className="num">{tokens(total.cachedInputTokens ?? 0)}</td>
-                  <td className="num">{tokens(total.outputTokens ?? 0)}</td>
-                  <td className="num">{tokens(total.reasoningOutputTokens ?? 0)}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
-
-      <details>
-        <summary>返ってきたものをそのまま見る</summary>
-        <Json v={{ usage: d.usage, context: d.context }} />
-      </details>
-    </>
-  )
-}
-
 // 残量。仕様が求めていた4種のうち3種をここに出す
-// （プラン残量の履歴は「使用量」の画面にある）。
+// （プラン残量の履歴は「使用量」の画面にある）。**共通の形（view）だけを見て描く。**
 //
 // **どれもチャートにしない。** 測っているのは「大きさ」と「状態」で、
 // 種類は2〜8しかない——プラン枠はメーター、内訳は表、同時実行は1行。
@@ -514,64 +369,41 @@ function Usage({ id }: { id: string }) {
   if (u.loading) return <Loading />
   if (u.error) return <Failed error={u.error} />
   const d = u.data as RuntimeUsage
-  if (d.agent === 'codex') return <CodexUsage d={d} />
-  const limits = d.usage?.rate_limits?.limits ?? []
-  const models = Object.entries(d.usage?.session?.model_usage ?? {})
+  const v = d.view
+  const windows = v?.windows ?? []
+  const errors = v?.errors ?? []
+  const ctx = v?.context
 
   return (
     <>
       {d.warning && <p className="warn">{d.warning}</p>}
       <p className="sub muted">
         同時に走っているのは {d.running} / {d.max} 本（4コア）。
-        {d.usage?.subscription_type ? ` / プラン ${d.usage.subscription_type}` : ''}
+        {v?.plan ? ` / プラン ${v.plan}` : ''}
       </p>
 
       <h3>プラン枠</h3>
       {d.usage_error && <Failed error={d.usage_error} />}
-      {!d.usage_error && limits.length === 0 && <Empty>枠の情報が来ていない。</Empty>}
-      {limits.length > 0 && (
+      {errors.map((e) => <Failed key={e} error={e} />)}
+      {!d.usage_error && errors.length === 0 && windows.length === 0 && (
+        <Empty>枠の情報が来ていない。</Empty>
+      )}
+      {windows.length > 0 && (
         <div className="windows">
-          {limits.map((l) => <LimitCard key={l.kind + (l.group ?? '')} l={l} />)}
+          {windows.map((w) => <LimitCard key={w.label} w={w} />)}
         </div>
       )}
 
-      <h3>トークンの内訳（このセッション）</h3>
-      {models.length === 0 ? (
-        <Empty>まだ1度もモデルを呼んでいない。</Empty>
-      ) : (
-        <div className="scroll-x">
-          <table>
-            <thead>
-              <tr>
-                <th>モデル</th><th className="num">入力</th><th className="num">出力</th>
-                <th className="num">キャッシュ読み</th><th className="num">キャッシュ作成</th>
-                <th className="num">思考</th><th className="num">費用</th>
-              </tr>
-            </thead>
-            <tbody>
-              {models.map(([name, m]) => (
-                <tr key={name}>
-                  <td className="mono">{name}</td>
-                  <td className="num">{tokens(m.inputTokens)}</td>
-                  <td className="num">{tokens(m.outputTokens)}</td>
-                  <td className="num">{tokens(m.cacheReadInputTokens)}</td>
-                  <td className="num">{tokens(m.cacheCreationInputTokens)}</td>
-                  <td className="num">{tokens(m.thinkingTokens)}</td>
-                  <td className="num">{usd(m.costUSD)}</td>
-                </tr>
-              ))}
-              <tr>
-                <td className="muted">合計</td>
-                <td colSpan={5} />
-                <td className="num">{usd(d.usage?.session?.total_cost_usd ?? 0)}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      )}
+      <h3>コンテキスト</h3>
+      {d.context_error ? <Failed error={d.context_error} />
+        : ctx ? (
+          <p>
+            {tokens(ctx.used)}
+            {ctx.max ? <> / {tokens(ctx.max)}（{Math.round((ctx.used / ctx.max) * 100)}%）</> : null}
+          </p>
+        ) : <Empty>コンテキストの情報が来ていない。</Empty>}
 
-      <h3>コンテキストの内訳</h3>
-      {d.context_error ? <Failed error={d.context_error} /> : <Context v={d.context} />}
+      {(v?.tables ?? []).map((t) => <UsageTableView key={t.title} t={t} />)}
 
       <details>
         <summary>返ってきたものをそのまま見る</summary>
@@ -581,10 +413,41 @@ function Usage({ id }: { id: string }) {
   )
 }
 
-const LIMIT_LABEL: Record<string, string> = {
-  session: 'セッション', five_hour: '5時間',
-  weekly_all: '週（全体）', seven_day: '7日',
-  weekly_opus: '週（Opus）', seven_day_opus: '7日（Opus）',
+function UsageTableView({ t }: { t: UsageTable }) {
+  return (
+    <>
+      <h3>{t.title}</h3>
+      {t.rows.length === 0 ? <Empty>{t.empty || '無い。'}</Empty> : (
+        <div className="scroll-x">
+          <table>
+            <thead>
+              <tr>
+                <th></th>
+                {t.columns.map((c) => <th key={c.label} className="num">{c.label}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {t.rows.map((r) => (
+                <tr key={r.label}>
+                  <td className={r.total ? 'muted' : 'mono'}>{r.label}</td>
+                  {r.cells.map((x, i) => (
+                    <td key={i} className="num">{cell(x, t.columns[i]?.unit)}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  )
+}
+
+// cell は表の1つのますの書き方。単位は駆動器が列に付けている。
+function cell(x: number, unit?: string): string {
+  if (unit === 'usd') return usd(x)
+  if (unit === 'percent') return x.toFixed(1) + '%'
+  return tokens(x)
 }
 
 /** リセットまでの残り。過ぎていれば空。 */
@@ -597,8 +460,8 @@ function until(at?: string) {
   return h > 0 ? `あと ${h}時間${m}分` : `あと ${m}分`
 }
 
-function LimitCard({ l }: { l: PlanLimit }) {
-  const pct = Math.min(100, Math.max(0, l.percent ?? 0))
+function LimitCard({ w }: { w: UsageWindow }) {
+  const pct = Math.min(100, Math.max(0, w.percent ?? 0))
   // 色は状態（good/warn/critical）であって、系列の識別ではない。
   // **数字を必ず添える**——色だけで伝えない。
   const level = pct >= 90 ? 'hot' : pct >= 75 ? 'warm' : 'cool'
@@ -606,19 +469,19 @@ function LimitCard({ l }: { l: PlanLimit }) {
     <div className="window">
       <div className="window-head">
         <span className="window-kind">
-          {LIMIT_LABEL[l.kind] ?? l.kind}
-          {l.is_active && <span className="tag warn">拘束中</span>}
+          {w.label}
+          {w.active && <span className="tag warn">拘束中</span>}
         </span>
         <span className="window-pct">{Math.round(pct)}%</span>
       </div>
       <div className="bar" role="meter" aria-valuenow={Math.round(pct)}
         aria-valuemin={0} aria-valuemax={100}
-        aria-label={`${LIMIT_LABEL[l.kind] ?? l.kind} の使用率`}>
+        aria-label={`${w.label} の使用率`}>
         <span className={`fill ${level}`} style={{ width: `${pct}%` }} />
       </div>
       <div className="window-foot muted">
-        <span>{until(l.resets_at)}</span>
-        <span>{short(l.resets_at)} に戻る</span>
+        <span>{until(w.resets_at)}</span>
+        <span>{short(w.resets_at)} に戻る</span>
       </div>
     </div>
   )
@@ -626,36 +489,6 @@ function LimitCard({ l }: { l: PlanLimit }) {
 
 function usd(n: number) {
   return '$' + (n ?? 0).toFixed(n >= 1 ? 2 : 4)
-}
-
-function Context({ v }: { v?: ContextPayload }) {
-  if (!v?.categories) return <Empty>コンテキストの内訳が来ていない。</Empty>
-  const max = v.maxTokens ?? 0
-  return (
-    <>
-      <p>
-        {tokens(v.totalTokens ?? 0)} / {tokens(max)}（{v.percentage ?? 0}%）
-      </p>
-      <div className="scroll-x">
-        <table>
-          <thead>
-            <tr><th>分類</th><th className="num">トークン</th><th className="num">割合</th></tr>
-          </thead>
-          <tbody>
-            {v.categories.map((c) => (
-              <tr key={c.name}>
-                <td>{c.name}</td>
-                <td className="num">{tokens(c.tokens)}</td>
-                <td className="num muted">
-                  {max > 0 ? ((c.tokens / max) * 100).toFixed(1) + '%' : ''}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </>
-  )
 }
 
 function Json({ v }: { v: unknown }) {

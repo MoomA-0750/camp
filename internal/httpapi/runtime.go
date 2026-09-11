@@ -48,7 +48,10 @@ func (s *Server) handleRuntimeList(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agent_connected": s.sessions.AgentConnected(),
-		"sessions":        rows,
+		// 起こせるエージェント（名前・表示名・確認の度合い・起こせる場所・説明）。**画面は
+		// ここから選択肢を作り、エージェントの名前を決め打ちしない**（D-031）。
+		"agents":   s.sessions.Agents(),
+		"sessions": rows,
 	})
 }
 
@@ -79,7 +82,11 @@ func (s *Server) handleRuntimeOne(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.fail(w, r, http.StatusInternalServerError, err.Error())
 	default:
-		writeJSON(w, http.StatusOK, rec)
+		// そのエージェント固有の振る舞いの説明も添える（実行面が繋がっていなくても出せるように）。
+		writeJSON(w, http.StatusOK, struct {
+			session.Record
+			AgentNotes []string `json:"agent_notes,omitempty"`
+		}{rec, session.NotesOf(rec.Agent)})
 	}
 }
 
@@ -88,13 +95,15 @@ func (s *Server) handleRuntimeStart(w http.ResponseWriter, r *http.Request) {
 		Cwd string `json:"cwd"`
 		// Host は ssh の Host 名。空ならこのマシン。
 		Host string `json:"host"`
-		// Agent は claude か codex。空なら claude。
+		// Agent は起こすエージェント（GET /api/runtime の agents の name）。空なら claude（古い画面）。
 		Agent string `json:"agent"`
+		// Perm は確認の度合い（cli / ask / edits / auto / full）。空なら cli（本人の設定のまま）。
+		Perm string `json:"perm"`
 	}
 	if !s.readBody(w, r, &body) {
 		return
 	}
-	rec, err := s.sessions.StartAgent("user", body.Host, body.Cwd, body.Agent)
+	rec, err := s.sessions.StartWith("user", body.Host, body.Cwd, body.Agent, body.Perm)
 	if err != nil {
 		code := http.StatusBadRequest
 		if errors.Is(err, session.ErrNoAgent) {
@@ -304,22 +313,28 @@ func (s *Server) handleRuntimeApprovals(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleRuntimeUsage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	out := map[string]any{}
-	// どのエージェントか。**中身の形が違う**ので画面が読み分ける
-	// （Claude は get_usage の形、Codex は account/rateLimits/read と tokenUsage）。
+	agent := ""
 	if rec, err := session.Get(s.db, id); err == nil {
+		agent = rec.Agent
 		out["agent"] = rec.Agent
 	}
 
+	var usage, context json.RawMessage
 	if b, err := s.sessions.Control(id, "get_usage"); err != nil {
 		out["usage_error"] = err.Error()
 	} else {
+		usage = b
 		out["usage"] = json.RawMessage(b)
 	}
 	if b, err := s.sessions.Control(id, "get_context_usage"); err != nil {
 		out["context_error"] = err.Error()
 	} else {
+		context = b
 		out["context"] = json.RawMessage(b)
 	}
+	// **画面は共通の形だけを見て描く**（エージェントを読み分けない。D-031）。答えの形の違いは
+	// 駆動器が吸う。生の答えは「そのまま見る」のために並べて返す。
+	out["view"] = session.UsageViewOf(agent, usage, context)
 	running, max := s.sessions.Capacity()
 	out["running"] = running
 	out["max"] = max

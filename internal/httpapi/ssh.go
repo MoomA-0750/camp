@@ -18,7 +18,7 @@ func (s *Server) sshRoutes() {
 	m.HandleFunc("POST /api/ssh/scan", s.handleSSHScan)
 	m.HandleFunc("POST /api/ssh/{alias}/edit", s.handleSSHEdit)
 	m.HandleFunc("POST /api/ssh/{alias}/allow", s.handleSSHAllow)
-	m.HandleFunc("POST /api/ssh/{alias}/claude", s.handleSSHClaude)
+	m.HandleFunc("POST /api/ssh/{alias}/path", s.handleSSHPath)
 }
 
 func (s *Server) handleSSHList(w http.ResponseWriter, r *http.Request) {
@@ -106,12 +106,14 @@ func (s *Server) handleSSHAllow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pinned": pin})
 }
 
-// handleSSHClaude は向こうの `claude` の場所を書く。**再認証が要る**
+// handleSSHPath は向こうでの、あるエージェントの実体の場所を書く。**再認証が要る**
 // ——向こうで何を走らせるかを変えるので、許可と同じ重さで扱う。
-func (s *Server) handleSSHClaude(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSSHPath(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ClaudePath string `json:"claude_path"`
-		Password   string `json:"password"`
+		// Agent は駆動器の名前（GET /api/runtime の agents の name）。
+		Agent    string `json:"agent"`
+		Path     string `json:"path"`
+		Password string `json:"password"`
 	}
 	if !s.readBody(w, r, &body) {
 		return
@@ -120,15 +122,15 @@ func (s *Server) handleSSHClaude(w http.ResponseWriter, r *http.Request) {
 	if !s.reauth(w, r, body.Password, "ssh:"+alias) {
 		return
 	}
-	if err := session.SetClaudePath(s.db, alias, body.ClaudePath); err != nil {
+	if err := session.SetAgentPath(s.db, alias, body.Agent, body.Path); err != nil {
 		s.fail(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	detail := body.ClaudePath
-	if detail == "" {
-		detail = "（向こうで探す）"
+	detail := body.Agent + ": " + body.Path
+	if body.Path == "" {
+		detail = body.Agent + ": （向こうで探す）"
 	}
-	audit.Append(s.db, audit.Entry{Actor: "user", Action: "ssh.claude",
+	audit.Append(s.db, audit.Entry{Actor: "user", Action: "ssh.path",
 		Target: alias, Detail: detail, Outcome: audit.OK})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

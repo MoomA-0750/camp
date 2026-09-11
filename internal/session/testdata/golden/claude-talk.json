@@ -1,0 +1,23 @@
+[
+  {
+    "t": "started",
+    "agent": "claude"
+  },
+  {
+    "t": "frame",
+    "kind": "system/init",
+    "agent_session_id": "fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "result",
+    "agent_session_id": "fake-1",
+    "turn_end": true
+  },
+  {
+    "t": "frame",
+    "kind": "result",
+    "agent_session_id": "fake-1",
+    "turn_end": true
+  }
+]

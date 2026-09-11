@@ -1,0 +1,43 @@
+[
+  {
+    "t": "started",
+    "agent": "codex",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "thread/started",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "response",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "turn/started",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "item/completed",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "item/completed",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "thread/tokenUsage/updated",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "turn/completed",
+    "agent_session_id": "thr-fake-1",
+    "turn_end": true
+  }
+]

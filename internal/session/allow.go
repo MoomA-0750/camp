@@ -223,7 +223,7 @@ func matchedRemoteRoot(db *store.DB, host, cwd string) (string, error) {
 // checkRemote は向こうに起こしてよいかを見る。**照合するのは campd 側。**
 //
 // 返すのは正規化した場所、それを通した行、実行面へ渡す行き先。
-func checkRemote(db *store.DB, host, cwd string) (string, string, *RemoteSpec, error) {
+func checkRemote(db *store.DB, agent, host, cwd string) (string, string, *RemoteSpec, error) {
 	if err := validAlias(host); err != nil {
 		return "", "", nil, err
 	}
@@ -246,7 +246,7 @@ func checkRemote(db *store.DB, host, cwd string) (string, string, *RemoteSpec, e
 	if err != nil {
 		return "", "", nil, err
 	}
-	return c, root, &RemoteSpec{Alias: host, Pin: *d.Pinned, Claude: d.ClaudePath}, nil
+	return c, root, &RemoteSpec{Alias: host, Pin: *d.Pinned, Bin: d.AgentPaths[agent]}, nil
 }
 
 // under は p が root と同じか、その下かを返す。

@@ -27,15 +27,40 @@ type Destination struct {
 	// Pinned は許したときに `ssh -G` で見た行き先。起こすたびに照らす。
 	// 許可済みでもこれが空なら起こせない（2026-09-11 より前に許したもの）。
 	Pinned *Resolved `json:"pinned,omitempty"`
-	// ClaudePath は向こうの `claude` の実体。空なら向こうで探す。
-	ClaudePath string `json:"claude_path,omitempty"`
+	// AgentPaths はエージェントごとの向こうの実体（駆動器の名前 → 絶対パス）。無ければ向こうで探す。
+	AgentPaths map[string]string `json:"agent_paths,omitempty"`
 }
 
 const destCols = `
 	select id, alias, coalesce(hostname,''), coalesce(user,''), coalesce(port,0),
 	       coalesce(identity,''), coalesce(tailscale_ip,''), coalesce(note,''),
-	       allowed, source, seen_at, updated_at, coalesce(pinned,''), coalesce(claude_path,'')
+	       allowed, source, seen_at, updated_at, coalesce(pinned,'')
 	from ssh_hosts`
+
+// agentPathsOf は台帳の実体の場所を、接続先ごとに読む（alias が空なら全部）。
+func agentPathsOf(db *store.DB, alias string) (map[string]map[string]string, error) {
+	q, args := `select host, agent, path from ssh_agent_paths`, []any{}
+	if alias != "" {
+		q, args = q+` where host=?`, append(args, alias)
+	}
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]map[string]string{}
+	for rows.Next() {
+		var h, a, p string
+		if err := rows.Scan(&h, &a, &p); err != nil {
+			return nil, err
+		}
+		if out[h] == nil {
+			out[h] = map[string]string{}
+		}
+		out[h][a] = p
+	}
+	return out, rows.Err()
+}
 
 func scanDest(s scanner) (Destination, error) {
 	var d Destination
@@ -43,7 +68,7 @@ func scanDest(s scanner) (Destination, error) {
 	var pinned string
 	if err := s.Scan(&d.ID, &d.Alias, &d.HostName, &d.User, &d.Port,
 		&d.Identity, &d.TailscaleIP, &d.Note, &allowed, &d.Source,
-		&d.SeenAt, &d.UpdatedAt, &pinned, &d.ClaudePath); err != nil {
+		&d.SeenAt, &d.UpdatedAt, &pinned); err != nil {
 		return d, err
 	}
 	d.Allowed = allowed != 0
@@ -72,7 +97,17 @@ func ListDestinations(db *store.DB) ([]Destination, error) {
 		}
 		out = append(out, d)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	paths, err := agentPathsOf(db, "")
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].AgentPaths = paths[out[i].Alias]
+	}
+	return out, nil
 }
 
 // getDestination は1行読む。
@@ -81,7 +116,15 @@ func getDestination(db *store.DB, alias string) (Destination, error) {
 	if err == sql.ErrNoRows {
 		return d, fmt.Errorf("台帳に無い接続先: %s", alias)
 	}
-	return d, err
+	if err != nil {
+		return d, err
+	}
+	paths, err := agentPathsOf(db, alias)
+	if err != nil {
+		return d, err
+	}
+	d.AgentPaths = paths[alias]
+	return d, nil
 }
 
 // AllowDestination は許して、そのときの行き先を固定する。**再認証は呼び出し側の責任。**
@@ -110,23 +153,33 @@ func AllowDestination(db *store.DB, alias string, pin Resolved) error {
 	return nil
 }
 
-// SetClaudePath は向こうの `claude` の場所を書く。空は「向こうで探す」。
+// SetAgentPath は向こうでの、そのエージェントの実体の場所を書く。空は「向こうで探す」（行を消す）。
 //
 // **再認証は呼び出し側の責任。** 向こうで何を走らせるかを変えるので、
 // 許可と同じ重さで扱う。
-func SetClaudePath(db *store.DB, alias, p string) error {
-	if err := validClaudePath(p); err != nil {
+func SetAgentPath(db *store.DB, alias, agent, p string) error {
+	if !validAgent(agent) {
+		return fmt.Errorf("知らないエージェント: %q", agent)
+	}
+	if err := validAgentPath(p); err != nil {
 		return err
 	}
-	r, err := db.Exec(`update ssh_hosts set claude_path=?, updated_at=? where alias=?`,
-		nzs(p), time.Now().UTC().Format(time.RFC3339), alias)
+	if _, err := getDestination(db, alias); err != nil {
+		return err
+	}
+	var err error
+	if p == "" {
+		_, err = db.Exec(`delete from ssh_agent_paths where host=? and agent=?`, alias, agent)
+	} else {
+		_, err = db.Exec(`insert into ssh_agent_paths(host, agent, path) values(?,?,?)
+			on conflict(host, agent) do update set path=excluded.path`, alias, agent, p)
+	}
 	if err != nil {
 		return err
 	}
-	if n, _ := r.RowsAffected(); n == 0 {
-		return fmt.Errorf("台帳に無い接続先: %s", alias)
-	}
-	return nil
+	_, err = db.Exec(`update ssh_hosts set updated_at=? where alias=?`,
+		time.Now().UTC().Format(time.RFC3339), alias)
+	return err
 }
 
 // ResolveSSH は実行面に `ssh -G <alias>` を読ませる。**繋がない。**

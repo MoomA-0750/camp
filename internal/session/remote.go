@@ -128,8 +128,8 @@ type RemoteSpec struct {
 	Alias string `json:"alias"`
 	// Pin は許したときの行き先。実行面は `ssh -G` と照らし、違えば起こさない。
 	Pin Resolved `json:"pin"`
-	// Claude は向こうの `claude` の実体。空なら向こうで探す。
-	Claude string `json:"claude,omitempty"`
+	// Bin は向こうでの、起こすエージェントの実体（台帳の場所）。空なら向こうで探す。
+	Bin string `json:"bin,omitempty"`
 }
 
 // RemoteOwner は向こうで起きたセッションの身元。**向こうの sh が名乗ったもの。**
@@ -148,7 +148,15 @@ type RemoteOwner struct {
 	// Root は許した行を向こうで実パスに直したもの。Cwd は実際に降りた場所。
 	Root string `json:"root"`
 	Cwd  string `json:"cwd"`
+	// Session はしるし（CAMP_SESSION）の値 = Camp のセッション id。後始末で、別のセッションへ逃げた
+	// 残りを探すのに使う（台帳にあるので、campd の再起動後も渡せる）。
+	Session string `json:"session,omitempty"`
+	// Home・HomeReal はエージェントの置き場（向こうの sh が名乗る。照らす駆動器だけ）。
+	Home     string `json:"home,omitempty"`
+	HomeReal string `json:"home_real,omitempty"`
 }
+
+var sessionIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // 向こうを見に行った結果。
 const (
@@ -204,11 +212,11 @@ func cleanRemotePath(p string) (string, error) {
 	return c, nil
 }
 
-// validClaudePath は台帳に書く `claude` の場所を確かめる。空は「向こうで探す」。
+// validAgentPath は台帳に書く、向こうのエージェントの実体の場所を確かめる。空は「向こうで探す」。
 //
 // **`$` を通さない。** systemd-run は引数の `$VAR` を展開する（systemd 254 以降。
 // 2026-09-11 に `$$` が `$` になるのを実測した）。
-func validClaudePath(p string) error {
+func validAgentPath(p string) error {
 	if p == "" {
 		return nil
 	}
@@ -217,10 +225,10 @@ func validClaudePath(p string) error {
 		return err
 	}
 	if c != p {
-		return fmt.Errorf("claude の場所は正規化した形で書く: %s", c)
+		return fmt.Errorf("実体の場所は正規化した形で書く: %s", c)
 	}
 	if strings.ContainsAny(p, "$`\\\"'") {
-		return fmt.Errorf("claude の場所に使えない文字がある: %s", p)
+		return fmt.Errorf("実体の場所に使えない文字がある: %s", p)
 	}
 	return nil
 }
@@ -249,8 +257,13 @@ func remoteCommand(script string, args ...string) string {
 
 // sshSafeOpts は Camp が起こす ssh に必ず付ける。**config より優先される**
 // （ssh は最初に見た値を採り、コマンドラインが先に読まれる）。
+//
+// **転送は config のまま**（D-030、本人の決定 2026-09-12）。以前は `-a`・`-x`・ForwardAgent=no・
+// ForwardX11=no・ClearAllForwardings=yes を必ず付けていたが、そうすると `ssh <host>` してから CLI を
+// 起こすのと違い、向こうから手元の鍵を使えない（git push など）。答える人が居ないこと（BatchMode）と
+// ホスト鍵の固定は、Camp が答えられない・行き先を固定するための縛りなので残す。
 var sshSafeOpts = []string{
-	"-T", "-a", "-x",
+	"-T",
 	// 答える人が居ない。パスワードも、ホスト鍵の確認も訊かせない。
 	"-o", "BatchMode=yes",
 	// **ホスト鍵を Camp が受け入れない。** 知らない鍵・変わった鍵では繋がない。
@@ -263,8 +276,7 @@ var sshSafeOpts = []string{
 	"-o", "KnownHostsCommand=none",
 	// 相乗りしない。他の接続を巻き込んで止めたり、止め損ねたりしない。
 	"-o", "ControlMaster=no", "-o", "ControlPath=none",
-	// 鍵も画面も向こうへ渡さない。
-	"-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes",
+	// 繋いだときに手元でコマンドを走らせない。tty も要らない（転送は config のまま）。
 	"-o", "PermitLocalCommand=no", "-o", "RequestTTY=no",
 	// 黙って切れた接続に1分で気づく。
 	"-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
@@ -277,6 +289,15 @@ var sshSafeOpts = []string{
 // **`set -f` を掛けない**——/proc/[0-9]* を展開する。stat の欄（comm を
 // 除いたもの）は数と状態の1文字だけなので、分割しても展開は起きない。
 // 読むのは組み込みの read で、プロセスごとに cat を起こさない。
+//
+// **statof は state・ppid・sess・start を上書きする**（sh の関数に局所変数は無い）。marked は
+// me・smark・sself・unread を、stopall は left・alive・was を使う。スクリプトの側でこれらの名前を
+// 使わない（2026-09-12、しるしを sess と名付けて取り逃がした）。
+//
+// hasmark は「同じユーザーで、このセッションのしるしを持つ」プロセスか。**uid を読める側でも見る**
+// ——root で入ると、しるしを持つ別のユーザーのプロセスまで拾ってしまう（codex exec のレビュー）。
+// **pid の使い回しは残る穴**: 走査から撃つまでの間にしるし持ちが終わり、同じ番号が別人に渡ると、
+// その別人へ TERM が飛ぶ（窓は数秒。pid_max が小さいホストでは起こりうる）。
 //
 // members は、セッション番号が $1 の者と、そこから親を辿れる者を集める（$2 は除く）。
 // **セッション番号で数えてよいのは、番号を使っている者が居る間はカーネルが
@@ -312,7 +333,34 @@ members() {
   n=0
   for p in $list; do n=$((n+1)); done
 }
+hasmark() {
+  [ -r "/proc/$1/environ" ] || return 1
+  hu=
+  { while read -r k v rest; do [ "$k" = Uid: ] && { hu=$v; break; }; done < "/proc/$1/status"; } 2>/dev/null
+  [ -n "$me" ] && [ "$hu" = "$me" ] || return 1
+  tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -qx "CAMP_SESSION=$2"
+}
+marked() {
+  me=$(id -u 2>/dev/null) || me=
+  smark=$1 sself=$2
+  unread=0
+  for f in /proc/[0-9]*; do
+    p=${f#/proc/}
+    [ "$p" = "$2" ] && continue
+    case "$list" in *" $p "*) continue ;; esac
+    if [ -r "$f/environ" ]; then
+      hasmark "$p" "$1" && list="$list$p "
+    else
+      uid=
+      { while read -r k v rest; do [ "$k" = Uid: ] && { uid=$v; break; }; done < "$f/status"; } 2>/dev/null
+      [ -n "$me" ] && [ "$uid" = "$me" ] && unread=$((unread+1))
+    fi
+  done
+  n=0
+  for p in $list; do n=$((n+1)); done
+}
 stopall() {
+  left=0
   [ "$n" = 0 ] && return 0
   kill -TERM $list 2>/dev/null
   i=0
@@ -321,17 +369,46 @@ stopall() {
     for p in $list; do
       if statof "$p" && [ "$state" != Z ]; then alive="$alive $p"; fi
     done
-    [ -z "$alive" ] && return 0
+    [ -z "$alive" ] && break
     sleep 0.3 2>/dev/null || sleep 1
     i=$((i+1))
   done
-  kill -KILL $alive 2>/dev/null
+  # **止めている間に生まれたしるし持ちを拾う。** 最初の走査は1回きりなので、
+  # TERM を受けた子がその後に起こしたものが残る。
+  if [ -n "${smark:-}" ]; then
+    was=$n
+    marked "$smark" "$sself"
+    if [ "$n" != "$was" ]; then
+      kill -TERM $list 2>/dev/null
+      sleep 0.3 2>/dev/null || sleep 1
+    fi
+  fi
+  alive=
+  for p in $list; do
+    if statof "$p" && [ "$state" != Z ]; then alive="$alive $p"; fi
+  done
+  [ -n "$alive" ] && kill -KILL $alive 2>/dev/null
+  # **撃ったあとに数え直す。** 「止めた」と言い切らない。
+  sleep 0.2 2>/dev/null || true
+  for p in $list; do
+    if statof "$p" && [ "$state" != Z ]; then left=$((left+1)); fi
+  done
+  [ "$left" = 0 ] && return 0
+  return 1
 }
 `
 
-// wrapperScript は向こうで走る sh。**確かめてから `claude` を起こし、親として残る。**
+// wrapperScript は向こうで走る sh。**確かめてからエージェントを起こし、親として残る。**
 //
-// 引数: 場所、許した行、claude の実体（- なら探す）、scope 名（- なら使わない）、合言葉。
+// 引数: 場所、許した行、探す名前、実体（- なら探す）、置き場の環境変数名と既定の相対パス（- なら
+// 照らさない）、scope 名（- なら使わない）、合言葉、しるし（セッション id）。残りはエージェントの
+// 引数（駆動器の Argv）。**この sh にエージェントの名前を書かない**（D-031）。
+//
+// **しるし**: エージェントを `CAMP_SESSION=<セッション id>` の環境で起こす。エージェントが別の
+// セッションへ逃がしたもの（Codex のコマンド）は、エージェントが異常終了すると親を辿れなくなる
+// （2026-09-12、`rp` で実測）。終わりの後始末と reapScript は、同じユーザーのプロセスのうち
+// このしるしを持つものも止める。切り離して起こしたもの（nohup のサーバなど）も止まる（本人の決定。
+// 手元の scope と同じ）。残したいものは `env -u CAMP_SESSION` で起こす。
 //
 // 1行目に必ず `CAMP-REMOTE` か `CAMP-ERR` を出す。実行面はそれを読むまで
 // フレームとして扱わない（ログインシェルが何か吐いても混ざらない）。
@@ -345,32 +422,43 @@ stopall() {
 //
 // stdin は fd 3 に写してから子へ渡す。非対話の sh は、裏で起こした子の stdin を
 // /dev/null にする（POSIX）。明示の付け替えはその後に効く。
-const wrapperScript = procFns + `cwd=$1 root=$2 claude=$3 unit=$4 nonce=$5
+const wrapperScript = procFns + `cwd=$1 root=$2 name=$3 bin=$4 henv=$5 hdef=$6 unit=$7 nonce=$8 mark=$9
+shift 9
 nl='
 '
 tab=$(printf '\t')
 bad() { printf 'CAMP-ERR\t%s\t%s\n' "$2" "$1"; exit "$2"; }
 [ -r /proc/self/stat ] || bad '/proc が無いホストでは起こさない（切れたあとに向こうを確かめられない）' 95
-case "$cwd$root$claude" in *"$nl"*|*"$tab"*) bad 'パスに改行かタブがある' 90 ;; esac
+case "$cwd$root$bin$hdef" in *"$nl"*|*"$tab"*) bad 'パスに改行かタブがある' 90 ;; esac
+case "$name" in ''|*[!a-z0-9_-]*) bad "探す名前として使えない: $name" 90 ;; esac
+case "$henv" in -) ;; ''|[0-9]*|*[!A-Z0-9_]*) bad "置き場の環境変数名として使えない: $henv" 90 ;; esac
+case "$mark" in ''|*[!0-9a-f]*) bad 'しるしとして使えない' 90 ;; esac
 rootreal=$(cd -- "$root" 2>/dev/null && pwd -P) || bad "許した場所が向こうに無い: $root" 91
 [ "$rootreal" = / ] && bad "許した場所を辿ると / になる: $root" 91
 cd -- "$cwd" 2>/dev/null || bad "場所を辿れない: $cwd" 92
 real=$(pwd -P)
 case "$real/" in "$rootreal"/*) ;; *) bad "許した場所の外: $real" 93 ;; esac
 case "$real$rootreal" in *"$nl"*|*"$tab"*) bad '実パスに改行かタブがある' 90 ;; esac
-if [ "$claude" = - ]; then
-  claude=$(command -v claude 2>/dev/null) || claude=
-  case "$claude" in /*) ;; *) claude= ;; esac
-  if [ -z "$claude" ]; then
-    for p in "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
-      if [ -x "$p" ]; then claude=$p; break; fi
+if [ "$bin" = - ]; then
+  bin=$(command -v "$name" 2>/dev/null) || bin=
+  case "$bin" in /*) ;; *) bin= ;; esac
+  if [ -z "$bin" ]; then
+    for p in "$HOME/.local/bin/$name" "/opt/homebrew/bin/$name" "/usr/local/bin/$name"; do
+      if [ -x "$p" ]; then bin=$p; break; fi
     done
   fi
-  [ -n "$claude" ] || bad 'claude が見つからない（台帳で場所を指せる）' 94
+  [ -n "$bin" ] || bad "$name が見つからない（台帳で場所を指せる）" 94
 fi
-[ -x "$claude" ] || bad "claude を実行できない: $claude" 94
-PATH=${claude%/*}:$PATH
+[ -x "$bin" ] || bad "$name を実行できない: $bin" 94
+PATH=${bin%/*}:$PATH
 export PATH
+home=- homereal=-
+if [ "$henv" != - ]; then
+  eval "home=\${$henv:-}"
+  [ -n "$home" ] || home=$HOME/$hdef
+  homereal=$(cd -- "$home" 2>/dev/null && pwd -P) || homereal=-
+  case "$home$homereal" in *"$nl"*|*"$tab"*) bad '置き場のパスに改行かタブがある' 90 ;; esac
+fi
 boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot=
 st=
 statof $$ && st=$start
@@ -378,20 +466,23 @@ statof $$ && st=$start
 if [ "$unit" != - ]; then
   if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then :; else unit=-; fi
 fi
-printf 'CAMP-REMOTE\t2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$nonce" "$$" "$st" "${boot:--}" "$unit" "$rootreal" "$real"
-set -- -p --input-format stream-json --output-format stream-json --verbose --permission-prompt-tool stdio
+printf 'CAMP-REMOTE\t3\t%s\t%s\t%s\t%s\t%s\t%s\t%s\thome=%s\thomereal=%s\n' "$nonce" "$$" "$st" "${boot:--}" "$unit" "$rootreal" "$real" "$home" "$homereal"
+CAMP_SESSION=$mark
+export CAMP_SESSION
 exec 3<&0
 if [ "$unit" != - ]; then
-  systemd-run --user --scope --quiet --collect --unit "$unit" -- "$claude" "$@" 0<&3 3<&- &
+  systemd-run --user --scope --quiet --collect --unit "$unit" -- "$bin" "$@" 0<&3 3<&- &
 else
-  "$claude" "$@" 0<&3 3<&- &
+  "$bin" "$@" 0<&3 3<&- &
 fi
 kid=$!
 exec 0</dev/null 3<&-
 wait "$kid"
 rc=$?
 trap '' TERM HUP
+unset CAMP_SESSION
 members $$ $$
+marked "$mark" $$
 stopall
 exit $rc
 `
@@ -408,33 +499,52 @@ exit $rc
 // **確かめ終えるまで、scope にも触らない。** boot_id と起動時刻を照らしてから止める。
 // 以前は scope を先に止めていた（2026-09-11 の outer gate で codex が指摘。
 // 名前はセッションごとに乱数なので実害は無かったが、「照らしてから撃つ」と逆だった）。
-const reapScript = procFns + `pid=$1 st=$2 boot=$3 unit=$4
+const reapScript = procFns + `pid=$1 st=$2 boot=$3 unit=$4 mark=$5
 out() { printf 'CAMP-REAP\t%s\t%s\n' "$1" "$2"; exit 0; }
 [ -r /proc/self/stat ] || out unsupported '/proc が無い'
+case "$mark" in ''|*[!0-9a-f]*) mark=- ;; esac
 now=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || now=
 if [ "$boot" != - ] && [ -n "$now" ] && [ "$now" != "$boot" ]; then out gone '再起動を跨いだ'; fi
+same=1
 if statof "$pid"; then
   [ "$st" = - ] && out unsupported '起動時刻を控えていない'
-  [ "$start" != "$st" ] && out gone 'pid が使い回されている'
+  [ "$start" != "$st" ] && same=0
 fi
 stopped=0
-if [ "$unit" != - ] && command -v systemctl >/dev/null 2>&1; then
+if [ $same = 1 ] && [ "$unit" != - ] && command -v systemctl >/dev/null 2>&1; then
   systemctl --user stop "$unit" >/dev/null 2>&1 && stopped=1
 fi
-members "$pid" $$
+list=' ' n=0 unread=0
+[ $same = 1 ] && members "$pid" $$
+[ "$mark" != - ] && marked "$mark" $$
+note=
+[ "$unread" -gt 0 ] && note="（environ を読めない同じユーザーのプロセスが $unread）"
 if [ $n = 0 ]; then
-  [ $stopped = 1 ] && out killed scope
-  out gone '残っていなかった'
+  [ $stopped = 1 ] && out killed "scope$note"
+  [ $same = 0 ] && out gone "pid が使い回されている$note"
+  out gone "残っていなかった$note"
 fi
 stopall
-out killed "$n"
+[ "${left:-0}" -gt 0 ] && note="$note（撃っても $left 残った）"
+out killed "$n$note"
 `
 
-// parseHeader は向こうの sh の1行目を読む。**合言葉と起動時刻の無い名乗りは採らない。**
+// parseHeader は向こうの sh の1行目を読む（版 3）。**合言葉と起動時刻の無い名乗りは採らない。**
+// 9欄のあとは `key=value` を足せる（版を上げずに名乗りを増やすため。Fable の M42 レビュー）。
 func parseHeader(line, host, nonce string) (RemoteOwner, bool) {
 	f := strings.Split(line, "\t")
-	if len(f) != 9 || f[0] != "CAMP-REMOTE" || f[1] != "2" || nonce == "" || f[2] != nonce {
+	if len(f) < 9 || f[0] != "CAMP-REMOTE" || f[1] != "3" || nonce == "" || f[2] != nonce {
 		return RemoteOwner{}, false
+	}
+	extra := map[string]string{}
+	for _, kv := range f[9:] {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			return RemoteOwner{}, false
+		}
+		if v != "-" {
+			extra[k] = v
+		}
 	}
 	pid, err := strconv.Atoi(f[3])
 	if err != nil || pid <= 0 {
@@ -444,7 +554,8 @@ func parseHeader(line, host, nonce string) (RemoteOwner, bool) {
 	if err != nil || st == 0 {
 		return RemoteOwner{}, false
 	}
-	o := RemoteOwner{Host: host, PID: pid, Started: st, Root: f[7], Cwd: f[8]}
+	o := RemoteOwner{Host: host, PID: pid, Started: st, Root: f[7], Cwd: f[8],
+		Home: extra["home"], HomeReal: extra["homereal"]}
 	if f[5] != "-" {
 		o.BootID = f[5]
 	}

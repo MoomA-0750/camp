@@ -1,0 +1,51 @@
+[
+  {
+    "t": "started",
+    "agent": "codex",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "thread/started",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "response",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "turn/started",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "item/completed",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "item/started",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "request/item/fileChange/requestApproval",
+    "agent_session_id": "thr-fake-1",
+    "ask": true,
+    "request_id": "0",
+    "tool": "codex:fileChange"
+  },
+  {
+    "t": "frame",
+    "kind": "serverRequest/resolved",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "turn/completed",
+    "agent_session_id": "thr-fake-1",
+    "turn_end": true
+  }
+]

@@ -150,6 +150,12 @@ func hostKeyLine(t *testing.T, dir, name string) string {
 
 func newRemoteRig(t *testing.T, claudeBody string) *remoteRig {
 	t.Helper()
+	return newRemoteRigWith(t, claudeBody)
+}
+
+// newRemoteRigWith は、実行面に opts を掛けてから繋ぐ（向こうで Codex を起こすときなど）。
+func newRemoteRigWith(t *testing.T, claudeBody string, opts ...func(*Agent)) *remoteRig {
+	t.Helper()
 	dir := t.TempDir()
 	dir, _ = filepath.EvalSymlinks(dir)
 	ssh := filepath.Join(dir, "ssh")
@@ -173,12 +179,12 @@ func newRemoteRig(t *testing.T, claudeBody string) *remoteRig {
 
 	db := newDB(t)
 	s := New(db)
-	a := attach(t, s, "/nonexistent/local-claude", func(a *Agent) {
+	a := attach(t, s, "/nonexistent/local-claude", append([]func(*Agent){func(a *Agent) {
 		a.SSH = ssh
 		a.HeaderWait = 5 * time.Second
 		a.ReapWait = 10 * time.Second
 		a.ReapRetry = 10 * time.Millisecond
-	})
+	}}, opts...)...)
 
 	if _, _, err := ImportSSH(db, []SSHHost{{Alias: "far"}}); err != nil {
 		t.Fatal(err)
@@ -194,7 +200,7 @@ func newRemoteRig(t *testing.T, claudeBody string) *remoteRig {
 	if err := AllowDestination(db, "far", pin); err != nil {
 		t.Fatal(err)
 	}
-	if err := SetClaudePath(db, "far", claude); err != nil {
+	if err := SetAgentPath(db, "far", AgentClaude, claude); err != nil {
 		t.Fatal(err)
 	}
 	root, _ := filepath.EvalSymlinks(t.TempDir())
@@ -498,13 +504,13 @@ func TestRemotePlacesAreAllowedPerHost(t *testing.T) {
 	if _, err := AddRemoteAllowed(db, "a", "/srv/work", "", "test"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := checkRemote(db, "a", "/srv/work/x"); err != nil {
+	if _, _, _, err := checkRemote(db, AgentClaude, "a", "/srv/work/x"); err != nil {
 		t.Fatalf("許した場所の下が通らない: %v", err)
 	}
-	if _, _, _, err := checkRemote(db, "a", "/srv/workshop"); err == nil {
+	if _, _, _, err := checkRemote(db, AgentClaude, "a", "/srv/workshop"); err == nil {
 		t.Fatal("/srv/work を許しただけで /srv/workshop が通った")
 	}
-	if _, _, _, err := checkRemote(db, "b", "/srv/work"); err == nil {
+	if _, _, _, err := checkRemote(db, AgentClaude, "b", "/srv/work"); err == nil {
 		t.Fatal("a で許した場所が b でも通った")
 	}
 	if list, _ := ListAllowed(db); len(list) != 0 {
@@ -517,12 +523,12 @@ func TestOnlyAllowedAndPinnedDestinationsCanStart(t *testing.T) {
 	db := newDB(t)
 	ImportSSH(db, []SSHHost{{Alias: "a"}})
 	AddRemoteAllowed(db, "a", "/srv/work", "", "test")
-	if _, _, _, err := checkRemote(db, "a", "/srv/work"); err == nil || !strings.Contains(err.Error(), "許していない") {
+	if _, _, _, err := checkRemote(db, AgentClaude, "a", "/srv/work"); err == nil || !strings.Contains(err.Error(), "許していない") {
 		t.Fatalf("許していない先に起こせる: %v", err)
 	}
 	// 9/11 より前の許し方（固定なし）
 	SetDestinationAllowed(db, "a", true)
-	if _, _, _, err := checkRemote(db, "a", "/srv/work"); err == nil || !strings.Contains(err.Error(), "許し直す") {
+	if _, _, _, err := checkRemote(db, AgentClaude, "a", "/srv/work"); err == nil || !strings.Contains(err.Error(), "許し直す") {
 		t.Fatalf("固定していない先に起こせる: %v", err)
 	}
 	// 鍵の無い固定は固定ではない。許すこともできないし、台帳にあっても起こさない。
@@ -530,13 +536,13 @@ func TestOnlyAllowedAndPinnedDestinationsCanStart(t *testing.T) {
 		t.Fatalf("ホスト鍵の無い先を許せた: %v", err)
 	}
 	db.Exec(`update ssh_hosts set allowed=1, pinned='{"hostname":"h","user":"u","port":"22"}' where alias='a'`)
-	if _, _, _, err := checkRemote(db, "a", "/srv/work"); err == nil || !strings.Contains(err.Error(), "許し直す") {
+	if _, _, _, err := checkRemote(db, AgentClaude, "a", "/srv/work"); err == nil || !strings.Contains(err.Error(), "許し直す") {
 		t.Fatalf("鍵の無い固定で起こせる: %v", err)
 	}
 	if err := AllowDestination(db, "a", Resolved{HostName: "h", HostKeys: []string{"SHA256:x"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := checkRemote(db, "a", "/srv/work"); err != nil {
+	if _, _, _, err := checkRemote(db, AgentClaude, "a", "/srv/work"); err != nil {
 		t.Fatal(err)
 	}
 	// 外すと固定も消える。許し直すときは、そのときの行き先で固定し直す。
@@ -545,7 +551,7 @@ func TestOnlyAllowedAndPinnedDestinationsCanStart(t *testing.T) {
 	if d.Allowed || d.Pinned != nil {
 		t.Fatalf("外したのに固定が残っている: %+v", d)
 	}
-	if _, _, _, err := checkRemote(db, "nope", "/srv/work"); err == nil {
+	if _, _, _, err := checkRemote(db, AgentClaude, "nope", "/srv/work"); err == nil {
 		t.Fatal("台帳に無い先に起こせる")
 	}
 }
@@ -574,7 +580,7 @@ func TestRemotePathsAreCheckedByTheirLetters(t *testing.T) {
 	if c, err := cleanRemotePath("/srv//work/./x/"); err != nil || c != "/srv/work/x" {
 		t.Errorf("正規化が違う: %q %v", c, err)
 	}
-	if validClaudePath("/opt/$HOME/claude") == nil {
+	if validAgentPath("/opt/$HOME/claude") == nil {
 		t.Error("$ の入った claude の場所を通した（systemd-run が展開する）")
 	}
 }
@@ -633,20 +639,27 @@ func TestAReusedPIDOverThereIsNotKilled(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return !procAlive(pid) })
 }
 
-// Camp の ssh は**鍵を受け入れず、何も渡さず、相乗りしない**。config より先に効く。
-func TestCampsSSHNeverAcceptsHostKeysOrForwardsAnything(t *testing.T) {
+// Camp の ssh は**鍵を受け入れず、相乗りせず、手元でコマンドを走らせない**。config より先に効く。
+// **転送は config のまま**にする（D-030、本人の決定 2026-09-12）——`ForwardAgent` を有効にしている
+// 接続先では、向こうから手元の鍵を使える（`ssh <host>` してから CLI を起こすのと同じ）。
+func TestCampsSSHPinsHostKeysButLeavesForwardingToTheConfig(t *testing.T) {
 	a := NewAgent("/nonexistent", "/nonexistent")
 	a.SSHFile = ""
 	args := a.sshArgs("--", "far", "cmd")
 	joined := strings.Join(args, " ")
 	for _, must := range []string{
 		"BatchMode=yes", "StrictHostKeyChecking=yes", "UpdateHostKeys=no", "KnownHostsCommand=none",
-		"ForwardAgent=no", "ForwardX11=no", "ClearAllForwardings=yes",
 		"ControlMaster=no", "ControlPath=none", "PermitLocalCommand=no",
 		"-- far cmd",
 	} {
 		if !strings.Contains(joined, must) {
 			t.Errorf("%s が無い: %s", must, joined)
+		}
+	}
+	// **転送を Camp が決め打ちしない。** 足し直すと、本人の config が効かなくなる。
+	for _, never := range []string{"ForwardAgent=", "ForwardX11=", "ClearAllForwardings=", " -a", " -x"} {
+		if strings.Contains(joined, never) {
+			t.Errorf("転送を決め打ちしている（%s）: %s", never, joined)
 		}
 	}
 	for _, a := range args {

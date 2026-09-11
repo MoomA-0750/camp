@@ -650,3 +650,89 @@ func TestEndedSessionsHaveTheirOwnListAndCanBeOpened(t *testing.T) {
 	get("/api/runtime/無い", 404, nil)
 	get("/api/runtime/ended?kind=bogus", 400, nil)
 }
+
+// **画面はエージェントの名前を決め打ちしない**（D-031）。選択肢・表示名・エージェント自身の
+// セッション id は API から来る。
+func TestTheScreenGetsAgentsAndLabelsFromTheAPI(t *testing.T) {
+	ts, c, sup := runtimeServer(t)
+	work := allowDir(t, c, ts)
+	rec, err := sup.Start("test", work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getJSON := func(path string, v any) {
+		t.Helper()
+		r, err := c.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		json.NewDecoder(r.Body).Decode(v)
+	}
+	var list struct {
+		Agents []struct {
+			Name   string   `json:"name"`
+			Label  string   `json:"label"`
+			Perms  []string `json:"perms"`
+			Remote bool     `json:"remote"`
+		} `json:"agents"`
+		Sessions []struct {
+			ID         string `json:"id"`
+			AgentLabel string `json:"agent_label"`
+		} `json:"sessions"`
+	}
+	getJSON("/api/runtime", &list)
+	// この実行面は codex の実体を持たないので、claude だけを名乗る。
+	if len(list.Agents) != 1 || list.Agents[0].Name != "claude" || list.Agents[0].Label != "Claude Code" ||
+		!list.Agents[0].Remote || len(list.Agents[0].Perms) == 0 {
+		t.Fatalf("起こせるエージェントが API に出ない: %+v", list.Agents)
+	}
+	labeled := false
+	for _, s := range list.Sessions {
+		labeled = labeled || (s.ID == rec.ID && s.AgentLabel == "Claude Code")
+	}
+	if !labeled {
+		t.Fatalf("一覧に表示名が無い: %+v", list.Sessions)
+	}
+
+	var one struct {
+		AgentSessionID string `json:"agent_session_id"`
+		ClaudeID       string `json:"claude_id"`
+		AgentLabel     string `json:"agent_label"`
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		getJSON("/api/runtime/"+rec.ID, &one)
+		if one.AgentSessionID != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if one.AgentSessionID != "fake-1" || one.ClaudeID != "fake-1" || one.AgentLabel != "Claude Code" {
+		t.Fatalf("エージェント自身のセッション id が出ない: %+v", one)
+	}
+}
+
+// 確認の度合いは campd が照らす。知らない値は断る。
+func TestThePermIsCheckedWhenStarting(t *testing.T) {
+	ts, c, _ := runtimeServer(t)
+	work := allowDir(t, c, ts)
+	post := func(body string) (int, string) {
+		t.Helper()
+		r, err := c.Post(ts.URL+"/api/runtime", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		b, _ := io.ReadAll(r.Body)
+		return r.StatusCode, string(b)
+	}
+	if code, msg := post(`{"cwd":` + jsonString(work) + `,"perm":"yolo"}`); code != 400 ||
+		!strings.Contains(msg, "確認の度合い") {
+		t.Fatalf("知らない度合いを通した: %d %s", code, msg)
+	}
+	// 空は cli。台帳にもそう入る。
+	if code, msg := post(`{"cwd":` + jsonString(work) + `}`); code != 200 || !strings.Contains(msg, `"perm":"cli"`) {
+		t.Fatalf("空の度合いを cli として起こせない: %d %s", code, msg)
+	}
+}

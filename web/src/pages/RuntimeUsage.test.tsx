@@ -3,37 +3,27 @@ import { act, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import RuntimeDetail from './RuntimeDetail'
 
-// 2026-09-04 に本物の `claude` から返ってきた形（値は丸めてある）。
-// **推測で書かない。** 実測の欄だけを置く。
-const usage = {
-  running: 1, max: 4,
-  usage: {
-    subscription_type: 'pro',
-    rate_limits: {
-      limits: [
-        { group: 'session', kind: 'session', percent: 100, is_active: true,
-          resets_at: '2126-09-04T18:30:00Z', severity: 'critical' },
-        { group: 'weekly', kind: 'weekly_all', percent: 48, is_active: false,
-          resets_at: '2126-09-10T00:00:00Z', severity: 'normal' },
-      ],
-    },
-    session: {
-      total_cost_usd: 0.1422,
-      model_usage: {
-        'claude-opus-5': {
-          inputTokens: 4, outputTokens: 226, cacheReadInputTokens: 25859,
-          cacheCreationInputTokens: 12264, thinkingTokens: 0, costUSD: 0.1412,
-        },
-      },
-    },
-  },
-  context: {
-    categories: [
-      { name: 'System prompt', tokens: 3296 },
-      { name: 'Messages', tokens: 9408 },
-    ],
-    totalTokens: 21874, maxTokens: 1000000, percentage: 2,
-  },
+// 残量は共通の形（view）で来る。駆動器が、本物の `claude`（2026-09-04）・`codex app-server`
+// （2026-09-11）から返ってきた形をこれに直す（直し方は internal/session/usage_test.go が縛る）。
+// **画面はエージェントを見ない。**
+const claudeView = {
+  plan: 'pro',
+  windows: [
+    { label: 'セッション', percent: 100, active: true, resets_at: '2126-09-04T18:30:00Z' },
+    { label: '週（全体）', percent: 48, resets_at: '2126-09-10T00:00:00Z' },
+  ],
+  context: { used: 21874, max: 1000000 },
+  tables: [
+    { title: 'トークンの内訳（このセッション）', empty: 'まだ1度もモデルを呼んでいない。',
+      columns: [{ label: '入力', unit: 'tokens' }, { label: '出力', unit: 'tokens' },
+        { label: 'キャッシュ読み', unit: 'tokens' }, { label: 'キャッシュ作成', unit: 'tokens' },
+        { label: '思考', unit: 'tokens' }, { label: '費用', unit: 'usd' }],
+      rows: [{ label: 'claude-opus-5', cells: [4, 226, 25859, 12264, 0, 0.1412] },
+        { label: '合計', total: true, cells: [4, 226, 25859, 12264, 0, 0.1422] }] },
+    { title: 'コンテキストの内訳', columns: [{ label: 'トークン', unit: 'tokens' },
+      { label: '割合', unit: 'percent' }],
+      rows: [{ label: 'System prompt', cells: [3296, 0.33] }, { label: 'Messages', cells: [9408, 0.94] }] },
+  ],
 }
 
 function stub(payload: (url: string) => unknown) {
@@ -49,12 +39,12 @@ function stub(payload: (url: string) => unknown) {
 }
 afterEach(() => vi.unstubAllGlobals())
 
-// 仕様が求めた4種のうち3種がここに出る（残り1種＝プラン残量の履歴は「使用量」）。
-// **生の JSON を貼るだけでは「出た」ことにならない。**
-test('残量タブに、枠・トークン内訳・コンテキスト・同時実行が出る', async () => {
+const idle = { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+
+function showUsage(view: unknown, extra: Record<string, unknown> = {}) {
   stub((u) => {
-    if (u.includes('/usage')) return usage
-    if (u === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+    if (u.includes('/usage')) return { running: 1, max: 4, view, ...extra }
+    if (u === '/api/runtime/abc') return idle
     if (u.startsWith('/api/runtime/')) return []
     return { agent_connected: true, sessions: [] }
   })
@@ -62,9 +52,15 @@ test('残量タブに、枠・トークン内訳・コンテキスト・同時�
     <MemoryRouter initialEntries={['/runtime/abc?tab=usage&live=0']}>
       <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
     </MemoryRouter>)
+}
 
+// 仕様が求めた4種のうち3種がここに出る（残り1種＝プラン残量の履歴は「使用量」）。
+// **生の JSON を貼るだけでは「出た」ことにならない。**
+test('残量タブに、枠・トークン内訳・コンテキスト・同時実行が出る', async () => {
+  showUsage(claudeView)
   // 同時実行
   await waitFor(() => expect(screen.getByText(/同時に走っているのは 1 \/ 4 本/)).toBeTruthy())
+  expect(screen.getByText(/プラン pro/)).toBeTruthy()
   // プラン枠（メーター）。色だけでなく**数字が出ている**こと。
   expect(screen.getByText('セッション')).toBeTruthy()
   expect(screen.getByText('100%')).toBeTruthy()
@@ -73,7 +69,8 @@ test('残量タブに、枠・トークン内訳・コンテキスト・同時�
   expect(screen.getByText('48%')).toBeTruthy()
   // トークンの内訳
   expect(screen.getByText('claude-opus-5')).toBeTruthy()
-  expect(screen.getByText('26k')).toBeTruthy() // キャッシュ読み
+  expect(screen.getAllByText('26k').length).toBeGreaterThan(0) // キャッシュ読み
+  expect(screen.getByText('$0.1412')).toBeTruthy()
   // コンテキスト
   expect(screen.getByText(/22k \/ 1.0M（2%）/)).toBeTruthy()
   expect(screen.getByText('System prompt')).toBeTruthy()
@@ -81,19 +78,44 @@ test('残量タブに、枠・トークン内訳・コンテキスト・同時�
 
 // 取れなかったときに、空とは書かない。
 test('残量が取れないと、その理由が出る', async () => {
-  stub((u) => {
-    if (u.includes('/usage')) {
-      return { running: 0, max: 4, usage_error: '子が答えない', context_error: '子が答えない' }
-    }
-    if (u === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
-    if (u.startsWith('/api/runtime/')) return []
-    return { agent_connected: true, sessions: [] }
-  })
-  render(
-    <MemoryRouter initialEntries={['/runtime/abc?tab=usage&live=0']}>
-      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
-    </MemoryRouter>)
+  showUsage(undefined, { running: 0, usage_error: '子が答えない', context_error: '子が答えない' })
   await waitFor(() => expect(screen.getAllByText(/子が答えない/).length).toBe(2))
+})
+
+test('エージェントが答えの中で返した失敗も出る', async () => {
+  showUsage({ windows: [], tables: [], errors: ['枠を読めない'] })
+  await waitFor(() => expect(screen.getByText(/枠を読めない/)).toBeTruthy())
+  expect(screen.queryByText('枠の情報が来ていない。')).toBeNull()
+})
+
+test('Codex の形から直した残量も、同じ画面で出る', async () => {
+  const later = new Date(Date.now() + 3 * 3600_000).toISOString()
+  showUsage({
+    plan: 'plus',
+    windows: [{ label: '5時間', percent: 73, resets_at: later }, { label: '週', percent: 78, resets_at: later }],
+    context: { used: 16497, max: 258400 },
+    tables: [{ title: 'トークン（このスレッド）', columns: [{ label: '入力', unit: 'tokens' },
+      { label: 'キャッシュ読み', unit: 'tokens' }, { label: '出力', unit: 'tokens' }, { label: '推論', unit: 'tokens' }],
+      rows: [{ label: '合計', total: true, cells: [16378, 11904, 119, 0] }] }],
+  })
+  await waitFor(() => expect(screen.getByText(/プラン plus/)).toBeTruthy())
+  expect(screen.getByText('5時間')).toBeTruthy()
+  expect(screen.getByText('73%')).toBeTruthy()
+  expect(screen.getByText('週')).toBeTruthy()
+  expect(screen.getByText('78%')).toBeTruthy()
+  expect(screen.getByText(/16k \/ 258k（6%）/)).toBeTruthy()
+  // その答えに無い欄（モデル別の費用）は出ない。
+  expect(screen.queryByText('キャッシュ作成')).toBeNull()
+})
+
+// **3つ目のエージェントの残量も、画面に手を入れずに出る**（D-031）。
+test('知らないエージェントの残量も、共通の形なら出る', async () => {
+  showUsage({ windows: [{ label: 'フェイク枠', percent: 42 }],
+    tables: [{ title: 'フェイクの内訳', columns: [{ label: '回数', unit: 'tokens' }],
+      rows: [{ label: 'fake', cells: [3] }] }] })
+  await waitFor(() => expect(screen.getByText('フェイク枠')).toBeTruthy())
+  expect(screen.getByText('42%')).toBeTruthy()
+  expect(screen.getByText('フェイクの内訳')).toBeTruthy()
 })
 
 // **終わったセッションでは流さない。**
@@ -110,7 +132,7 @@ test('終わったセッションでは EventSource を開かない', async () =
   vi.stubGlobal('fetch', async (url: string) => ({
     ok: true, status: 200,
     json: async () => {
-      if (url.includes('/log')) return { lines: [{ seq: 1, at: '2026-09-06T00:00:00Z', kind: 'result' }], gap: false, newest: 1, dropped: 0 }
+      if (url.includes('/log')) return { lines: [{ seq: 1, at: '2026-09-06T00:00:00Z', kind: 'result', summary: '終わった' }], gap: false, newest: 1, dropped: 0 }
       if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
       if (url === '/api/runtime/abc') return { id: 'abc', state: 'exited', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
       return { agent_connected: true, sessions: [] }
@@ -125,8 +147,9 @@ test('終わったセッションでは EventSource を開かない', async () =
 
   await waitFor(() => expect(screen.getByText(/終わったので流していない/)).toBeTruthy())
   expect(opened).toBe(0)
-  // 流さなくても、落ちているぶんは読める。
+  // 流さなくても、落ちているぶんは読める。一言は駆動器が畳んだもの。
   await waitFor(() => expect(screen.getByText('result')).toBeTruthy())
+  expect(screen.getByText('終わった')).toBeTruthy()
 })
 
 test('live=0 なら走っていても流さない', async () => {
@@ -141,7 +164,7 @@ test('live=0 なら走っていても流さない', async () => {
     json: async () => {
       if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
       if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
-      if (url === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      if (url === '/api/runtime/abc') return idle
       return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
@@ -155,8 +178,9 @@ test('live=0 なら走っていても流さない', async () => {
   expect(opened).toBe(0)
 })
 
-// **Camp 自身の問い合わせは会話ではない。** 畳むが、畳んだことは言う。
-test('control_response は流れから畳み、件数を出す', async () => {
+// **Camp 自身の問い合わせは会話ではない。** 畳むが、畳んだことは言う。どれがそうかは駆動器が
+// 印（own）を付ける——画面はフレームの種類を読まない。
+test('Camp 自身の問い合わせは流れから畳み、件数を出す', async () => {
   vi.stubGlobal('EventSource', class { close() {} addEventListener() {} } as unknown as typeof EventSource)
   vi.stubGlobal('fetch', async (url: string) => ({
     ok: true, status: 200,
@@ -165,8 +189,8 @@ test('control_response は流れから畳み、件数を出す', async () => {
         return {
           lines: [
             { seq: 1, at: '2026-09-06T08:37:20Z', kind: 'assistant' },
-            { seq: 2, at: '2026-09-06T08:37:37Z', kind: 'control_response' },
-            { seq: 3, at: '2026-09-06T08:37:38Z', kind: 'control_response' },
+            { seq: 2, at: '2026-09-06T08:37:37Z', kind: 'control_response', own: true },
+            { seq: 3, at: '2026-09-06T08:37:38Z', kind: 'control_response', own: true },
             { seq: 4, at: '2026-09-06T08:37:20Z', kind: 'result' },
           ],
           gap: false, newest: 4, dropped: 0,
@@ -189,6 +213,27 @@ test('control_response は流れから畳み、件数を出す', async () => {
   expect(screen.getByText(/Camp 自身の問い合わせ 2 件は畳んでいる/)).toBeTruthy()
 })
 
+// 表示名・固有の振る舞いの説明・エージェント自身のセッション id は、API が埋めたもの。
+test('詳細にエージェントの表示名と説明が出る', async () => {
+  stub((u) => {
+    if (u.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
+    if (u === '/api/runtime/abc') {
+      return { ...idle, agent: 'fake3', agent_label: 'Fake Three', agent_session_id: 'f3-12345678',
+        agent_notes: ['中断では何も残らない'], perm: 'edits' }
+    }
+    if (u.startsWith('/api/runtime/')) return []
+    return { agent_connected: true, sessions: [] }
+  })
+  render(
+    <MemoryRouter initialEntries={['/runtime/abc?live=0']}>
+      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
+    </MemoryRouter>)
+  await waitFor(() => expect(screen.getByText(/Fake Three/)).toBeTruthy())
+  expect(screen.getByText(/確認の度合い 編集は訊かない/)).toBeTruthy()
+  expect(screen.getByText('中断では何も残らない')).toBeTruthy()
+  expect(screen.getByText('f3-12345')).toBeTruthy()
+})
+
 // **上へ遡っている最中は引き戻さない。**
 //
 // 2026-09-07、承認の枠を見ようとしても 0.5 秒おきに最下へ飛ばされて、
@@ -206,7 +251,7 @@ test('上へ遡ったら、新しい行が来ても引き戻さない', async ()
     json: async () => {
       if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
       if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
-      if (url === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      if (url === '/api/runtime/abc') return idle
       return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
@@ -269,7 +314,7 @@ test('繋ぎ直しは、受け取った続きから', async () => {
     json: async () => {
       if (url.includes('/log')) return { lines: [], gap: false, newest: 0, dropped: 0 }
       if (url.startsWith('/api/runtime/') && url !== '/api/runtime/abc') return []
-      if (url === '/api/runtime/abc') return { id: 'abc', state: 'idle', cwd: '/w', requested_by: 'u', created_at: '', updated_at: '' }
+      if (url === '/api/runtime/abc') return idle
       return { agent_connected: true, sessions: [] }
     },
     text: async () => '',
@@ -305,42 +350,4 @@ test('繋ぎ直しは、受け取った続きから', async () => {
   act(() => { (screen.getByLabelText('流す') as HTMLInputElement).click() })  // 繋ぎ直す
   await waitFor(() => expect(urls.length).toBeGreaterThan(before))
   expect(urls[urls.length - 1]).toContain('since=3')
-})
-
-// Codex の残量は形が違う（2026-09-11 に本物の codex app-server から返ってきた形。値は丸めた）。
-// account/rateLimits/read の5時間枠・週枠と、実行面が控えている thread/tokenUsage/updated。
-test('Codex の残量タブに、5時間枠・週枠・プラン・トークンが出る', async () => {
-  const later = Math.floor(Date.now() / 1000) + 3 * 3600
-  stub((u) => {
-    if (u.includes('/usage')) {
-      return {
-        agent: 'codex', running: 1, max: 4,
-        usage: { rateLimits: { planType: 'plus',
-          primary: { usedPercent: 73, windowDurationMins: 300, resetsAt: later },
-          secondary: { usedPercent: 78, windowDurationMins: 10080, resetsAt: later } } },
-        context: { tokenUsage: { total: { totalTokens: 16497, inputTokens: 16378,
-          cachedInputTokens: 11904, outputTokens: 119, reasoningOutputTokens: 0 },
-          modelContextWindow: 258400 } },
-      }
-    }
-    if (u === '/api/runtime/cx') {
-      return { id: 'cx', agent: 'codex', state: 'idle', cwd: '/w', requested_by: 'u',
-        created_at: '', updated_at: '' }
-    }
-    if (u.startsWith('/api/runtime/')) return []
-    return { agent_connected: true, sessions: [] }
-  })
-  render(
-    <MemoryRouter initialEntries={['/runtime/cx?tab=usage&live=0']}>
-      <Routes><Route path="/runtime/:id" element={<RuntimeDetail />} /></Routes>
-    </MemoryRouter>)
-
-  await waitFor(() => expect(screen.getByText(/プラン plus/)).toBeTruthy())
-  expect(screen.getByText('5時間')).toBeTruthy()
-  expect(screen.getByText('73%')).toBeTruthy()
-  expect(screen.getByText('週')).toBeTruthy()
-  expect(screen.getByText('78%')).toBeTruthy()
-  expect(screen.getByText(/16k \/ コンテキスト 258k/)).toBeTruthy()
-  // Claude の形（モデル別の費用）は出さない。
-  expect(screen.queryByText('キャッシュ作成')).toBeNull()
 })

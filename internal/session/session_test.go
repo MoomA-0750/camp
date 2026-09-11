@@ -409,8 +409,8 @@ func TestIdleAndLongTurnsAreCollected(t *testing.T) {
 	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
-	// 時計を進める代わりに、待つ長さをゼロにする。
-	s.IdleAfter = 0
+	// 時計を進める代わりに、待つ長さをごく短くする（0 は「閉じない」の意味）。
+	s.IdleAfter = time.Nanosecond
 	s.Tick()
 	waitFor(t, 5*time.Second, func() bool {
 		st := state(t, db, rec.ID)
@@ -940,16 +940,26 @@ func TestAWaitingApprovalSurvivesCampdRestarting(t *testing.T) {
 	}
 }
 
-// 期限切れは**拒否として**扱い、そう記録する。
+// 期限切れは**拒否として**扱い、そう記録する。拒否は待っている子に届く。
+//
+// 子が本当に訊いた承認で確かめる。台帳に直に置いた承認は実行面が抱えていないので、
+// 答えは「取り下げ」として返り、期限切れの記録を上書きする（f0ad375 から。届かなかった
+// 答えを届いたことにしない）。
 func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
-	db := newDB(t)
-	s, _ := wire(t, db)
-	rec, _ := s.Start("test", allowHere(t, db))
+	s, db, rec := startWith(t, askingBody)
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := s.Input(rec.ID, "書いて"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		got := pending(t, s, rec.ID)
+		return len(got) == 1 && got[0] == "req-1"
+	})
 
-	// 期限を過去にして置く。
-	past := time.Now().Add(-2 * parkLimit)
-	if err := ask(db, rec.ID, "req-old", "Bash", `{"tool_name":"Bash"}`, past); err != nil {
+	// 期限を過去にする。時計は進めない（ターンと放置の期限に触らないため）。
+	past := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`update approvals set expires_at=? where session_id=? and request_id='req-1'`,
+		past, rec.ID); err != nil {
 		t.Fatal(err)
 	}
 	s.Tick()
@@ -957,6 +967,8 @@ func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
 	if got := pending(t, s, rec.ID); len(got) != 0 {
 		t.Fatalf("期限切れがまだ待っている: %v", got)
 	}
+	// 拒否が子へ届けば、子はターンを終える。
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 	hist, err := ApprovalHistory(db, rec.ID, 10)
 	if err != nil || len(hist) != 1 {
 		t.Fatalf("履歴が読めない: %+v (%v)", hist, err)

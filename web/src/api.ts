@@ -121,9 +121,14 @@ export type Backup = {
 // ---- Phase 3: Camp が起こしたセッション ------------------------------------
 
 export type RuntimeSession = {
-  // agent は claude か codex（2026-09-11 から。それより前は claude）。
-  // claude_id はエージェント自身のセッション id（Codex ならスレッド id）。
-  id: string; agent?: string; claude_id?: string; cwd: string; state: string
+  // agent は起こしたエージェントの名前、agent_label は画面に出す名前（API が駆動器の説明から埋める）。
+  // agent_session_id はエージェント自身のセッション id（claude_id は古い名前。同じ値）。
+  // agent_notes はそのエージェント固有の振る舞いの説明（1本の口だけ）。
+  id: string; agent?: string; agent_label?: string; agent_session_id?: string; claude_id?: string
+  agent_notes?: string[]
+  // perm は確認の度合い（cli / ask / edits / auto / full。legacy は Phase 3.6 の Codex の行）。
+  perm?: string
+  cwd: string; state: string
   requested_by: string; created_at: string; updated_at: string
   pid?: number; scope?: string
   // ssh の Host 名。無ければこのマシン（2026-09-11 から）。そのとき pid は手元の ssh。
@@ -134,14 +139,26 @@ export type RuntimeSession = {
   approvals_asked?: number; approvals_left_waiting?: number; approvals_timed_out?: number
 }
 
-export type RuntimeList = { agent_connected: boolean; sessions: RuntimeSession[] }
+/** 起こせるエージェントの説明（実行面が名乗ったもの）。**画面は名前を決め打ちしない**（D-031）。 */
+export type AgentInfo = {
+  name: string; label: string; perms: string[]; notes?: string[]
+  interrupt_leaves_tools?: boolean
+  // 向こうのホスト（ssh）でも起こせるか。
+  remote?: boolean
+}
+
+export type RuntimeList = { agent_connected: boolean; agents?: AgentInfo[]; sessions: RuntimeSession[] }
 
 // 終わったセッションの1頁。counts は頁に関係なく全体の件数。
 export type RuntimeEnded = {
   sessions: RuntimeSession[]; next?: string; counts: Record<string, number>
 }
 
-export type LogLine = { seq: number; at: string; kind: string; frame?: unknown }
+// summary は駆動器が畳んだ一言、own は Camp 自身の問い合わせのやりとり（会話ではないので畳む）。
+// **画面はフレームの形を読まない。**
+export type LogLine = {
+  seq: number; at: string; kind: string; frame?: unknown; summary?: string; own?: boolean
+}
 
 export type Approval = {
   id: number; session_id: string; request_id: string
@@ -165,52 +182,41 @@ export type Destination = {
   id: number; alias: string; hostname?: string; user?: string; port?: number
   identity?: string; tailscale_ip?: string; note?: string
   allowed: boolean; source: string; seen_at: string; updated_at: string
-  pinned?: Pinned; claude_path?: string
+  // agent_paths は向こうでのエージェントごとの実体（駆動器の名前 → 絶対パス）。無ければ向こうで探す。
+  pinned?: Pinned; agent_paths?: Record<string, string>
 }
 
-/** `get_usage` の中身。実測で出た欄だけを写している（2026-09-04）。 */
-export type PlanLimit = {
-  kind: string; group?: string; percent: number
-  resets_at?: string; severity?: string; is_active?: boolean
+/** 承認の中身の共通の形（駆動器が直したもの）。**差分は切り詰めない。** */
+export type AskChange = { path: string; kind?: string; patch: string }
+export type AskView = {
+  // command（コマンドを走らせる）/ file（ファイルを変える）/ tool（その他の道具）
+  what: string
+  tool?: string; command?: string; cwd?: string
+  // 起こした場所の外で走らせようとしている（断らずに印を付けて見せる。D-030）
+  outside?: boolean
+  changes?: AskChange[]; input?: unknown; reason?: string
 }
-export type ModelUsage = {
-  inputTokens: number; outputTokens: number
-  cacheReadInputTokens: number; cacheCreationInputTokens: number
-  thinkingTokens: number; costUSD: number; contextWindow?: number
+
+/** 残量の共通の形（駆動器が直したもの）。**画面はこの形だけを見て描く。** */
+export type UsageWindow = { label: string; percent: number; resets_at?: string; active?: boolean }
+export type UsageTable = {
+  title: string
+  // unit は書き方: tokens / usd / percent
+  columns: { label: string; unit: string }[]
+  rows: { label: string; cells: number[]; total?: boolean }[]
+  empty?: string
 }
-export type UsagePayload = {
-  subscription_type?: string
-  rate_limits?: { limits?: PlanLimit[] }
-  session?: {
-    total_cost_usd?: number; total_duration_ms?: number
-    total_lines_added?: number; total_lines_removed?: number
-    model_usage?: Record<string, ModelUsage>
-  }
-}
-export type ContextPayload = {
-  categories?: { name: string; tokens: number }[]
-  totalTokens?: number; maxTokens?: number; percentage?: number
-}
-/** Codex の残量。account/rateLimits/read の中身（2026-09-11 実測、codex-cli 0.154.0）。 */
-export type CodexWindow = { usedPercent: number; windowDurationMins?: number; resetsAt?: number }
-export type CodexRateLimits = {
-  rateLimits?: { planType?: string; primary?: CodexWindow; secondary?: CodexWindow }
-  error?: string
-}
-/** thread/tokenUsage/updated の控え（実行面が手元に持っているもの）。 */
-export type CodexTokens = {
-  totalTokens?: number; inputTokens?: number; cachedInputTokens?: number
-  outputTokens?: number; reasoningOutputTokens?: number
-}
-export type CodexContext = {
-  tokenUsage?: { total?: CodexTokens; last?: CodexTokens; modelContextWindow?: number } | null
+export type UsageView = {
+  plan?: string; windows: UsageWindow[]; context?: { used: number; max?: number }
+  tables: UsageTable[]; errors?: string[]
 }
 
 export type RuntimeUsage = {
-  // agent で中身の形が変わる。codex なら usage は CodexRateLimits、context は CodexContext。
   agent?: string
-  usage?: UsagePayload; usage_error?: string
-  context?: ContextPayload; context_error?: string
+  view?: UsageView
+  // 生の答え。「そのまま見る」ためだけ（形はエージェントで違うので、画面は読み分けない）。
+  usage?: unknown; usage_error?: string
+  context?: unknown; context_error?: string
   running: number; max: number; warning?: string
 }
 
@@ -340,9 +346,9 @@ export const api = {
     fetchJSON<RuntimeSession>(`/api/runtime/${encodeURIComponent(id)}`),
   runtimeEnded: (kind = '', before = '') =>
     fetchJSON<RuntimeEnded>('/api/runtime/ended' + qs({ kind, before })),
-  runtimeStart: (cwd: string, host = '', agent = 'claude') =>
+  runtimeStart: (cwd: string, host = '', agent = '', perm = '') =>
     postJSON<RuntimeSession>('/api/runtime',
-      { cwd, ...(host ? { host } : {}), ...(agent !== 'claude' ? { agent } : {}) }),
+      { cwd, ...(host ? { host } : {}), ...(agent ? { agent } : {}), ...(perm ? { perm } : {}) }),
   runtimeInput: (id: string, text: string) =>
     postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/input`, { text }),
   runtimeStop: (id: string, mode: 'interrupt' | 'terminate') =>
@@ -370,8 +376,8 @@ export const api = {
     postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/edit`, { note, tailscale_ip }),
   sshAllow: (alias: string, allowed: boolean, password: string) =>
     postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/allow`, { allowed, password }),
-  sshClaude: (alias: string, claude_path: string, password: string) =>
-    postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/claude`, { claude_path, password }),
+  sshPath: (alias: string, agent: string, path: string, password: string) =>
+    postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/path`, { agent, path, password }),
 
   logout: async () => {
     await fetch('/api/logout', { method: 'POST' })

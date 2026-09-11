@@ -2,9 +2,10 @@ package session
 
 // Codex の駆動器（`codex app-server`、stdio の JSON-RPC、1行1メッセージ）。
 //
-// 実測と設計は dev/active/phase3.6-plan.md（codex-cli 0.154.0）。Claude の駆動は
-// agent.go のまま触らず、ここで Codex だけを扱う。campd へは Claude と同じ Msg で渡し、
-// 「ターンが終わった」「承認が来た」は欄（TurnEnd / Ask）で伝える。
+// 実測と設計は dev/active/phase3.6-plan.md・phase3.7-plan.md（codex-cli 0.154.0）。
+// **Codex は本人の置き場（`~/.codex`）で、CLI と同じ設定のまま起こす**（D-030。Phase 3.6 の
+// Camp 専用の置き場は覆した）。campd へは Claude と同じ Msg で渡し、「ターンが終わった」
+// 「承認が来た」は欄（TurnEnd / Ask）で伝える。
 
 import (
 	"bufio"
@@ -14,52 +15,101 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
-// 起こせるエージェント。**この2つ以外を通さない。**
-const (
-	AgentClaude = "claude"
-	AgentCodex  = "codex"
-)
+type codexDriver struct{}
 
-func validAgent(a string) bool { return a == AgentClaude || a == AgentCodex }
-
-// agentsOf は実行面が起こせるエージェント（監査の文用）。
-func agentsOf(a *agentConn) []string {
-	if len(a.agents) == 0 {
-		return []string{AgentClaude}
-	}
-	return a.agents
+func (codexDriver) Info() AgentInfo {
+	return AgentInfo{Name: AgentCodex, Label: "Codex", Perms: append([]string(nil), allPerms...),
+		Notes: []string{
+			"「中断」はターンを止めるが、走っていたコマンドは残る（Codex の作り。2026-09-11 実測）。確実に止めるなら「止める」",
+			"MCP のツールは Codex の作りとして承認を訊いてこない",
+			"「編集は訊かない」は近いもの（on-request・workspace-write）。Codex に「編集だけ訊かない」は無いので、" +
+				"作業場所の中のコマンドも訊かずに走る。ネットワークや場所の外への書き込みは、Codex が権限を上げて頼まない限り" +
+				"訊かれずに失敗する（2026-09-12 実測）",
+		},
+		InterruptLeavesTools: true, Remote: true}
 }
 
-// agentOr は空を claude と読む。**古い実行面は agent を名乗らない**（Phase 3.6 より前）。
-func agentOr(a string) string {
-	if a == "" {
-		return AgentClaude
-	}
-	return a
+// RemoteLaunch は向こうで探す名前と置き場（$CODEX_HOME、無ければ ~/.codex。CLI と同じ）。
+func (codexDriver) RemoteLaunch() RemoteLaunch {
+	return RemoteLaunch{Name: "codex", HomeEnv: "CODEX_HOME", HomeDefault: ".codex"}
 }
 
-// codexPolicy は Camp が Codex に渡す方針。**ここ1か所で決める**
-// （後でセッションごとの確認の度合い・範囲の選択に差し替える）。
-//
-// untrusted は「読むだけの決まったコマンド以外は訊く」。workspace-write でもファイル変更は
-// 訊いてくる（実測）。**MCP のツールは訊いてこない**——Codex に承認の要求そのものが無い
-// （本人が受け入れた。2026-09-11）。
-var codexPolicy = struct {
-	approval, reviewer, sandbox, sandboxType string
-}{"untrusted", "user", "workspace-write", "workspaceWrite"}
+// Argv は `codex app-server`（stdio の JSON-RPC）。確認の度合いは引数でなく thread/start の欄で渡す
+// （codexPerms）。
+func (codexDriver) Argv(perm string) ([]string, error) {
+	if !validPerm(perm) {
+		return nil, fmt.Errorf("Codex の確認の度合い %s は扱わない", perm)
+	}
+	return []string{"app-server"}, nil
+}
+
+// codexPerms は確認の度合いごとに thread/start へ渡す欄（2026-09-12、thread/start の応答で効くことを
+// 測った）。cli は何も渡さない（本人の設定のまま）。「編集は訊かない」は Codex にぴったり当たるものが
+// 無いので、近いもの（sandbox の中は訊かず、外に出るときだけ訊く）で出す（本人の決定）。
+var codexPerms = map[string]map[string]any{
+	PermAsk:   {"approvalPolicy": "untrusted"},
+	PermEdits: {"approvalPolicy": "on-request", "sandbox": "workspace-write"},
+	PermAuto:  {"approvalsReviewer": "auto_review"},
+	PermFull:  {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+}
+
+// codexSandboxType は thread/start で渡す sandbox の名前と、応答が名乗る型の名前（実測）。
+var codexSandboxType = map[string]string{
+	"read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess",
+}
+
+// verifyCodexPerm は、渡した確認の度合いの欄が thread/start の応答で効いているかを照らす。
+// **渡したものだけ照らす**（cli では何も渡さず、何も照らさない）。欠けていても断る。
+func verifyCodexPerm(res json.RawMessage, sent map[string]any) error {
+	if len(sent) == 0 {
+		return nil
+	}
+	var r struct {
+		ApprovalPolicy    *string `json:"approvalPolicy"`
+		ApprovalsReviewer *string `json:"approvalsReviewer"`
+		Sandbox           *struct {
+			Type string `json:"type"`
+		} `json:"sandbox"`
+	}
+	json.Unmarshal(res, &r)
+	str := func(p *string) string {
+		if p == nil {
+			return "（無い）"
+		}
+		return *p
+	}
+	var why []string
+	if v, ok := sent["approvalPolicy"]; ok && str(r.ApprovalPolicy) != v {
+		why = append(why, fmt.Sprintf("approvalPolicy が %s（%v のはず）", str(r.ApprovalPolicy), v))
+	}
+	if v, ok := sent["approvalsReviewer"]; ok && str(r.ApprovalsReviewer) != v {
+		why = append(why, fmt.Sprintf("approvalsReviewer が %s（%v のはず）", str(r.ApprovalsReviewer), v))
+	}
+	if v, ok := sent["sandbox"].(string); ok {
+		got := "（無い）"
+		if r.Sandbox != nil {
+			got = r.Sandbox.Type
+		}
+		if got != codexSandboxType[v] {
+			why = append(why, fmt.Sprintf("sandbox が %s（%s のはず）", got, codexSandboxType[v]))
+		}
+	}
+	if len(why) > 0 {
+		return fmt.Errorf("頼んだ確認の度合いで起きていない。話し始めない: %s", strings.Join(why, "・"))
+	}
+	return nil
+}
 
 // codexOptOut は受け取らない通知。途中経過は Claude でも取っていない
 // （`--include-partial-messages` を付けていない）。完成品は item/completed に全文がある。
-// **ターンの終わり・承認・方針の変化に関わるものは入れない**（テストで縛る）。
+// **ターンの終わり・承認・設定の変化に関わるものは入れない**（テストで縛る）。
 var codexOptOut = []string{
 	"item/agentMessage/delta",
 	"item/reasoning/textDelta",
@@ -81,18 +131,17 @@ var codexApprovals = map[string]string{
 	"item/fileChange/requestApproval":       "codex:fileChange",
 }
 
-// codexPolicyChanged は途中で方針が変わったしるし。**来たらその場で止める。**
-// 話し始める前に照らしたことが、以後も成り立っているとは言えなくなる。
-var codexPolicyChanged = map[string]bool{
-	"thread/settings/updated":         true,
-	"item/autoApprovalReview/started": true,
+// codexSettingsChanged は途中で設定が変わったしるし。**止めずに記録する**（2026-09-12、本人。
+// CLI では止まらない。D-030）。以前はその場で止めていた。
+var codexSettingsChanged = map[string]bool{
+	"thread/settings/updated": true,
 }
 
 // codexState は Codex の子1本ぶんの状態。
 type codexState struct {
 	mu     sync.Mutex
 	thread string
-	// root は起こした場所（実パス）。承認のコマンドの cwd がこの外なら、見せずに断る。
+	// root は起こした場所（実パス）。承認のコマンドの cwd がこの外なら、印を付けて見せる。
 	root    string
 	turn    string
 	wantInt bool // 中断を頼まれたが、まだターン id が無い
@@ -156,10 +205,13 @@ func (cs *codexState) threadID() string {
 // ---------------------------------------------------------------- 起こしてから話し始めるまで
 
 // handshake は最初の3往復（initialize → initialized → thread/start）を済ませ、
-// **Camp の置き場で起きたこと・効いた方針を照らしてから**スレッド id を覚える。
+// **本人の置き場で起きたことと、作業場所を照らしてから**スレッド id を覚える。
 // rec は流れた行を落とし先へ残す。
-func (cs *codexState) handshake(sc *bufio.Scanner, w io.Writer, cwd, home string,
-	rec func(kind string, line []byte)) error {
+//
+// 方針（承認・sandbox）は何も渡さない——本人の設定のまま（CLI と同じ）。確認の度合いを
+// セッションごとに選ぶ口は Phase 3.7 の M41 で足す（渡したものだけ照らす）。
+func (cs *codexState) handshake(sc *bufio.Scanner, w io.Writer, cwd string,
+	checkHome func(json.RawMessage) error, perm map[string]any, rec func(kind string, line []byte)) error {
 	write := func(b []byte) error {
 		_, err := w.Write(append(b, '\n'))
 		return err
@@ -175,21 +227,20 @@ func (cs *codexState) handshake(sc *bufio.Scanner, w io.Writer, cwd, home string
 	if err != nil {
 		return fmt.Errorf("initialize: %w", err)
 	}
-	// **Camp の置き場で起きたか。** 本人の「今後訊かない」を持ち込まない守りは CODEX_HOME を
-	// 渡す1行に掛かっている。本人の置き場で起きても方針は Camp が渡した値になるので、
-	// thread/start の照合では気づけない（Fable の実装後レビュー 1）。
-	if err := verifyCodexHome(res, home); err != nil {
+	// **本人の置き場で起きたか。** CLI と同じ設定で動かすと約束しているので、取り違えて
+	// 別の置き場（別の設定・別のログイン）で起きていたら話し始めない。
+	if err := checkHome(res); err != nil {
 		return err
 	}
 	if err := write(rpcFrame(map[string]any{"method": "initialized"})); err != nil {
 		return err
 	}
-	start, key := cs.request("start", "thread/start", map[string]any{
-		"cwd":               cwd,
-		"approvalPolicy":    codexPolicy.approval,
-		"approvalsReviewer": codexPolicy.reviewer,
-		"sandbox":           codexPolicy.sandbox,
-	})
+	// 確認の度合いの欄だけを足す（cli なら cwd だけ。本人の設定のまま）。
+	params := map[string]any{"cwd": cwd}
+	for k, v := range perm {
+		params[k] = v
+	}
+	start, key := cs.request("start", "thread/start", params)
 	if err := write(start); err != nil {
 		return err
 	}
@@ -199,6 +250,9 @@ func (cs *codexState) handshake(sc *bufio.Scanner, w io.Writer, cwd, home string
 	}
 	thread, err := verifyCodexStart(res, cwd)
 	if err != nil {
+		return err
+	}
+	if err := verifyCodexPerm(res, perm); err != nil {
 		return err
 	}
 	cs.mu.Lock()
@@ -247,7 +301,7 @@ func (cs *codexState) await(sc *bufio.Scanner, w io.Writer, key string,
 	return nil, errors.New("子が手順の途中で終わった")
 }
 
-// verifyCodexHome は initialize の応答が名乗る置き場が、Camp の置き場か（実パスで）照らす。
+// verifyCodexHome は initialize の応答が名乗る置き場が、本人の置き場か（実パスで）照らす。
 // **名乗らないことを「合っている」と読まない。**
 func verifyCodexHome(res json.RawMessage, home string) error {
 	var r struct {
@@ -255,72 +309,55 @@ func verifyCodexHome(res json.RawMessage, home string) error {
 	}
 	json.Unmarshal(res, &r)
 	if r.CodexHome == "" {
-		return errors.New("Codex がどの置き場で起きたか名乗らない。本人の設定で起きていないと確かめられないので話し始めない")
+		return errors.New("Codex がどの置き場で起きたか名乗らない。本人の設定で起きたと確かめられないので話し始めない")
 	}
 	got, err1 := filepath.EvalSymlinks(r.CodexHome)
 	want, err2 := filepath.EvalSymlinks(home)
 	if err1 != nil || err2 != nil || got != want {
-		return fmt.Errorf("Codex が Camp の置き場ではない %s で起きた（%s のはず）。"+
-			"本人の「今後訊かない」を持ち込むので話し始めない", r.CodexHome, home)
+		return fmt.Errorf("Codex が本人の置き場ではない %s で起きた（%s のはず）。"+
+			"CLI と別の設定で動くので話し始めない", r.CodexHome, home)
 	}
 	return nil
 }
 
+// verifyRemoteCodexHome は向こうのホストで、Codex が本人の置き場で起きたかを照らす。向こうのパスは
+// 手元で実パスに直せないので、向こうの sh が名乗った置き場（直す前か実パス）と文字の上で比べる。
+// **名乗らないことを「合っている」と読まない。**
+func verifyRemoteCodexHome(res json.RawMessage, homes []string) error {
+	var r struct {
+		CodexHome string `json:"codexHome"`
+	}
+	json.Unmarshal(res, &r)
+	if r.CodexHome == "" {
+		return errors.New("Codex がどの置き場で起きたか名乗らない。本人の設定で起きたと確かめられないので話し始めない")
+	}
+	for _, h := range homes {
+		if h != "" && r.CodexHome == h {
+			return nil
+		}
+	}
+	return fmt.Errorf("Codex が向こうの本人の置き場ではない %s で起きた（%s のはず）。"+
+		"CLI と別の設定で動くので話し始めない", r.CodexHome, strings.Join(homes, " か "))
+}
+
 var threadIDRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
-// verifyCodexStart は thread/start の応答を**構造ごと**照らす。
+// verifyCodexStart は thread/start の応答から、作業場所とスレッド id を照らす。
+// **欠けていても断る**（「無い」を「合っている」と読まない）。
 //
-// 本人の設定や将来の版で「訊かない」「自動で審査する」「広い sandbox」に倒れていたとき、
-// 承認の画面を通らずに走り出すのを防ぐ。**違えば話し始めない。**
-// 「無い」を「合っている」と読まない——欄が欠けていても断る。
-//
-// activePermissionProfile は今の版の応答には無い（スキーマ上も thread/start の応答ではなく
-// thread/settings の欄）。来たら中身を問わず断る。将来の版で常に返るようになれば
-// 起こせなくなる——**安全側に倒れる**ので、そのとき読み方を決める（Fable の実装後レビュー 5）。
+// 承認・sandbox の方針は、Camp が何も渡していないので照らさない（本人の設定のまま）。
+// 確認の度合いを渡すようになったら（M41）、渡したものだけをここで照らす。
 func verifyCodexStart(res json.RawMessage, cwd string) (string, error) {
 	var r struct {
 		Thread *struct {
 			ID string `json:"id"`
 		} `json:"thread"`
-		ApprovalPolicy          json.RawMessage            `json:"approvalPolicy"`
-		ApprovalsReviewer       json.RawMessage            `json:"approvalsReviewer"`
-		Sandbox                 map[string]json.RawMessage `json:"sandbox"`
-		ActivePermissionProfile json.RawMessage            `json:"activePermissionProfile"`
-		Cwd                     *string                    `json:"cwd"`
+		Cwd *string `json:"cwd"`
 	}
 	if err := json.Unmarshal(res, &r); err != nil {
 		return "", fmt.Errorf("thread/start の応答が読めない: %w", err)
 	}
-	str := func(raw json.RawMessage) string {
-		var s string
-		if json.Unmarshal(raw, &s) != nil {
-			return "（" + string(raw) + "）"
-		}
-		return s
-	}
 	var why []string
-	if got := str(r.ApprovalPolicy); got != codexPolicy.approval {
-		why = append(why, fmt.Sprintf("承認の方針が %s（%s のはず）", got, codexPolicy.approval))
-	}
-	if got := str(r.ApprovalsReviewer); got != codexPolicy.reviewer {
-		why = append(why, fmt.Sprintf("承認を見るのが %s（%s のはず）", got, codexPolicy.reviewer))
-	}
-	if r.Sandbox == nil {
-		why = append(why, "sandbox が返ってこない")
-	} else {
-		if got := str(r.Sandbox["type"]); got != codexPolicy.sandboxType {
-			why = append(why, fmt.Sprintf("sandbox が %s（%s のはず）", got, codexPolicy.sandboxType))
-		}
-		if got := strings.TrimSpace(string(r.Sandbox["networkAccess"])); got != "false" {
-			why = append(why, "sandbox のネットワークが閉じていない（"+got+"）")
-		}
-		if got := strings.Join(strings.Fields(string(r.Sandbox["writableRoots"])), ""); got != "[]" {
-			why = append(why, "sandbox に書ける場所が足されている（"+got+"）")
-		}
-	}
-	if p := strings.TrimSpace(string(r.ActivePermissionProfile)); p != "" && p != "null" {
-		why = append(why, "権限のプロファイルが効いている（"+p+"）")
-	}
 	if r.Cwd == nil || *r.Cwd != cwd {
 		got := "（無い）"
 		if r.Cwd != nil {
@@ -336,7 +373,7 @@ func verifyCodexStart(res json.RawMessage, cwd string) (string, error) {
 		why = append(why, fmt.Sprintf("スレッド id が読めない（%q）", thread))
 	}
 	if len(why) > 0 {
-		return "", fmt.Errorf("Codex に渡した方針が効いていない。話し始めない: %s", strings.Join(why, "・"))
+		return "", fmt.Errorf("Codex の起き方が頼んだものと違う。話し始めない: %s", strings.Join(why, "・"))
 	}
 	return thread, nil
 }
@@ -348,13 +385,13 @@ type codexEvent struct {
 	kind        string
 	turnEnd     bool
 	interrupted bool
-	err         string          // 監査に残す一言（断った・方針が変わった・ターンが失敗した）
+	err         string          // 監査に残す一言（断った・ターンが失敗した）
+	note        string          // 監査に残す記録（止めない。設定が途中で変わった等）
 	ask         *HeldAsk        // 画面へ出す承認
 	replies     [][]byte        // 実行面がすぐ Codex へ返すもの（断り・後回しの中断）
 	withdrawn   []string        // もう答えを待たなくなった承認の id（campd の台帳を閉じる）
 	deliver     string          // 待っている者へ渡す応答の id（残量の問い合わせ）
 	payload     json.RawMessage // その中身
-	kill        bool            // 方針が変わったので止める
 }
 
 // classify は Codex の1行を畳む。**知らないものは種類だけにして通す。**
@@ -413,9 +450,9 @@ func (cs *codexState) classify(line []byte) codexEvent {
 		ev.kind = "?"
 		return ev
 	}
-	if codexPolicyChanged[m.Method] {
-		ev.kill = true
-		ev.err = "方針が途中で変わった（" + m.Method + "）ので止めた"
+	if codexSettingsChanged[m.Method] {
+		// **止めない。** 記録して画面に出す（本人の決定。CLI では止まらない）。
+		ev.note = "設定が途中で変わった（" + m.Method + "）。止めずに記録した"
 		return ev
 	}
 	switch m.Method {
@@ -511,7 +548,7 @@ func (cs *codexState) classify(line []byte) codexEvent {
 			ev.err = "承認を訊いたあとで差分が変わったので断った"
 		}
 	case "serverRequest/resolved":
-		// Codex 側で片付いた（中断など）。**まだ答えていなかったなら、台帳からも取り下げる。**
+		// Codex 側で片付いた（中断・自動審査など）。**まだ答えていなかったなら、台帳からも取り下げる。**
 		var p struct {
 			RequestID json.RawMessage `json:"requestId"`
 		}
@@ -537,8 +574,8 @@ func (cs *codexState) classify(line []byte) codexEvent {
 // askDetail は承認カードに出す中身。why が空でなければ、見せられないので断る。
 func (cs *codexState) askDetail(method string, params json.RawMessage) ([]byte, string) {
 	d := map[string]any{"agent": AgentCodex, "method": method, "params": params}
-	// **本人が見る中身と、走るものを取り違えさせない**（codex の outer gate の指摘 4）。
-	// 欠けている・別のスレッド・許した場所の外なら、見せずに断る。
+	// **本人が見る中身と、走るものを取り違えさせない**（Phase 3.6 の outer gate の codex の指摘 4）。
+	// 欠けている・別のスレッドなら、見せずに断る。
 	var ids struct {
 		ThreadID string `json:"threadId"`
 	}
@@ -557,9 +594,14 @@ func (cs *codexState) askDetail(method string, params json.RawMessage) ([]byte, 
 			return nil, "何を走らせるのか分からない（command が無い）"
 		case p.Cwd == nil || !filepath.IsAbs(*p.Cwd):
 			return nil, "どこで走らせるのか分からない（cwd が無い）"
-		case cs.root != "" && !under(filepath.Clean(*p.Cwd), cs.root):
-			return nil, "許した場所の外（" + *p.Cwd + "）で走らせようとした"
 		}
+		// 起こした場所の外で走らせようとしているなら、**断らずに印を付けて見せる**
+		// （Camp は見せる。決めるのは本人。D-030）。
+		if cs.root != "" && !under(filepath.Clean(*p.Cwd), cs.root) {
+			d["outside"] = true
+		}
+		d["view"] = AskView{What: "command", Command: *p.Command, Cwd: *p.Cwd,
+			Outside: d["outside"] == true, Reason: codexReason(params)}
 	}
 	if method == "item/fileChange/requestApproval" {
 		var p struct {
@@ -576,8 +618,13 @@ func (cs *codexState) askDetail(method string, params json.RawMessage) ([]byte, 
 		if !ok || len(ch) == 0 || string(ch) == "null" {
 			return nil, "何を変えるのか分からない（差分が来ていない）"
 		}
-		d["changes"] = ch
+		changes, err := codexChanges(ch)
+		if err != nil {
+			return nil, "何を変えるのか読めない（" + err.Error() + "）"
+		}
 		d["item"] = p.ItemID
+		// 差分は view にだけ入れる（二重に持つと、画面へ渡せる大きさを半分しか使えない）。
+		d["view"] = AskView{What: "file", Changes: changes, Reason: codexReason(params)}
 	}
 	b, err := json.Marshal(d)
 	if err != nil {
@@ -700,20 +747,8 @@ func (cs *codexState) waiting() []HeldAsk {
 
 // ---------------------------------------------------------------- 実行面で起こす
 
-// DefaultCodexHome は Camp 専用の Codex の置き場。**本人の ~/.codex とは別。**
+// DefaultCodexHome は本人の Codex の置き場（CLI が使うのと同じ）。
 func DefaultCodexHome() string {
-	if p := os.Getenv("CAMP_CODEX_HOME"); p != "" {
-		return p
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".local/share/camp/codex")
-}
-
-// DefaultCodexSource は本人の Codex の置き場（道具とログインをここから借りる）。
-func DefaultCodexSource() string {
 	if p := os.Getenv("CODEX_HOME"); p != "" {
 		return p
 	}
@@ -724,225 +759,72 @@ func DefaultCodexSource() string {
 	return filepath.Join(home, ".codex")
 }
 
-// defaultCodexCommand は Camp の置き場を CODEX_HOME にして app-server を起こす。
-// scope で包むのは Claude と同じ理由（孫まで止める）。Codex の子は別のプロセスグループ・
-// 別のセッションに居る（実測）ので、**プロセスグループでは取り逃がす。**
-//
-// CODEX_HOME が効いたかは、話し始める前に initialize の応答で照らす（verifyCodexHome）。
-func (a *Agent) defaultCodexCommand(id string) *exec.Cmd {
-	var cmd *exec.Cmd
-	if a.Scope {
-		cmd = exec.Command("systemd-run", "--user", "--scope", "--quiet", "--collect",
-			"--unit", scopeName(id), "--", a.Codex, "app-server")
-	} else {
-		cmd = exec.Command(a.Codex, "app-server")
+// Launch は Codex の実体と本人の置き場。**scope で包めない構成では起こさない**——Codex の子は
+// 別のプロセスグループ・別のセッションに居て（実測）、止めるときに取り逃がす。
+func (codexDriver) Launch(a *Agent) (Launch, error) {
+	if !a.Scope && !a.CodexWithoutScope {
+		return Launch{}, errors.New("scope を使わない構成では Codex を起こさない（子が別のプロセスグループ・別のセッションに居て、止めるときに取り逃がす）")
 	}
-	cmd.Env = append(os.Environ(), "CODEX_HOME="+a.CodexHome)
-	return cmd
+	cannot := errors.New("この実行面は Codex を起こせない（codex の実体か置き場が無い）")
+	if a.Codex == "" || a.CodexHome == "" {
+		return Launch{}, cannot
+	}
+	if _, err := os.Stat(a.Codex); err != nil {
+		return Launch{}, cannot
+	}
+	return Launch{Bin: a.Codex, Home: a.CodexHome}, nil
 }
 
-// CanCodex は Codex を起こせる形になっているか。hello で名乗る。
+// CanCodex は Codex を起こせる形になっているか。
 func (a *Agent) CanCodex() bool {
-	if a.Codex == "" || a.CodexHome == "" || a.CodexSource == "" {
-		return false
-	}
-	if !a.Scope && !a.CodexWithoutScope {
-		return false
-	}
-	_, err := os.Stat(a.Codex)
+	_, err := codexDriver{}.Launch(a)
 	return err == nil
 }
 
-// agents は起こせるエージェント。
-func (a *Agent) agents() []string {
-	out := []string{AgentClaude}
-	if a.CanCodex() {
-		out = append(out, AgentCodex)
-	}
-	return out
-}
-
-// startCodex は Codex の子を起こす。流れは start（Claude）と同じで、話し始める前の
-// 3往復と、置き場・方針の照合が加わる。
-func (a *Agent) startCodex(m Msg) {
-	fail := func(why string) {
-		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token, Error: why})
-	}
-	real, err := resolveCwd(m.Cwd)
-	if err != nil {
-		fail(err.Error())
-		return
-	}
-	if m.Root == "" || !under(real, m.Root) {
-		fail(fmt.Sprintf("許した場所（%s）の外を渡された: %s", m.Root, real))
-		return
-	}
-	if !a.Scope && !a.CodexWithoutScope {
-		fail("scope を使わない構成では Codex を起こさない（子が別のプロセスグループ・別のセッションに居て、止めるときに取り逃がす）")
-		return
-	}
-	if !a.CanCodex() {
-		fail("この実行面は Codex を起こせない（codex の実体か置き場が無い）")
-		return
-	}
-	if err := prepareCodexHome(a.CodexHome, a.CodexSource); err != nil {
-		fail("Camp の Codex の置き場を用意できない: " + err.Error())
-		return
-	}
-
-	cmd := a.CodexCommand(m.Session)
-	cmd.Dir = real
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		fail(err.Error())
-		return
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		fail(err.Error())
-		return
-	}
-	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		fail(err.Error())
-		return
-	}
-	pid := cmd.Process.Pid
-	st, _ := Starttime(pid)
-
-	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
-		pending: map[string]chan []byte{}, codex: newCodexState()}
-	if a.Scope {
-		k.scope = scopeName(m.Session)
-	}
-	giveUp := func(why string) {
-		k.kill()
-		cmd.Wait()
-		if k.log != nil {
-			k.log.Close()
-		}
-		fail(why)
-	}
-	// **照合したパスと、実際に降りた場所が同じか**（start と同じ。TOCTOU）。
-	if where, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
-		if !under(where, m.Root) {
-			giveUp(fmt.Sprintf("起こした先が許した場所の外だった（%s）。止めた", where))
-			return
-		}
-	} else {
-		fmt.Fprintf(os.Stderr,
-			"camp agent: %s の実際の cwd を確かめられない: %v\n", m.Session[:8], err)
-	}
-	if lg, err := OpenLog(a.LogDir, m.Session); err == nil {
-		k.log = lg
-	} else {
-		k.logBroken = true
-		fmt.Fprintf(os.Stderr, "camp agent: 落とし先を開けない（%v）。フレームは残らない\n", err)
-		a.send(Msg{T: MsgDropped, Session: m.Session, Token: m.Token, Dropped: -1,
-			Error: "落とし先を開けない: " + err.Error()})
-	}
-
-	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 0, 64*1024), maxLine)
-	// **話し始める前の3往復に時間を切る。** 黙った子を待ち続けない。
-	timer := time.AfterFunc(a.HeaderWait, func() { k.kill() })
-	err = k.codex.handshake(sc, stdin, real, a.CodexHome, func(kind string, line []byte) {
-		a.record(k, kind, line)
-	})
-	if !timer.Stop() && err != nil {
-		err = fmt.Errorf("%v 待っても話し始められない（%v）", a.HeaderWait, err)
-	}
-	if err != nil {
-		giveUp(err.Error())
-		return
-	}
-
-	a.mu.Lock()
-	a.kids[m.Session] = k
-	wanted, wasAsked := a.stopWanted[m.Session]
-	delete(a.stopWanted, m.Session)
-	a.mu.Unlock()
-
-	a.send(Msg{T: MsgStarted, Session: m.Session, Token: m.Token, Agent: AgentCodex,
-		PID: pid, Started: st, BootID: BootID(), Scope: k.scope, ClaudeID: k.codex.threadID()})
-	if wasAsked {
-		go a.stop(Msg{Session: m.Session, Token: m.Token, Mode: wanted})
-	}
-
-	go a.drainCodex(k, sc)
-
-	err = cmd.Wait()
-	code, reason := 0, "終わった"
-	if err != nil {
-		reason = err.Error()
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			code = -1
-		}
-	}
-	k.mu.Lock()
-	k.dead = true
-	k.mu.Unlock()
-	// **app-server が終わっても、scope に残りが居るかもしれない**（コマンドは別のセッション、
-	// MCP の子は別のプロセスグループ）。数えて止め、止め切れなければそう言う（scope.go）。
-	left := a.leftovers(k)
-	if left != 0 {
-		reason += leftoverNote(left)
-	}
-	if k.log != nil {
-		k.log.Close()
-	}
-	a.mu.Lock()
-	delete(a.kids, m.Session)
-	a.mu.Unlock()
-	a.send(Msg{T: MsgExited, Session: m.Session, Token: m.Token, Code: code, Reason: reason,
-		Leftover: left})
-}
-
-// drainCodex は Codex の stdout を読み続ける。**必ず落としてから**畳んで渡す。
-func (a *Agent) drainCodex(k *child, sc *bufio.Scanner) {
+// drainConv は子の stdout を読み続け、会話で畳んで campd へ渡す。**必ず落としてから**畳む。
+func (a *Agent) drainConv(k *child, sc *bufio.Scanner) {
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		ev := k.codex.classify(line)
-		a.record(k, ev.kind, line)
-		if ev.deliver != "" {
-			deliverRaw(k, ev.deliver, ev.payload)
+		ev := k.conv.Fold(line)
+		if ev.Drop {
+			continue
 		}
-		for _, r := range ev.replies {
+		a.record(k, ev.Kind, line)
+		if ev.Deliver != "" {
+			deliverRaw(k, ev.Deliver, ev.Payload)
+		}
+		for _, r := range ev.Replies {
 			if err := k.write(r); err != nil {
 				fmt.Fprintf(os.Stderr, "camp agent: %s へ返せない: %v\n", k.id[:8], err)
 			}
 		}
-		if ev.turnEnd {
+		if ev.TurnEnd {
 			k.mu.Lock()
 			k.turn = false
 			k.mu.Unlock()
 		}
-		thread := k.codex.threadID()
-		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: ev.kind,
-			ClaudeID: thread, TurnEnd: ev.turnEnd, Interrupted: ev.interrupted}
-		if len(ev.withdrawn) == 0 {
-			m.Error = ev.err
+		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: ev.Kind,
+			ClaudeID: ev.SessionID, TurnEnd: ev.TurnEnd, Interrupted: ev.Interrupted, Note: ev.Note}
+		if len(ev.Withdrawn) == 0 {
+			m.Error = ev.Err
 		}
-		if ev.ask != nil {
-			m.Ask, m.ReqID, m.Text, m.Frame = true, ev.ask.ReqID, ev.ask.Tool, ev.ask.Detail
+		if ev.Halt != "" {
+			m.Halt, m.Error = true, ev.Halt
+		}
+		if ev.Ask != nil {
+			m.Ask, m.ReqID, m.Text, m.Frame = true, ev.Ask.ReqID, ev.Ask.Tool, ev.Ask.Detail
 		}
 		if debugFrames {
 			fmt.Fprintf(os.Stderr, "camp agent: %s %s\n", k.id[:8], m.Kind)
 		}
 		a.send(m)
 		// 取り下げは1つずつ伝える（campd は ReqID ごとに台帳を閉じる）。
-		for _, id := range ev.withdrawn {
+		for _, id := range ev.Withdrawn {
 			a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/withdrawn",
-				ClaudeID: thread, ReqID: id, Withdrawn: true, Error: ev.err})
-		}
-		if ev.kill {
-			a.killChild(k)
+				ClaudeID: ev.SessionID, ReqID: id, Withdrawn: true, Error: ev.Err})
 		}
 	}
 }
@@ -976,10 +858,10 @@ func deliverRaw(k *child, key string, payload json.RawMessage) {
 	}
 }
 
-// controlCodex は残量の問い合わせを Codex へ投げる（または手元の控えを返す）。
-func (a *Agent) controlCodex(k *child, m Msg) {
+// controlConv は残量の問い合わせを子へ投げる（または会話の手元の控えを返す）。
+func (a *Agent) controlConv(k *child, m Msg) {
 	out := Msg{T: MsgCtlRes, Session: m.Session, ReqID: m.ReqID}
-	req, key, now, err := k.codex.control(m.Kind)
+	req, key, now, err := k.conv.Query(m.Kind)
 	switch {
 	case err != nil:
 		out.Error = err.Error()
@@ -1011,304 +893,6 @@ func (a *Agent) controlCodex(k *child, m Msg) {
 		out.Error = "子が答えない" // **返ってこないことを「空」と読まない。**
 	}
 	a.send(out)
-}
-
-// ---------------------------------------------------------------- Camp 専用の置き場
-
-// prepareCodexHome は Camp 専用の Codex の置き場を**起こすたびに**整える。
-//
-//   - config.toml は本人の置き場から作り直す（filterCodexConfig）。道具は本人と同じにし、
-//     信頼済みの場所・権限のプロファイルは持ち込まない。Codex がここへ書き足した
-//     「信頼済みの場所」も、次に起こすときに消える
-//   - auth.json・plugins・skills は本人の置き場への symlink（ログインは共有。本人の決定）
-//   - **rules は置かない。** 本人が対話で「今後訊かない」にしたものを持ち込まない
-//     （持ち込むと、承認なしで sandbox の外で走る。実測）
-func prepareCodexHome(home, source string) error {
-	if home == "" || source == "" {
-		return errors.New("置き場か、本人の置き場が決まっていない")
-	}
-	if filepath.Clean(home) == filepath.Clean(source) {
-		return errors.New("本人の Codex の置き場そのものは使わない")
-	}
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return err
-	}
-	// **綴りが違っても同じ場所なら使わない**（symlink・別綴り）。作り直しが本人の
-	// config.toml を上書きする（Fable の実装後レビュー 3）。
-	if hi, err := os.Stat(home); err != nil {
-		return err
-	} else if si, err := os.Stat(source); err == nil && os.SameFile(hi, si) {
-		return fmt.Errorf("%s は本人の Codex の置き場（%s）と同じ場所。使わない", home, source)
-	}
-	if _, err := os.Lstat(filepath.Join(home, "rules")); err == nil {
-		return fmt.Errorf("%s がある。Camp の Codex には「今後訊かない」を持ち込まない。消してから起こす",
-			filepath.Join(home, "rules"))
-	}
-	src, err := os.ReadFile(filepath.Join(source, "config.toml"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	f, err := os.CreateTemp(home, ".config.toml.camp-*")
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(filterCodexConfig(src)); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(f.Name())
-		return err
-	}
-	if err := os.Rename(f.Name(), filepath.Join(home, "config.toml")); err != nil {
-		os.Remove(f.Name())
-		return err
-	}
-	for _, name := range []string{"auth.json", "plugins", "skills"} {
-		if err := linkInto(home, source, name); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// linkInto は home/name を source/name への symlink にする。**写しは作らない**
-// ——ログインの写しを作ると、鍵の更新で片方が古くなる。
-func linkInto(home, source, name string) error {
-	dst, want := filepath.Join(home, name), filepath.Join(source, name)
-	for try := 0; try < 2; try++ {
-		if cur, err := os.Readlink(dst); err == nil {
-			if cur == want {
-				return nil
-			}
-			return fmt.Errorf("%s が %s を指している（%s のはず）", dst, cur, want)
-		}
-		if _, err := os.Lstat(dst); err == nil {
-			return fmt.Errorf("%s が symlink ではない。写しを置かない——消すか %s へのリンクにしてから起こす",
-				dst, want)
-		}
-		if _, err := os.Stat(want); err != nil {
-			if name == "auth.json" {
-				return fmt.Errorf("本人の Codex がログインしていない（%s が無い）", want)
-			}
-			return nil // 道具が無いだけ
-		}
-		if err := os.Symlink(want, dst); err == nil || !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		// 同時に起こした別のセッションが先に作った。もう一度見る。
-	}
-	return fmt.Errorf("%s を用意できない", dst)
-}
-
-// codexDropSections は Camp の置き場へ持ち込まない表（と、その下の表）。キーの並びで持つ。
-//
-//   - projects      信頼済みの場所。Camp から起こすと Codex がここへ書き足す（実測）
-//   - permissions   本人の権限のプロファイル。sandbox は Camp が決める
-//   - tui / desktop 端末とデスクトップの設定
-//   - marketplaces.openai-bundled  source が本人の置き場を指したままだと、同梱のプラグイン
-//     （computer use など）が読まれない。落とせば Codex が自分で見つける（実測）
-var codexDropSections = [][]string{{"projects"}, {"permissions"}, {"tui"}, {"desktop"},
-	{"marketplaces", "openai-bundled"}}
-
-// codexDropKeys は持ち込まない、先頭（どの表にも属さない）のキー。ドット付きのキー
-// （`projects."/x".trust_level = …`）とインラインの表（`projects = { … }`）も、最初の
-// 区切りで見る。
-var codexDropKeys = []string{"default_permissions", "projects", "permissions"}
-
-// filterCodexConfig は本人の config.toml から Camp の置き場の config.toml を作る。
-//
-// TOML を丸ごと読み下さず行で扱うが、**見出しとキーは TOML の区切りどおりに読む**
-// （引用符・空白・ドットを正規化する）。複数行の値（`"""`・`'''`・閉じていない `[` `{`）の
-// 途中の行は、見出しと読まず、その値の持ち主と一緒に残すか落とす（Fable の実装後レビュー 4）。
-func filterCodexConfig(src []byte) []byte {
-	var out bytes.Buffer
-	out.WriteString("# Camp が Codex を起こすたびに ~/.codex/config.toml から作り直す。\n" +
-		"# ここを書き換えても次で消える（dev/active/phase3.6-plan.md）。\n")
-	write := func(l string) {
-		out.WriteString(l)
-		out.WriteByte('\n')
-	}
-	dropSec, dropVal, inSection := false, false, false
-	ml, depth := "", 0 // 開いている複数行の文字列の区切り、開いている [ { の深さ
-	for _, l := range strings.Split(string(src), "\n") {
-		if ml != "" || depth > 0 {
-			// 複数行の値の続き。持ち主の行と同じ扱い。
-			if ml != "" {
-				if strings.Count(l, ml)%2 == 1 {
-					ml = ""
-				}
-			} else if depth += bracketDelta(l); depth < 0 {
-				depth = 0
-			}
-			if !dropSec && !dropVal {
-				write(l)
-			}
-			continue
-		}
-		s := strings.TrimSpace(l)
-		dropVal = false
-		if path, ok := headerPath(s); ok {
-			inSection = true
-			dropSec = hasPrefixPath(path, codexDropSections)
-			if !dropSec {
-				write(l)
-			}
-			continue
-		}
-		if k, v, ok := cutKey(s); ok {
-			if path := tomlKeyPath(k); !inSection && contains(codexDropKeys, path[0]) {
-				dropVal = true
-			}
-			for _, d := range []string{`"""`, `'''`} {
-				if strings.Count(v, d)%2 == 1 {
-					ml = d
-					break
-				}
-			}
-			if ml == "" {
-				if depth = bracketDelta(v); depth < 0 {
-					depth = 0
-				}
-			}
-		}
-		if !dropSec && !dropVal {
-			write(l)
-		}
-	}
-	return out.Bytes()
-}
-
-// headerPath は `[a.b]`・`[[a.b]]`・`[ "a" . 'b' ] # 注` を見出しとして読み、キーの並びを返す。
-func headerPath(s string) ([]string, bool) {
-	if !strings.HasPrefix(s, "[") {
-		return nil, false
-	}
-	body := strings.TrimPrefix(strings.TrimPrefix(s, "["), "[")
-	q := byte(0)
-	for i := 0; i < len(body); i++ {
-		c := body[i]
-		if q != 0 {
-			if c == '\\' && q == '"' {
-				i++
-			} else if c == q {
-				q = 0
-			}
-			continue
-		}
-		switch c {
-		case '"', '\'':
-			q = c
-		case ']':
-			return tomlKeyPath(body[:i]), true
-		}
-	}
-	return nil, false
-}
-
-// tomlKeyPath はキー（`a.b`・`"a" . b`・`'a.b'.c`）をドットで区切り、引用符と空白を外す。
-func tomlKeyPath(s string) []string {
-	var out []string
-	var cur strings.Builder
-	q := byte(0)
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case q != 0:
-			if c == '\\' && q == '"' && i+1 < len(s) {
-				cur.WriteByte(s[i+1])
-				i++
-			} else if c == q {
-				q = 0
-			} else {
-				cur.WriteByte(c)
-			}
-		case c == '"' || c == '\'':
-			q = c
-		case c == '.':
-			out = append(out, cur.String())
-			cur.Reset()
-		case c == ' ' || c == '\t':
-		default:
-			cur.WriteByte(c)
-		}
-	}
-	return append(out, cur.String())
-}
-
-// cutKey は `key = value` を、引用符の外の最初の `=` で分ける。注釈行・空行は分けない。
-func cutKey(s string) (key, value string, ok bool) {
-	if s == "" || strings.HasPrefix(s, "#") {
-		return "", "", false
-	}
-	q := byte(0)
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if q != 0 {
-			if c == '\\' && q == '"' {
-				i++
-			} else if c == q {
-				q = 0
-			}
-			continue
-		}
-		switch c {
-		case '"', '\'':
-			q = c
-		case '=':
-			return s[:i], s[i+1:], true
-		case '#':
-			return "", "", false
-		}
-	}
-	return "", "", false
-}
-
-// bracketDelta は文字列と注釈の外にある `[` `{` と `]` `}` の差。
-func bracketDelta(s string) int {
-	n, q := 0, byte(0)
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if q != 0 {
-			if c == '\\' && q == '"' {
-				i++
-			} else if c == q {
-				q = 0
-			}
-			continue
-		}
-		switch c {
-		case '"', '\'':
-			q = c
-		case '#':
-			return n
-		case '[', '{':
-			n++
-		case ']', '}':
-			n--
-		}
-	}
-	return n
-}
-
-func hasPrefixPath(path []string, prefixes [][]string) bool {
-	for _, p := range prefixes {
-		if len(path) < len(p) {
-			continue
-		}
-		match := true
-		for i := range p {
-			if path[i] != p[i] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
 }
 
 func contains(xs []string, s string) bool {

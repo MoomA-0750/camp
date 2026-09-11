@@ -191,7 +191,23 @@ result を待つ」形で書いたら、`can_use_tool` が2つ来て、2つ目�
   残りを止めてから抜ける。残りが stdout を握っていると sshd はチャネルを閉じず、
   手元の ssh も終わらない
 - 1行目に向こうの sh が身元（pid・起動時刻・boot_id・scope・実パス）を名乗る。
-  ログインシェルが何かを吐いても、それより前の行はフレームとして扱わない
+  ログインシェルが何かを吐いても、それより前の行はフレームとして扱わない（64 行まで。超えても名乗らなければ
+  諦めて手元の ssh を止める。このとき向こうの身元を知らないので reapScript は入れず、向こうの sh が子の終わりで
+  残りを止めるのに任せる）
+- **（M42、2026-09-12）向こうの sh はエージェントの名前を知らない。** 探す名前・置き場の環境変数名と
+  既定の相対パス・引数（駆動器の Argv）を実行面が渡す。名乗りは版 3 で、9欄のあとに `key=value`
+  （いまは `home`・`homereal`、置き場の直す前と実パス）を足せる。Codex の置き場はこれと文字の上で照らす
+- **（M42）しるし**: エージェントを `CAMP_SESSION=<セッション id>` の環境で起こす。Codex 自身が SIGKILL で
+  死ぬと、Codex が別のセッションで起こしたコマンドは ppid 1 で残り、親を辿れない（`rp` で実測。
+  `dev/scripts/probe_codex_remote.py execkill`）。**モデルのターンで起こしたコマンドにもしるしは届く**
+  （`rp` で実測、2026-09-12。`probe_codex_remote.py tree`。`sleep` は自分のセッションで codex.bin の子として
+  走り、app-server に渡した環境変数を持っていた）。sh の終わりと reapScript は、しるしを持つプロセスも止める:
+  `/proc/<pid>/environ` を読めるものは**同じ uid かどうかも見て**（root で入ったときに別のユーザーまで
+  拾わないため）、読めなかった同じユーザーのプロセスは数だけ報告に出す。TERM のあとにもう一度しるしを
+  探し（止めている間に生まれた子を拾う）、KILL のあとに数え直して、残っていればその数も報告に出す。
+  **残る穴**: 走査から撃つまでの間にしるし持ちが終わり、同じ pid が別人に渡ると、その別人へ TERM が飛ぶ
+  （窓は数秒。pid_max の小さいホストでのみ現実的）。しるしは台帳のセッション id なので、campd の
+  再起動後の孤児の始末でも渡る
 
 ---
 
@@ -199,12 +215,12 @@ result を待つ」形で書いたら、`can_use_tool` が2つ来て、2つ目�
 
 口は `codex app-server`（stdio の JSON-RPC、1行1メッセージ）。`codex exec --json` は承認を
 返せない（非対話）ので使わない。測り方は `dev/scripts/probe_codex.py`・`probe_codex_config.py`、
-設計は `dev/active/phase3.6-plan.md`、決定は D-029。
+設計は `dev/active/phase3.6-plan.md`・`phase3.7-plan.md`、決定は D-029（D-030 で一部覆した）。
 
 ```
 → initialize {clientInfo, capabilities:{optOutNotificationMethods:[…]}}   ← {userAgent, codexHome, …}
 → initialized
-→ thread/start {cwd, approvalPolicy:"untrusted", approvalsReviewer:"user", sandbox:"workspace-write"}
+→ thread/start {cwd, …}（「CLI と同じ」では方針を渡さない。ほかの度合いでは approvalPolicy 等を渡す（§12）。Phase 3.6 では毎回渡していた）
                                                    ← {thread:{id}, approvalPolicy, approvalsReviewer, sandbox, cwd, …}
 → turn/start {threadId, input:[{type:"text", text}]}   ← {turn:{id}}、以後 turn/started … turn/completed
 ← item/commandExecution/requestApproval {id:0, command, cwd, …}   → {id:0, result:{decision:"accept"|"decline"}}
@@ -233,10 +249,58 @@ result を待つ」形で書いたら、`can_use_tool` が2つ来て、2つ目�
 | MCP のツール | 承認要求なしで走った。**Codex には MCP の承認の要求そのものが無い** |
 | `thread/start`（`workspace-write`） | 本人の `config.toml` に `[projects."<cwd>"] trust_level="trusted"` を書き足した（`read-only` では書かない） |
 
-したがって Camp は **専用の `CODEX_HOME`** で起こす。設定は起こすたびに本人の `config.toml` から
-作り直し、rules と信頼済みの場所は持ち込まない（同じ置き場で、それまで訊かずに走ったコマンドが
-承認を訊いてきたことを確かめた）。MCP・プラグイン・モデルは同じになる。ログインは `auth.json` の
-symlink で共有し、鍵の更新を強制しても symlink が保たれ本体が更新されることを確かめた。
+Phase 3.6 ではこれを受けて **専用の `CODEX_HOME`** で起こしていた（設定を本人の `config.toml` から
+作り直し、rules と信頼済みの場所は持ち込まない）。**Phase 3.7 で覆した**（D-030、2026-09-12）:
+Camp はこのマシンの AI 作業環境の忠実なリモコンなので、Codex は**本人の `~/.codex` のまま**起こし、
+上の「承認を通らずに走る経路」も CLI と同じ振る舞いとして受け入れる（専用の置き場ではプラグイン・
+スキル・computer use が使えなかった）。話し始める前に照らすのは、本人の置き場で起きたか
+（initialize の `codexHome` を実パスで）・作業場所・スレッド id だけ。承認のコマンドが起こした場所の
+外なら、断らずに印を付けて見せる。設定が途中で変わっても（`thread/settings/updated`）止めずに記録する。
 
 **確かめていない**: Codex 自身に承認待ちの期限があるか（Camp は 4分30秒で自分から断る）。
 権限の拡張・質問・MCP の問い合わせに断りを返したときの振る舞い（偽物でしか試せていない）。
+
+## 12. 駆動器（Phase 3.7、2026-09-12）
+
+エージェントの違いは駆動器（`internal/session/driver.go` の `Driver` と、子1本との会話の
+`Conversation`）に閉じ込めた（D-031）。実行面の本流・campd・API・画面は、ここに書いた形しか知らない。
+設計は `dev/active/phase3.7-design.md`。
+
+**実行面 ↔ campd**:
+
+| 口 | 欄 |
+|---|---|
+| hello | `agents`（起こせる名前の配列。古い campd のために残す）と `drivers`（駆動器の説明: `name`・`label`・`perms`・`notes`・`interrupt_leaves_tools`・`remote`）。**名乗らない古い実行面**の分は campd が手元の駆動器から補い、確認の度合いは `cli` だけとみなす |
+| start | `agent`・`perm`（空は `cli`）。実行面は名乗っていない度合いなら起こさない |
+| started | 実行面が起こした `agent`・`perm` を名乗る。campd が頼んだものと照らし、違えば止める |
+| frame | 駆動器が畳んだ意味（`turn_end`・`ask`・`interrupted`・`note`・`withdrawn`）。campd は種類の文字列を読み分けない |
+
+中断でターンが終わっても工具が残るか（Codex）・向こうのホストでも起こせるか（Claude）は、
+エージェントの名前でなく駆動器の説明で決める。残量の問い合わせは全エージェントで同じ
+`get_usage`・`get_context_usage` だけ（`mcp_status` は外した）。
+
+**API（画面はこれだけを見る）**:
+
+| 口 | 欄 |
+|---|---|
+| `GET /api/runtime` | `agents`（いま繋がっている実行面が起こせるものの説明） |
+| 行 | `agent_label`（表示名）・`agent_session_id`（エージェント自身のセッション id。`claude_id` は同じ値で当面残す） |
+| `GET /api/runtime/{id}` | `agent_notes`（固有の振る舞いの説明） |
+| `/log`・`/stream` の行 | `summary`（駆動器が畳んだ一言）・`own`（Camp 自身の問い合わせのやりとり。画面が畳む） |
+| `/usage` | `view`（プラン・枠・コンテキスト・内訳の表・答えの中の失敗）。生の答えも並べる |
+| 承認の `detail` | `view`（`what`: command / file / tool、コマンド・場所・`outside`、変更は `{path, kind, patch}`、理由）。元の要求も並べる |
+
+エージェントを足すのは、`drivers` の1行とその駆動器のファイル（`Info`・`Launch`・`Argv`・`Open`・
+`Usage`・`Summary` と `Conversation`）だけ。テストの中の3つ目のエージェント（`fake3_test.go`）が手本。
+**まだ残っているエージェントの名前**（codex exec のレビュー、2026-09-12）: 実行面の設定の口（`campd agent` の
+`-claude`・`-codex`・`-codex-home` と `Agent` の欄、systemd の `CAMP_CLAUDE_BIN`）、古い実行面との互換
+（名乗らなければ Claude）、移行 0025・0026 の SQL、会話記録の取り込みと「残量」の画面（Claude だけ）。
+
+**確認の度合い（M41）**: start の `perm`（`cli`・`ask`・`edits`・`auto`・`full`）を、駆動器が渡し方に直す
+（Claude は `--permission-mode`、Codex は thread/start の欄。対応は README の「確認の度合い」）。
+**照らすのは渡したものだけ、起こしたときに1回だけ**: Codex は thread/start の応答（違えば話し始めない）、
+Claude は最初の system/init の `permissionMode`（最初の入力のあとにしか来ない。名乗らないのも違うと読む。
+**違っていても最初のターンは始まっていて、止めるまでの間に道具が動きうる**。system/init そのものが来なければ照らせない）。
+Claude で違えば、実行面が frame の `halt` で伝え、campd が孫まで止めて `start_failed` と書く。2回目以降の
+変化は `note`（止めない）。台帳は `runtime_sessions.perm`（移行 0025）。Phase 3.6 の Codex の行は `legacy`
+（表示だけ、頼めない）。向こうのホストでも同じ5つを渡す（M42 から。引数・thread/start の欄は駆動器が向こうへ渡す）。

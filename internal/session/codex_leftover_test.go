@@ -39,9 +39,9 @@ func TestExitsWithLeftoversAreRecordedAsGivenUp(t *testing.T) {
 			claude := fakeClaude(t)
 			attach(t, s, claude, opt, func(a *Agent) {
 				a.Scope = true // scope 名を付けさせる
-				a.Command = func(string, string) *exec.Cmd { return exec.Command(claude) }
-				a.CodexCommand = func(string) *exec.Cmd {
-					c := exec.Command(a.Codex, "app-server")
+				// scope で包まずに起こす（systemd には触らない）。
+				a.Command = func(_, _ string, argv []string) *exec.Cmd {
+					c := exec.Command(argv[0], argv[1:]...)
 					c.Env = append(os.Environ(), "CODEX_HOME="+a.CodexHome)
 					return c
 				}
@@ -121,9 +121,9 @@ func TestAnAnswerThatCannotBeWrittenIsReportedAsWithdrawn(t *testing.T) {
 	cs := newCodexState()
 	cs.asks["0"] = HeldAsk{ReqID: "0", Tool: "codex:command"}
 	a.kids["sessabcdef"] = &child{id: "sessabcdef", token: "t", stdin: failingStdin{},
-		codex: cs, pending: map[string]chan []byte{}}
+		conv: &codexConv{cs: cs}, name: AgentCodex, pending: map[string]chan []byte{}}
 	go a.toChild(Msg{T: MsgApprove, Session: "sessabcdef", Token: "t", ReqID: "0",
-		Behavior: "allow"}, nil)
+		Behavior: "allow"})
 	m := readMsg(t, c2)
 	if !m.Withdrawn || m.ReqID != "0" || !strings.Contains(m.Error, "書けなかった") {
 		t.Fatalf("書けなかった答えを取り下げとして返していない: %+v", m)

@@ -12,6 +12,14 @@ function stub(payload: (url: string) => unknown) {
 }
 afterEach(() => vi.unstubAllGlobals())
 
+// 起こせるエージェントは実行面が名乗り、API が並べる（画面は名前を決め打ちしない。D-031）。
+const allPerms = ['cli', 'ask', 'edits', 'auto', 'full']
+const agents = [
+  { name: 'claude', label: 'Claude Code', perms: allPerms, remote: true },
+  { name: 'codex', label: 'Codex', perms: allPerms, notes: ['中断ではコマンドが残る'] },
+]
+const live = { agent_connected: true, agents, sessions: [] }
+
 function show(path = '/runtime') {
   render(
     <MemoryRouter initialEntries={[path]}>
@@ -31,7 +39,7 @@ test('sessions が null でも落ちない', async () => {
 })
 
 test('許可リストが null でも落ちない', async () => {
-  stub((u) => (u.startsWith('/api/allowlist') ? null : { agent_connected: true, sessions: [] }))
+  stub((u) => (u.startsWith('/api/allowlist') ? null : live))
   show('/runtime?tab=allow')
   await waitFor(() => expect(screen.getByText(/空。この状態では1本も起こせない/)).toBeTruthy())
 })
@@ -45,7 +53,7 @@ test('実行面が繋がっていないと、そう出る', async () => {
 
 // 状態はURLに乗る（Phase 0 からの決まり）。
 test('タブがURLに乗る', async () => {
-  stub(() => ({ agent_connected: true, sessions: [] }))
+  stub(() => (live))
   show('/runtime?tab=ssh')
   await waitFor(() => expect(screen.getByText(/読むだけ/)).toBeTruthy())
 })
@@ -64,7 +72,7 @@ const hostsPayload = [
 ]
 
 test('起こせる先は、許して行き先を固定した接続先だけ', async () => {
-  stub((u) => (u.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }))
+  stub((u) => (u.startsWith('/api/ssh') ? hostsPayload : live))
   show()
   const sel = await screen.findByLabelText('どこで起こすか')
   await waitFor(() => expect(within(sel).getByText(/far/)).toBeTruthy())
@@ -77,7 +85,7 @@ test('起こすときに接続先を渡す', async () => {
   const posts: unknown[] = []
   vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
     if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)))
-    const body = url.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }
+    const body = url.startsWith('/api/ssh') ? hostsPayload : live
     return { ok: true, status: 200, json: async () => body, text: async () => '' } as unknown as Response
   })
   show()
@@ -86,11 +94,11 @@ test('起こすときに接続先を渡す', async () => {
   fireEvent.change(sel, { target: { value: 'far' } })
   fireEvent.change(screen.getByPlaceholderText(/far の上の場所/), { target: { value: '/srv/work' } })
   fireEvent.click(screen.getByText('起こす'))
-  await waitFor(() => expect(posts).toContainEqual({ cwd: '/srv/work', host: 'far' }))
+  await waitFor(() => expect(posts).toContainEqual({ cwd: '/srv/work', host: 'far', agent: 'claude', perm: 'cli' }))
 })
 
 test('台帳は固定した行き先を出し、固定の無い許可には許し直すよう言う', async () => {
-  stub((u) => (u.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }))
+  stub((u) => (u.startsWith('/api/ssh') ? hostsPayload : live))
   show('/runtime?tab=ssh')
   await waitFor(() => expect(screen.getByText('me@far.example・鍵 1')).toBeTruthy())
   // 固定の無い許可と、鍵の無い固定の2つ。
@@ -103,7 +111,7 @@ test('Codex を選ぶと agent を渡し、ホストは選べなくなる', asyn
   const posts: unknown[] = []
   vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
     if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)))
-    const body = url.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, sessions: [] }
+    const body = url.startsWith('/api/ssh') ? hostsPayload : live
     return { ok: true, status: 200, json: async () => body, text: async () => '' } as unknown as Response
   })
   show()
@@ -116,19 +124,101 @@ test('Codex を選ぶと agent を渡し、ホストは選べなくなる', asyn
   expect(host.value).toBe('')
   fireEvent.change(screen.getByPlaceholderText(/起こす場所/), { target: { value: '/w/x' } })
   fireEvent.click(screen.getByText('起こす'))
-  await waitFor(() => expect(posts).toContainEqual({ cwd: '/w/x', agent: 'codex' }))
+  await waitFor(() => expect(posts).toContainEqual({ cwd: '/w/x', agent: 'codex', perm: 'cli' }))
 })
 
-test('一覧にエージェントが出る（無ければ Claude Code）', async () => {
+test('一覧にエージェントの表示名が出る（API が埋めたもの）', async () => {
   stub((u) => (u.startsWith('/api/runtime')
-    ? { agent_connected: true, sessions: [
-        { id: 'c1', agent: 'codex', cwd: '/w/x', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' },
-        { id: 'c2', cwd: '/w/y', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' }] }
+    ? { agent_connected: true, agents, sessions: [
+        { id: 'c1', agent: 'codex', agent_label: 'Codex', cwd: '/w/x', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' },
+        { id: 'c2', agent: 'claude', agent_label: 'Claude Code', cwd: '/w/y', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' }] }
     : []))
   show()
   const table = await screen.findByRole('table')
   expect(within(table).getByText('Codex')).toBeTruthy()
   expect(within(table).getByText('Claude Code')).toBeTruthy()
+})
+
+// **3つ目のエージェントも、画面に手を入れずに選べる**（D-031。選択肢・表示名・起こせる場所は API から）。
+test('知らないエージェントも API に載れば選べて、起こせる場所に従う', async () => {
+  const posts: unknown[] = []
+  const three = [...agents, { name: 'fake3', label: 'Fake Three', perms: ['cli'] }]
+  vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)))
+    const body = url.startsWith('/api/ssh') ? hostsPayload
+      : { agent_connected: true, agents: three, sessions: [] }
+    return { ok: true, status: 200, json: async () => body, text: async () => '' } as unknown as Response
+  })
+  show()
+  const sel = await screen.findByLabelText('どのエージェントで起こすか')
+  await waitFor(() => expect(within(sel).getByText('Fake Three')).toBeTruthy())
+  fireEvent.change(sel, { target: { value: 'fake3' } })
+  expect((screen.getByLabelText('どこで起こすか') as HTMLSelectElement).disabled).toBe(true)
+  fireEvent.change(screen.getByPlaceholderText(/起こす場所/), { target: { value: '/w/z' } })
+  fireEvent.click(screen.getByText('起こす'))
+  await waitFor(() => expect(posts).toContainEqual({ cwd: '/w/z', agent: 'fake3', perm: 'cli' }))
+})
+
+// ---- 確認の度合い（M41）--------------------------------------------------------
+
+test('確認の度合いを選べ、エージェントが名乗った度合いだけが並ぶ', async () => {
+  const posts: unknown[] = []
+  const few = [{ name: 'claude', label: 'Claude Code', perms: ['cli', 'edits'], remote: true }]
+  vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)))
+    const body = url.startsWith('/api/ssh') ? hostsPayload : { agent_connected: true, agents: few, sessions: [] }
+    return { ok: true, status: 200, json: async () => body, text: async () => '' } as unknown as Response
+  })
+  show()
+  const sel = await screen.findByLabelText('確認の度合い')
+  await waitFor(() => expect(within(sel).getByText('編集は訊かない')).toBeTruthy())
+  expect(within(sel).queryByText('全部任せる')).toBeNull()
+  fireEvent.change(sel, { target: { value: 'edits' } })
+  fireEvent.change(screen.getByPlaceholderText(/起こす場所/), { target: { value: '/w/p' } })
+  fireEvent.click(screen.getByText('起こす'))
+  await waitFor(() => expect(posts).toContainEqual({ cwd: '/w/p', agent: 'claude', perm: 'edits' }))
+})
+
+// 向こうのホストでも確認の度合いを選べる（M42。向こうの sh へ駆動器の引数を渡すようにした）。
+test('向こうのホストでも確認の度合いを選べる', async () => {
+  const posts: unknown[] = []
+  vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)))
+    const body = url.startsWith('/api/ssh') ? hostsPayload : live
+    return { ok: true, status: 200, json: async () => body, text: async () => '' } as unknown as Response
+  })
+  show()
+  const perm = await screen.findByLabelText('確認の度合い') as HTMLSelectElement
+  await waitFor(() => expect(within(perm).getByText('全部任せる')).toBeTruthy())
+  fireEvent.change(perm, { target: { value: 'full' } })
+  const host = screen.getByLabelText('どこで起こすか')
+  await waitFor(() => expect(within(host).getByText(/far/)).toBeTruthy())
+  fireEvent.change(host, { target: { value: 'far' } })
+  expect(perm.disabled).toBe(false)
+  expect(perm.value).toBe('full')
+  fireEvent.change(screen.getByPlaceholderText(/far の上の場所/), { target: { value: '/srv/work' } })
+  fireEvent.click(screen.getByText('起こす'))
+  await waitFor(() => expect(posts).toContainEqual({ cwd: '/srv/work', host: 'far', agent: 'claude', perm: 'full' }))
+})
+
+test('一覧に確認の度合いが出る（Phase 3.6 の Codex の行は、専用の置き場と出る）', async () => {
+  stub((u) => (u.startsWith('/api/runtime')
+    ? { agent_connected: true, agents, sessions: [
+        { id: 'p1', agent: 'claude', agent_label: 'Claude Code', perm: 'auto', cwd: '/w/x', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' },
+        { id: 'p2', agent: 'codex', agent_label: 'Codex', perm: 'legacy', cwd: '/w/y', state: 'idle', requested_by: 'user', created_at: '', updated_at: '' }] }
+    : []))
+  show()
+  const table = await screen.findByRole('table')
+  expect(within(table).getByText('自動で判断')).toBeTruthy()
+  expect(within(table).getByText('Phase 3.6 の専用の置き場')).toBeTruthy()
+})
+
+test('起こせるエージェントが無いと、起こせない', async () => {
+  stub((u) => (u.startsWith('/api/ssh') ? [] : { agent_connected: true, agents: [], sessions: [] }))
+  show()
+  await waitFor(() => expect(screen.getByText('（起こせるエージェントが無い）')).toBeTruthy())
+  fireEvent.change(screen.getByPlaceholderText(/起こす場所/), { target: { value: '/w/z' } })
+  expect((screen.getByText('起こす') as HTMLButtonElement).disabled).toBe(true)
 })
 
 test('向こうのセッションはホスト名つきで出る', async () => {
@@ -162,7 +252,7 @@ const ended = {
 // 本人が探したいもの——動いている途中で終わった・承認を待たせたまま終わった・
 // 承認を期限切れにした——が、1行ずつ見分けられる。
 test('終わったものに、終わり方・そのとき・承認の内訳が出る', async () => {
-  stub((u) => (u.startsWith('/api/runtime/ended') ? ended : { agent_connected: true, sessions: [] }))
+  stub((u) => (u.startsWith('/api/runtime/ended') ? ended : live))
   show('/runtime?tab=ended')
   const table = await screen.findByRole('table')
   const rows = within(table).getAllByRole('row')
@@ -183,7 +273,7 @@ test('絞り込みと続きがURLに乗る', async () => {
   const urls: string[] = []
   stub((u) => {
     urls.push(u)
-    return u.startsWith('/api/runtime/ended') ? ended : { agent_connected: true, sessions: [] }
+    return u.startsWith('/api/runtime/ended') ? ended : live
   })
   show('/runtime?tab=ended&kind=waiting')
   await waitFor(() => expect(urls.some((u) => u === '/api/runtime/ended?kind=waiting')).toBe(true))
@@ -195,7 +285,7 @@ test('絞り込みと続きがURLに乗る', async () => {
 test('終わったものが無いと、そう出る', async () => {
   stub((u) => (u.startsWith('/api/runtime/ended')
     ? { sessions: [], counts: { all: 0 } }
-    : { agent_connected: true, sessions: [] }))
+    : live))
   show('/runtime?tab=ended')
   await waitFor(() => expect(screen.getByText(/まだ1本も終わっていない/)).toBeTruthy())
 })

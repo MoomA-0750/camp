@@ -197,6 +197,8 @@ func TestAnApprovalLeftToExpireIsRecorded(t *testing.T) {
 	s.Tick() // 期限切れ → 拒否を送る → 子はターンを終える
 	waitFor(t, 5*time.Second, func() bool { return liveState(s, rec.ID) == StateIdle })
 
+	// 放置で閉じるのは既定では見ない（D-030）。ここでは入れて確かめる。
+	s.IdleAfter = 30 * time.Minute
 	later = later.Add(s.IdleAfter + time.Minute)
 	s.Tick() // 放置 → 閉じる
 	r := endedRec(t, db, rec.ID)
@@ -224,6 +226,8 @@ func TestATurnThatIgnoresInterruptIsStoppedAfterAWhile(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// ターンの長さで止めるのは既定では見ない（D-030）。ここでは入れて確かめる。
+	s.TurnAfter = 60 * time.Minute
 	later := time.Now().Add(s.TurnAfter + time.Minute)
 	s.Now = func() time.Time { return later }
 	s.Tick() // 中断を投げる。この子は聞かない

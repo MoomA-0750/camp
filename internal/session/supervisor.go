@@ -156,18 +156,28 @@ func (s *Supervisor) StartOn(requestedBy, host, cwd string) (Record, error) {
 	return s.StartAgent(requestedBy, host, cwd, AgentClaude)
 }
 
-// StartAgent は host（空ならこのマシン）に agent（claude / codex）のセッションを起こす。
-// **起こすのは実行面だが、決めるのはここ。**
+// StartAgent は host（空ならこのマシン）に agent のセッションを、確認の度合い「CLI と同じ」で起こす。
 func (s *Supervisor) StartAgent(requestedBy, host, cwd, agent string) (Record, error) {
-	agent = agentOr(agent)
+	return s.StartWith(requestedBy, host, cwd, agent, PermCLI)
+}
+
+// StartWith は host（空ならこのマシン）に agent のセッションを、確認の度合い perm で起こす。
+// **起こすのは実行面だが、決めるのはここ。**
+func (s *Supervisor) StartWith(requestedBy, host, cwd, agent, perm string) (Record, error) {
+	agent, perm = agentOr(agent), permOr(perm)
 	if !validAgent(agent) {
-		err := fmt.Errorf("知らないエージェント: %q（claude か codex）", agent)
+		err := fmt.Errorf("知らないエージェント: %q", agent)
 		s.audit("", "session.start", cwd, err.Error(), audit.Denied)
 		return Record{}, err
 	}
-	if agent == AgentCodex && host != "" {
-		// 向こうのホストで Codex は後のタスク（dev/active/phase3.6-plan.md）。
-		err := errors.New("Codex はまだ向こうのホストでは起こせない（このマシンだけ）")
+	if !validPerm(perm) {
+		err := fmt.Errorf("知らない確認の度合い: %q", perm)
+		s.audit("", "session.start", cwd, err.Error(), audit.Denied)
+		return Record{}, err
+	}
+	if info := drivers[agent].Info(); host != "" && !info.Remote {
+		// 向こうのホストで起こせないエージェント（Codex は M42 まで）。
+		err := fmt.Errorf("%s はまだ向こうのホストでは起こせない（このマシンだけ）", info.Label)
 		s.audit("", "session.start", host+":"+cwd, err.Error(), audit.Denied)
 		return Record{}, err
 	}
@@ -189,7 +199,7 @@ func (s *Supervisor) StartAgent(requestedBy, host, cwd, agent string) (Record, e
 		// 向こうのパスは campd には実パスに直せない。文字の上で決め、
 		// symlink は向こうの sh が解いてから塞ぐ（remote.go）。
 		var err error
-		real, root, spec, err = checkRemote(s.db, host, cwd)
+		real, root, spec, err = checkRemote(s.db, agent, host, cwd)
 		if err != nil {
 			s.audit("", "session.start", host+":"+cwd, err.Error(), audit.Denied)
 			return Record{}, err
@@ -201,7 +211,7 @@ func (s *Supervisor) StartAgent(requestedBy, host, cwd, agent string) (Record, e
 	token := newID() + newID()
 	t := s.Now().UTC()
 	rec := Record{
-		ID: id, Agent: agent, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
+		ID: id, Agent: agent, Perm: perm, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
 		CreatedAt: t.Format(time.RFC3339), UpdatedAt: t.Format(time.RFC3339),
 		Host: host,
 	}
@@ -219,6 +229,13 @@ func (s *Supervisor) StartAgent(requestedBy, host, cwd, agent string) (Record, e
 		// **古い実行面に Codex を頼まない。** 読まれない欄は黙って落ち、claude が起きる。
 		s.mu.Unlock()
 		err := fmt.Errorf("いまの実行面は %s を起こせない（codex が無いか、実行面が古い。camp-agent を入れ替える）", agent)
+		s.audit("", "session.start", target, err.Error(), audit.Denied)
+		return Record{}, err
+	}
+	if !s.agent.canPerm(agent, perm) {
+		// **名乗っていない度合いを頼まない。** 読まれずに落ち、本人の設定のまま起きる。
+		s.mu.Unlock()
+		err := fmt.Errorf("いまの実行面は %s を確認の度合い %s で起こせない（実行面が古い。camp-agent を入れ替える）", agent, perm)
 		s.audit("", "session.start", target, err.Error(), audit.Denied)
 		return Record{}, err
 	}
@@ -241,10 +258,10 @@ func (s *Supervisor) StartAgent(requestedBy, host, cwd, agent string) (Record, e
 		return Record{}, err
 	}
 
-	s.audit(id, "session.start", target, "実行面へ起動を依頼した（"+agent+"）", audit.OK)
+	s.audit(id, "session.start", target, "実行面へ起動を依頼した（"+agent+"、確認の度合い "+perm+"）", audit.OK)
 
 	if err := ac.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root,
-		Remote: spec, Agent: agent}); err != nil {
+		Remote: spec, Agent: agent, Perm: perm}); err != nil {
 		// **「届かなかった」を「起きなかった」と確定しない。**
 		// 途中まで書けていれば実行面は子を起こしている。ここで exited と
 		// 書くと、あとから来る started も、繋ぎ直しの名乗りも弾いてしまい、
@@ -488,7 +505,7 @@ func (s *Supervisor) Tick() {
 					cause: EndStartFailed})
 			}
 		case StateRunning:
-			if ls.turn.IsZero() || now.Sub(ls.turn) <= s.TurnAfter {
+			if s.TurnAfter <= 0 || ls.turn.IsZero() || now.Sub(ls.turn) <= s.TurnAfter {
 				break
 			}
 			// **まず中断。効かなければ孫まで止める。** 中断を投げっぱなしにすると、
@@ -502,7 +519,7 @@ func (s *Supervisor) Tick() {
 					"ターンが長すぎ、中断も効かない", EndTurnTimeout})
 			}
 		case StateIdle:
-			if now.Sub(ls.last) > s.IdleAfter {
+			if s.IdleAfter > 0 && now.Sub(ls.last) > s.IdleAfter {
 				todo = append(todo, action{id, StopTerminate,
 					"何も来ないまま時間が経った", EndIdleTimeout})
 			}
@@ -745,6 +762,7 @@ func (s *Supervisor) Tail(id string, since int64, limit int) (TailResult, error)
 		if m.Error != "" {
 			return TailResult{}, fmt.Errorf("%s", m.Error)
 		}
+		s.summarize(id, m.Lines)
 		return TailResult{Lines: m.Lines, Gap: m.Gap, Newest: m.Seq, Dropped: m.Dropped}, nil
 	case <-time.After(15 * time.Second):
 		// **返ってこないことを「空」と読まない。**
@@ -824,8 +842,10 @@ func matchedRoot(db *store.DB, real string) (string, error) {
 // 変えるものはここから出せない——画面の1クリックで承認の要否が変わると、
 // 監査ログの意味が薄くなる。
 func (s *Supervisor) Control(id, subtype string) ([]byte, error) {
+	// **どのエージェントにも同じ問い合わせだけを通す**（D-031）。mcp_status は Codex に同じものが
+	// 無く、画面も使っていないので外した（Fable の設計レビュー）。
 	switch subtype {
-	case "get_usage", "get_context_usage", "mcp_status":
+	case "get_usage", "get_context_usage":
 	default:
 		return nil, fmt.Errorf("この制御は出せない: %s", subtype)
 	}

@@ -17,7 +17,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/store"
 )
 
-// Phase 3.6（Codex のセッション駆動）。偽の app-server は fakecodex_test.go。
+// Codex のセッション駆動（Phase 3.6、3.7 で本人の置き場へ戻した）。偽の app-server は fakecodex_test.go。
 
 func codexNoErr(t *testing.T, err error) {
 	t.Helper()
@@ -27,15 +27,13 @@ func codexNoErr(t *testing.T, err error) {
 }
 
 // withFakeCodex は実行面に偽の app-server と、使い捨ての「本人の置き場」を持たせる。
+// 偽物は、その置き場で起きたと名乗る（env で上書きできる。あとに書いたものが勝つ）。
 func withFakeCodex(t *testing.T, env ...string) (func(*Agent), string) {
 	t.Helper()
-	bin, logPath := fakeCodex(t, env...)
-	src := t.TempDir()
-	codexNoErr(t, os.WriteFile(filepath.Join(src, "auth.json"), []byte(`{"fake":true}`), 0o600))
-	codexNoErr(t, os.WriteFile(filepath.Join(src, "config.toml"), []byte("model = \"fake\"\n"), 0o600))
-	home := filepath.Join(t.TempDir(), "codex-home")
+	home := t.TempDir()
+	bin, logPath := fakeCodex(t, append([]string{"CAMP_FAKE_CODEX_HOMEOUT=" + home}, env...)...)
 	return func(a *Agent) {
-		a.Codex, a.CodexHome, a.CodexSource = bin, home, src
+		a.Codex, a.CodexHome = bin, home
 		a.CodexWithoutScope = true // 偽物なので scope 無しで通す
 	}, logPath
 }
@@ -114,7 +112,7 @@ func historyReason(t *testing.T, db *store.DB, id, reqID string) string {
 // ---------------------------------------------------------------- 起こす・話す・止める
 
 // 1本の Codex のセッションが starting→idle→running→idle→exited を通る。
-// **話し始める前の手順で、Camp の方針を渡している。**
+// **方針は何も渡さない**（本人の設定のまま＝CLI と同じ。D-030）。
 func TestACodexSessionRunsThroughTheStateMachine(t *testing.T) {
 	db := newDB(t)
 	s, _, logPath := wireCodex(t, db)
@@ -140,9 +138,10 @@ func TestACodexSessionRunsThroughTheStateMachine(t *testing.T) {
 		t.Fatalf("thread/start が %d 回", len(start))
 	}
 	p := start[0]["params"].(map[string]any)
-	if p["approvalPolicy"] != "untrusted" || p["approvalsReviewer"] != "user" ||
-		p["sandbox"] != "workspace-write" {
-		t.Fatalf("渡した方針が違う: %v", p)
+	for _, k := range []string{"approvalPolicy", "approvalsReviewer", "sandbox"} {
+		if _, set := p[k]; set {
+			t.Fatalf("CLI と同じはずなのに %s を渡した: %v", k, p)
+		}
 	}
 	turns := sent(t, logPath, "turn/start")
 	if len(turns) != 1 || !strings.Contains(mustJSON(turns[0]), `"threadId":"thr-fake-1"`) ||
@@ -225,12 +224,9 @@ func TestCodexRequestsCampCannotAnswerAreRefused(t *testing.T) {
 	}
 }
 
-// **効いた方針を照らしてから話し始める。** 違えば起こさない。
-func TestCodexDoesNotStartUnlessThePolicyTookEffect(t *testing.T) {
+// **頼んだ場所で起きたかを照らしてから話し始める。** 違えば起こさない。
+func TestCodexDoesNotStartUnlessItStartedWhereAsked(t *testing.T) {
 	for _, c := range []struct{ env, want string }{
-		{"CAMP_FAKE_CODEX_POLICY=never", "承認の方針"},
-		{"CAMP_FAKE_CODEX_REVIEWER=auto_review", "承認を見る"},
-		{"CAMP_FAKE_CODEX_SANDBOX=dangerFullAccess", "sandbox が"},
 		{"CAMP_FAKE_CODEX_CWD=/elsewhere", "作業場所"},
 		{"CAMP_FAKE_CODEX_STARTERR=1", "Codex が断った"},
 	} {
@@ -242,20 +238,20 @@ func TestCodexDoesNotStartUnlessThePolicyTookEffect(t *testing.T) {
 				t.Fatalf("起こせなかった理由が違う: %s / %s", r.EndCause, r.ExitReason)
 			}
 			if len(sent(t, logPath, "turn/start")) != 0 {
-				t.Fatal("方針が効いていないのに話し始めた")
+				t.Fatal("頼んだ場所で起きていないのに話し始めた")
 			}
 		})
 	}
 }
 
-// **Camp の置き場で起きたことを照らす。** 本人の置き場で起きても方針は Camp が渡した値に
-// なるので、thread/start の照合では気づけない（Fable の実装後レビュー 1）。
-func TestCodexMustStartInCampsOwnHome(t *testing.T) {
+// **本人の置き場で起きたことを照らす。** CLI と同じ設定で動かすと約束しているので、
+// 別の置き場（別の設定・別のログイン）で起きていたら話し始めない。
+func TestCodexMustStartInTheUsersOwnHome(t *testing.T) {
 	db := newDB(t)
 	s, _, logPath := wireCodex(t, db, "CAMP_FAKE_CODEX_HOMEOUT="+t.TempDir())
 	r := startCodexFails(t, s, db)
-	if r.EndCause != EndStartFailed || !strings.Contains(r.ExitReason, "Camp の置き場ではない") {
-		t.Fatalf("本人の置き場で起きたのに話し始めた: %s / %s", r.EndCause, r.ExitReason)
+	if r.EndCause != EndStartFailed || !strings.Contains(r.ExitReason, "本人の置き場ではない") {
+		t.Fatalf("別の置き場で起きたのに話し始めた: %s / %s", r.EndCause, r.ExitReason)
 	}
 	if len(sent(t, logPath, "thread/start")) != 0 {
 		t.Fatal("置き場を照らす前にスレッドを始めた")
@@ -327,7 +323,7 @@ func TestACodexTurnThatRanTooLongIsStoppedAfterTheInterrupt(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- 取り下げ（Fable の実装後レビュー 2）
+// ---------------------------------------------------------------- 取り下げ
 
 // **訊いたあとで差分が変わったら、訊いた中身で許させない。** 断って、台帳からも取り下げる。
 func TestAChangedDiffAfterAskingIsDeclined(t *testing.T) {
@@ -404,7 +400,7 @@ func TestPatchUpdatedOnlyTouchesItsOwnItem(t *testing.T) {
 		t.Fatalf("item の id が無いのにコマンドの承認を断った: %s", joined(ev.replies))
 	}
 	for _, id := range []string{"1", "2"} {
-		cs.classify([]byte(`{"method":"item/started","params":{"item":{"type":"fileChange","id":"i1","changes":[{"path":"/w/a"}]}}}`))
+		cs.classify([]byte(`{"method":"item/started","params":{"item":{"type":"fileChange","id":"i1","changes":[{"path":"/w/a","diff":"a\n"}]}}}`))
 		cs.classify([]byte(`{"id":` + id + `,"method":"item/fileChange/requestApproval","params":{"itemId":"i1"}}`))
 	}
 	ev = cs.classify([]byte(`{"method":"item/fileChange/patchUpdated","params":{"itemId":"i1","changes":[{"path":"/w/b"}]}}`))
@@ -435,23 +431,38 @@ func TestCodexIsNotAskedOfAnExecutionSideThatCannotStartIt(t *testing.T) {
 	}
 }
 
-// 名乗らない（Phase 3.6 より前の）実行面は claude だけ。
+// 駆動器を名乗らない実行面（Phase 3.7 より前）は claude だけ。**Phase 3.6 の実行面は codex を
+// 名乗るが、それでも頼まない**——専用の置き場で untrusted 固定のまま起こすのを「CLI と同じ」として
+// 書いてしまう（`codex exec` のレビュー、2026-09-12）。
 func TestAnOldExecutionSideIsNotAskedForCodex(t *testing.T) {
 	old := &agentConn{}
 	if old.can(AgentCodex) || !old.can(AgentClaude) {
 		t.Fatal("名乗らない実行面の読み方が違う")
 	}
-	if !(&agentConn{agents: []string{AgentClaude, AgentCodex}}).can(AgentCodex) {
+	p36 := &agentConn{agents: []string{AgentClaude, AgentCodex}} // Phase 3.6 の実行面
+	if p36.can(AgentCodex) {
+		t.Fatal("駆動器を名乗らない実行面に Codex を頼める")
+	}
+	if !p36.can(AgentClaude) {
+		t.Fatal("古い実行面の claude まで断っている")
+	}
+	// 駆動器を名乗れば頼める。
+	named := &agentConn{agents: []string{AgentClaude, AgentCodex}}
+	named.infos = namedInfos(named, []AgentInfo{{Name: AgentCodex, Label: "Codex",
+		Perms: []string{PermCLI, PermAsk}}})
+	if !named.can(AgentCodex) {
 		t.Fatal("名乗った実行面に頼めない")
 	}
 }
 
+// 向こうのホストで起こせないエージェント（駆動器の説明の Remote が false）は campd が断る。
+// Codex は M42 で向こうでも起こせるようにしたので、テストの中の3つ目のエージェントで確かめる。
 func TestCodexOnAnotherHostAndUnknownAgentsAreRefused(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
-	if _, err := s.StartAgent("test", "rp", "/data/x", AgentCodex); err == nil ||
+	if _, err := s.StartAgent("test", "rp", "/data/x", agentFake3); err == nil ||
 		!strings.Contains(err.Error(), "向こうのホスト") {
-		t.Fatalf("向こうのホストで Codex を起こそうとした: %v", err)
+		t.Fatalf("向こうのホストで起こせないエージェントを起こそうとした: %v", err)
 	}
 	if _, err := s.StartAgent("test", "", allowHere(t, db), "gemini"); err == nil {
 		t.Fatal("知らないエージェントを通した")
@@ -534,6 +545,7 @@ func TestCodexAnswersOnlyRequestsItSaw(t *testing.T) {
 }
 
 // **ターンの終わりを取りこぼさない。** 取りこぼすと 60 分 running のまま（Fable 6）。
+// **設定が途中で変わっても止めない。** 記録するだけ（2026-09-12、本人）。
 func TestEveryWayACodexTurnEndsIsFolded(t *testing.T) {
 	cs := newCodexState()
 	cs.thread = "t"
@@ -557,10 +569,29 @@ func TestEveryWayACodexTurnEndsIsFolded(t *testing.T) {
 			t.Fatalf("%s: turnEnd=%v（%v のはず）", line, got, end)
 		}
 	}
-	for _, m := range []string{"thread/settings/updated", "item/autoApprovalReview/started"} {
-		if ev := cs.classify([]byte(`{"method":"` + m + `","params":{}}`)); !ev.kill {
-			t.Fatalf("方針が変わった（%s）のに止めない", m)
-		}
+	ev = cs.classify([]byte(`{"method":"thread/settings/updated","params":{}}`))
+	if ev.note == "" || ev.err != "" || ev.turnEnd {
+		t.Fatalf("設定の変化を記録していない、または止める扱いにした: %+v", ev)
+	}
+	// 自動審査の開始は「自動で判断」のふつうの流れ。止めも記録もしない。
+	ev = cs.classify([]byte(`{"method":"item/autoApprovalReview/started","params":{}}`))
+	if ev.note != "" || ev.err != "" || ev.turnEnd {
+		t.Fatalf("自動審査の開始を特別扱いした: %+v", ev)
+	}
+}
+
+// 設定の変化は止めずに、監査に「記録」として残る。
+func TestASettingsChangeIsRecordedNotStopped(t *testing.T) {
+	db := newDB(t)
+	s, _, _ := wireCodex(t, db)
+	rec := startCodexHere(t, s, db)
+	s.dispatchForTest(Msg{T: MsgFrame, Session: rec.ID, Token: s.live[rec.ID].token,
+		Kind: "thread/settings/updated", Note: "設定が途中で変わった（thread/settings/updated）。止めずに記録した"})
+	if !auditHas(t, db, "session.note", "止めずに記録した") {
+		t.Fatal("設定の変化が記録に残っていない")
+	}
+	if state(t, db, rec.ID) == StateExited {
+		t.Fatal("設定の変化で止めた")
 	}
 }
 
@@ -569,7 +600,7 @@ func TestTheOptOutNeverHidesWhatCampWatches(t *testing.T) {
 	watched := []string{"turn/started", "turn/completed", "error", "thread/closed",
 		"item/started", "item/completed", "item/fileChange/patchUpdated", "serverRequest/resolved",
 		"thread/tokenUsage/updated"}
-	for m := range codexPolicyChanged {
+	for m := range codexSettingsChanged {
 		watched = append(watched, m)
 	}
 	for _, m := range watched {
@@ -583,7 +614,8 @@ func TestTheOptOutNeverHidesWhatCampWatches(t *testing.T) {
 func TestAnUnknownOrOversizedDiffIsDeclinedNotShown(t *testing.T) {
 	cs := newCodexState()
 	ev := cs.classify([]byte(`{"id":3,"method":"item/fileChange/requestApproval","params":{"itemId":"i1"}}`))
-	if ev.ask != nil || !strings.Contains(joined(ev.replies), "decline") || !strings.Contains(ev.err, "差分") {
+	// **なぜ断ったかを言う**（差分がまだ来ていない。読めない差分とは分けて書く）。
+	if ev.ask != nil || !strings.Contains(joined(ev.replies), "decline") || !strings.Contains(ev.err, "来ていない") {
 		t.Fatalf("差分の無い承認を出した: %+v", ev)
 	}
 	big := strings.Repeat("x", maxApprovalDetail)
@@ -608,27 +640,18 @@ func TestAnInterruptBeforeTheTurnIsKnownIsSentWhenItStarts(t *testing.T) {
 	}
 }
 
-// **照合は構造ごと。欄が欠けていても断る。**
-func TestVerifyCodexStartChecksTheWholeShape(t *testing.T) {
-	good := `{"thread":{"id":"01a0-x"},"approvalPolicy":"untrusted","approvalsReviewer":"user",` +
-		`"sandbox":{"type":"workspaceWrite","writableRoots":[],"networkAccess":false},` +
-		`"activePermissionProfile":null,"cwd":"/w"}`
+// **照らすのは作業場所とスレッド。欠けていても断る。** 方針は本人の設定のまま（照らさない）。
+func TestVerifyCodexStartChecksWhereItStarted(t *testing.T) {
+	good := `{"thread":{"id":"01a0-x"},"approvalPolicy":"never","approvalsReviewer":"auto_review",` +
+		`"sandbox":{"type":"dangerFullAccess"},"cwd":"/w"}`
 	if th, err := verifyCodexStart(json.RawMessage(good), "/w"); err != nil || th != "01a0-x" {
-		t.Fatalf("正しい応答を断った: %v", err)
+		t.Fatalf("本人の設定のままの応答を断った: %v", err)
 	}
 	for name, bad := range map[string]string{
-		"方針":        strings.Replace(good, `"untrusted"`, `"on-request"`, 1),
-		"方針の型":      strings.Replace(good, `"untrusted"`, `{"granular":{}}`, 1),
-		"見る者":       strings.Replace(good, `"user"`, `"auto_review"`, 1),
-		"sandbox":   strings.Replace(good, `"workspaceWrite"`, `"dangerFullAccess"`, 1),
-		"ネット":       strings.Replace(good, `"networkAccess":false`, `"networkAccess":true`, 1),
-		"書ける場所":     strings.Replace(good, `"writableRoots":[]`, `"writableRoots":["/"]`, 1),
-		"書ける場所無し":   strings.Replace(good, `"writableRoots":[],`, ``, 1),
-		"プロファイル":    strings.Replace(good, `"activePermissionProfile":null`, `"activePermissionProfile":{"id":"x"}`, 1),
-		"cwd無し":     strings.Replace(good, `,"cwd":"/w"`, ``, 1),
-		"cwd違い":     strings.Replace(good, `"cwd":"/w"`, `"cwd":"/"`, 1),
-		"sandbox無し": strings.Replace(good, `"sandbox":{"type":"workspaceWrite","writableRoots":[],"networkAccess":false},`, ``, 1),
-		"スレッド":      strings.Replace(good, `"01a0-x"`, `"a b"`, 1),
+		"cwd無し":  strings.Replace(good, `,"cwd":"/w"`, ``, 1),
+		"cwd違い":  strings.Replace(good, `"cwd":"/w"`, `"cwd":"/"`, 1),
+		"スレッド":   strings.Replace(good, `"01a0-x"`, `"a b"`, 1),
+		"スレッド無し": strings.Replace(good, `"thread":{"id":"01a0-x"},`, ``, 1),
 	} {
 		if _, err := verifyCodexStart(json.RawMessage(bad), "/w"); err == nil {
 			t.Fatalf("%s が違うのに通した: %s", name, bad)
@@ -654,218 +677,90 @@ func TestTheExecutionSideNamesCodexOnlyWhenItCanStartIt(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- Camp 専用の置き場
-
-// **道具は本人と同じ。「今後訊かない」と「信頼済みの場所」は持ち込まない。本人の置き場に書かない。**
-func TestTheCampCodexHomeCarriesToolsButNotRulesOrTrust(t *testing.T) {
-	src := t.TempDir()
-	conf := `model = "gpt-x"
-default_permissions = "from-vaults"
-
-[projects."/home/me"]
-trust_level = "trusted"
-
-[permissions.from-vaults]
-extends = ":workspace"
-
-[permissions.from-vaults.filesystem]
-"/home/me/git" = "write"
-
-[features]
-hooks = true
-
-[desktop]
-keep = true
-
-[marketplaces.openai-bundled]
-source_type = "local"
-source = "/home/me/.codex/.tmp/bundled-marketplaces/openai-bundled"
-
-[marketplaces.openai-primary-runtime]
-source_type = "local"
-
-[mcp_servers.node_repl]
-command = "node"
-args = [
-  "repl",
-]
-
-[mcp_servers.node_repl.env]
-A = "1"
-
-[tui]
-status_line = []
-`
-	codexNoErr(t, os.WriteFile(filepath.Join(src, "config.toml"), []byte(conf), 0o600))
-	codexNoErr(t, os.WriteFile(filepath.Join(src, "auth.json"), []byte(`{}`), 0o600))
-	for _, d := range []string{"plugins", "skills", "rules"} {
-		codexNoErr(t, os.Mkdir(filepath.Join(src, d), 0o700))
-	}
-	codexNoErr(t, os.WriteFile(filepath.Join(src, "rules", "default.rules"), []byte(`x`), 0o600))
-	before, _ := os.ReadFile(filepath.Join(src, "config.toml"))
-
-	home := filepath.Join(t.TempDir(), "h")
-	codexNoErr(t, prepareCodexHome(home, src))
-	out, _ := os.ReadFile(filepath.Join(home, "config.toml"))
-	for _, keep := range []string{`model = "gpt-x"`, "[features]", "[mcp_servers.node_repl]",
-		"[mcp_servers.node_repl.env]", `"repl",`, "[marketplaces.openai-primary-runtime]"} {
-		if !bytes.Contains(out, []byte(keep)) {
-			t.Fatalf("道具の設定 %q を落とした:\n%s", keep, out)
+// 起こす口は、本人の置き場を触らない（CODEX_HOME を渡さない。CLI と同じ）。どのエージェントも
+// 実体の後ろに駆動器の引数をそのまま付け、scope を使うなら systemd-run で包む。
+func TestTheDefaultCommandUsesTheUsersOwnSettings(t *testing.T) {
+	a := NewAgent("x", "/usr/bin/claude-fake")
+	a.Codex, a.CodexWithoutScope = "/usr/bin/true", true
+	for _, scope := range []bool{false, true} {
+		a.Scope = scope
+		for _, name := range []string{AgentClaude, AgentCodex} {
+			d := drivers[name]
+			args, err := d.Argv(PermCLI)
+			codexNoErr(t, err)
+			l, err := d.Launch(a)
+			codexNoErr(t, err)
+			argv := append([]string{l.Bin}, args...)
+			cmd := a.defaultCommand(name, "s1", argv)
+			for _, e := range cmd.Env {
+				if strings.HasPrefix(e, "CODEX_HOME=") {
+					t.Fatalf("%s: CODEX_HOME を差し替えた: %s", name, e)
+				}
+			}
+			if !strings.HasSuffix(strings.Join(cmd.Args, " "), strings.Join(argv, " ")) {
+				t.Fatalf("%s: 起こし方が違う: %v", name, cmd.Args)
+			}
+			if wrapped := cmd.Args[0] == "systemd-run"; wrapped != scope {
+				t.Fatalf("%s: scope=%v なのに %v", name, scope, cmd.Args)
+			}
 		}
 	}
-	for _, gone := range []string{"projects", "trust_level", "default_permissions", "permissions.",
-		"/home/me/git", "[desktop]", "openai-bundled", "[tui]"} {
-		if bytes.Contains(out, []byte(gone)) {
-			t.Fatalf("持ち込まないはずの %q が残っている:\n%s", gone, out)
-		}
-	}
-	for _, name := range []string{"auth.json", "plugins", "skills"} {
-		if cur, err := os.Readlink(filepath.Join(home, name)); err != nil || cur != filepath.Join(src, name) {
-			t.Fatalf("%s が本人の置き場へのリンクになっていない: %q %v", name, cur, err)
-		}
-	}
-	if _, err := os.Lstat(filepath.Join(home, "rules")); err == nil {
-		t.Fatal("「今後訊かない」を持ち込んだ")
-	}
-	if after, _ := os.ReadFile(filepath.Join(src, "config.toml")); !bytes.Equal(before, after) {
-		t.Fatal("本人の config.toml を書き換えた")
-	}
-
-	// Codex がここへ書き足した「信頼済みの場所」は、次に起こすときに消える。
-	f, _ := os.OpenFile(filepath.Join(home, "config.toml"), os.O_APPEND|os.O_WRONLY, 0)
-	f.WriteString("\n[projects.\"/w\"]\ntrust_level = \"trusted\"\n")
-	f.Close()
-	codexNoErr(t, prepareCodexHome(home, src))
-	if out, _ := os.ReadFile(filepath.Join(home, "config.toml")); bytes.Contains(out, []byte("trust_level")) {
-		t.Fatal("書き足された信頼済みの場所が残った")
-	}
-
-	// rules が現れたら起こさない。
-	codexNoErr(t, os.Mkdir(filepath.Join(home, "rules"), 0o700))
-	if err := prepareCodexHome(home, src); err == nil || !strings.Contains(err.Error(), "rules") {
-		t.Fatalf("rules があるのに起こす: %v", err)
-	}
-	os.Remove(filepath.Join(home, "rules"))
-
-	// ログインの写しを置かない。
-	os.Remove(filepath.Join(home, "auth.json"))
-	codexNoErr(t, os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{}`), 0o600))
-	if err := prepareCodexHome(home, src); err == nil || !strings.Contains(err.Error(), "symlink ではない") {
-		t.Fatalf("ログインの写しを受け入れた: %v", err)
+	if args, _ := (codexDriver{}).Argv(PermCLI); strings.Join(args, " ") != "app-server" {
+		t.Fatalf("Codex の起こし方が違う: %v", args)
 	}
 }
 
-// **綴りが違っても、本人の置き場そのものは使わない**（Fable の実装後レビュー 3）。
-// rules の無い本人の置き場でも止まること——rules の検査に偶然頼らない。
-func TestTheUsersOwnHomeIsNotUsedUnderAnotherName(t *testing.T) {
-	src := t.TempDir()
-	conf := "model = \"x\"\n[projects.\"/keep\"]\ntrust_level = \"trusted\"\n"
-	codexNoErr(t, os.WriteFile(filepath.Join(src, "config.toml"), []byte(conf), 0o600))
-	codexNoErr(t, os.WriteFile(filepath.Join(src, "auth.json"), []byte(`{}`), 0o600))
-	alias := filepath.Join(t.TempDir(), "alias")
-	codexNoErr(t, os.Symlink(src, alias))
-	for _, home := range []string{src, alias, src + "/./", filepath.Join(alias, ".")} {
-		if err := prepareCodexHome(home, src); err == nil {
-			t.Fatalf("%s（本人の置き場）を Camp の置き場にした", home)
-		}
-	}
-	if got, _ := os.ReadFile(filepath.Join(src, "config.toml")); string(got) != conf {
-		t.Fatal("本人の config.toml を書き換えた")
-	}
-}
+// ---------------------------------------------------------------- 承認の中身（Phase 3.6 の outer gate の指摘 4）
 
-// **TOML として同じ意味の書き方でも落とす。** 複数行の値の中は見出しと読まない（Fable の実装後レビュー 4）。
-func TestTheConfigFilterReadsTOMLNotJustLines(t *testing.T) {
-	src := `projects."/x".trust_level = "trusted"
-projects = { "/y" = { trust_level = "trusted" } }
-default_permissions = """
-from-vaults
-"""
-developer_instructions = """
-[projects."/in-a-string"]
-"""
-model = "keep"
-
-[ projects . "/z" ]
-trust_level = "trusted"
-
-["projects"."/q"]
-trust_level = "trusted"
-
-[ 'permissions' . "p" ]
-x = 1
-
-[mcp_servers.keep]
-args = [
-  ["nested"],
-  "[projects.fake]",
-]
-env = { A = "[b]" }
-
-[marketplaces."openai-bundled"]
-source = "/home/me/.codex"
-
-[projects."/w"] # 注
-trust_level = "trusted"
-`
-	out := string(filterCodexConfig([]byte(src)))
-	for _, keep := range []string{`model = "keep"`, `developer_instructions = """`,
-		`[projects."/in-a-string"]`, "[mcp_servers.keep]", `["nested"],`, `"[projects.fake]",`,
-		`env = { A = "[b]" }`} {
-		if !strings.Contains(out, keep) {
-			t.Fatalf("残すはずの %q を落とした:\n%s", keep, out)
-		}
-	}
-	for _, gone := range []string{"trust_level", "from-vaults", `"/z"`, `"/q"`, "permissions",
-		"x = 1", "openai-bundled", "/home/me/.codex"} {
-		if strings.Contains(out, gone) {
-			t.Fatalf("落とすはずの %q が残っている:\n%s", gone, out)
-		}
-	}
-}
-
-// ---------------------------------------------------------------- codex の outer gate の指摘
-
-// **許した場所の外で走らせようとする承認は、見せずに断る**（指摘 4）。
-func TestACommandApprovalOutsideTheAllowedPlaceIsDeclined(t *testing.T) {
+// **起こした場所の外で走らせようとする承認は、断らずに印を付けて見せる**（D-030。決めるのは本人）。
+func TestACommandApprovalOutsideTheStartPlaceIsShownWithAMark(t *testing.T) {
 	db := newDB(t)
 	s, _, logPath := wireCodex(t, db, "CAMP_FAKE_CODEX_ASKCWD=/etc")
 	rec := startCodexHere(t, s, db)
 	codexNoErr(t, s.Input(rec.ID, "ask"))
-	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if len(pending(t, s, rec.ID)) != 0 || decisions(t, logPath)["0"] != "decline" {
-		t.Fatal("許した場所の外で走る承認を画面に出した")
+	waitFor(t, 5*time.Second, func() bool { return len(pending(t, s, rec.ID)) == 1 })
+	w, _ := s.Waiting(rec.ID)
+	if !strings.Contains(w[0].Detail, `"outside":true`) {
+		t.Fatalf("起こした場所の外なのに印が無い: %s", w[0].Detail)
 	}
-	if !auditHas(t, db, "session.frame", "許した場所の外") {
-		t.Fatal("断った理由が監査に無い")
+	codexNoErr(t, s.Approve(rec.ID, w[0].RequestID, "allow", ""))
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if decisions(t, logPath)["0"] != "accept" {
+		t.Fatal("許したのに届いていない")
 	}
 }
 
-// 何を・どこで・どのスレッドで、が揃わない承認は出さない。
+// 何を・どこで・どのスレッドで、が揃わない承認は出さない。外なら印を付けて出す。
 func TestACommandApprovalMustSayWhatWhereAndWhichThread(t *testing.T) {
 	cs := newCodexState()
 	cs.thread, cs.root = "t", "/w"
 	for name, params := range map[string]string{
-		"command 無し":   `{"threadId":"t","cwd":"/w"}`,
-		"command が空":   `{"threadId":"t","cwd":"/w","command":" "}`,
-		"cwd 無し":       `{"threadId":"t","command":"x"}`,
-		"cwd が相対":      `{"threadId":"t","command":"x","cwd":"w"}`,
-		"外（.. で抜ける）": `{"threadId":"t","command":"x","cwd":"/w/../etc"}`,
-		"別のスレッド":      `{"threadId":"u","command":"x","cwd":"/w"}`,
+		"command 無し": `{"threadId":"t","cwd":"/w"}`,
+		"command が空": `{"threadId":"t","cwd":"/w","command":" "}`,
+		"cwd 無し":     `{"threadId":"t","command":"x"}`,
+		"cwd が相対":    `{"threadId":"t","command":"x","cwd":"w"}`,
+		"別のスレッド":     `{"threadId":"u","command":"x","cwd":"/w"}`,
 	} {
 		ev := cs.classify([]byte(`{"id":1,"method":"item/commandExecution/requestApproval","params":` + params + `}`))
 		if ev.ask != nil || !strings.Contains(joined(ev.replies), "decline") {
 			t.Fatalf("%s の承認を画面に出した", name)
 		}
 	}
-	ev := cs.classify([]byte(`{"id":2,"method":"item/commandExecution/requestApproval","params":` +
-		`{"threadId":"t","command":"x","cwd":"/w/sub"}}`))
-	if ev.ask == nil {
-		t.Fatalf("揃った承認を断った: %s", ev.err)
+	for cwd, outside := range map[string]bool{"/w/sub": false, "/w/../etc": true} {
+		ev := cs.classify([]byte(`{"id":2,"method":"item/commandExecution/requestApproval","params":` +
+			`{"threadId":"t","command":"x","cwd":"` + cwd + `"}}`))
+		if ev.ask == nil {
+			t.Fatalf("%s の揃った承認を断った: %s", cwd, ev.err)
+		}
+		if got := strings.Contains(string(ev.ask.Detail), `"outside":true`); got != outside {
+			t.Fatalf("%s: 外の印=%v（%v のはず）", cwd, got, outside)
+		}
 	}
 }
 
-// **scope に残ったものを数えて止める。止め切れなければ数を返す**（指摘 1）。
+// ---------------------------------------------------------------- 後始末（Phase 3.6 の outer gate の指摘 1）
+
+// **scope に残ったものを数えて止める。止め切れなければ数を返す。**
 func TestLeftoversInTheScopeAreStoppedAndCounted(t *testing.T) {
 	// 本当に止まるもの。
 	sleeper := exec.Command("sleep", "60")
@@ -919,3 +814,6 @@ func TestAnExitWithLeftoversIsNotRecordedAsFinished(t *testing.T) {
 		}
 	}
 }
+
+// filepath を使っている箇所（テストの中で置き場を作る）が残っているかの確かめ用。
+var _ = filepath.Join

@@ -155,10 +155,23 @@ func (a *Agent) startRemote(m Msg) {
 		fail(fmt.Sprintf("許した場所（%s）の外を渡された: %s", root, cwd))
 		return
 	}
-	if err := validClaudePath(spec.Claude); err != nil {
+	if err := validAgentPath(spec.Bin); err != nil {
 		fail(err.Error())
 		return
 	}
+	// **向こうでも駆動器で起こす**（M42）。探す名前・置き場・引数は駆動器が持ち、sh には書かない。
+	agent, perm := agentOr(m.Agent), permOr(m.Perm)
+	d, ok := drivers[agent]
+	if !ok || !d.Info().Remote {
+		fail(fmt.Sprintf("%s は向こうのホストで起こせない", agent))
+		return
+	}
+	args, err := d.Argv(perm)
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	rl := d.RemoteLaunch()
 
 	// **許したときと同じ先か。** 違えば繋がない——繋いだ時点で、向こうの
 	// ログインシェルが走る。
@@ -177,16 +190,23 @@ func (a *Agent) startRemote(m Msg) {
 		return
 	}
 
-	claude, unit := spec.Claude, "-"
-	if claude == "" {
-		claude = "-"
+	bin, unit := spec.Bin, "-"
+	if bin == "" {
+		bin = "-"
 	}
 	if a.Scope {
 		unit = scopeName(m.Session)
 	}
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
 	nonce := newID()
-	cmd := exec.Command(a.SSH, a.sshArgs("--", spec.Alias,
-		remoteCommand(wrapperScript, cwd, root, claude, unit, nonce))...)
+	wargs := append([]string{cwd, root, rl.Name, bin, dash(rl.HomeEnv), dash(rl.HomeDefault), unit, nonce,
+		m.Session}, args...)
+	cmd := exec.Command(a.SSH, a.sshArgs("--", spec.Alias, remoteCommand(wrapperScript, wargs...))...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		fail(err.Error())
@@ -243,6 +263,7 @@ func (a *Agent) startRemote(m Msg) {
 		return
 	}
 	o := h.owner
+	o.Session = m.Session
 	// 向こうの sh が確かめているが、名乗りも照らす。
 	if !under(o.Cwd, o.Root) {
 		a.reapRemote(&o)
@@ -252,8 +273,15 @@ func (a *Agent) startRemote(m Msg) {
 		return
 	}
 
+	var homes []string
+	for _, h := range []string{o.Home, o.HomeReal} {
+		if h != "" {
+			homes = append(homes, h)
+		}
+	}
 	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
-		pending: map[string]chan []byte{}, remote: &o}
+		pending: map[string]chan []byte{}, remote: &o, name: agent,
+		conv: d.Open(OpenOpts{Session: m.Session, Perm: perm, Cwd: o.Cwd, Remote: true, RemoteHomes: homes})}
 	if lg, err := OpenLog(a.LogDir, m.Session); err == nil {
 		k.log = lg
 	} else {
@@ -262,19 +290,39 @@ func (a *Agent) startRemote(m Msg) {
 		a.send(Msg{T: MsgDropped, Session: m.Session, Token: m.Token, Dropped: -1,
 			Error: "落とし先を開けない: " + err.Error()})
 	}
+	// **話し始めるまでに時間を切る**（手元の start と同じ。手順の無い駆動器はすぐ戻る）。
+	// 諦めるときは向こうを先に止める（killChild）。
+	timer := time.AfterFunc(a.HeaderWait, func() { a.killChild(k) })
+	err = k.conv.Begin(BeginOpts{Scanner: sc, W: stdin, Record: func(kind string, line []byte) {
+		a.record(k, kind, line)
+	}})
+	if !timer.Stop() && err != nil {
+		err = fmt.Errorf("%v 待っても話し始められない（%v）", a.HeaderWait, err)
+	}
+	if err != nil {
+		a.reapRemote(&o)
+		syscall.Kill(-pid, syscall.SIGTERM)
+		cmd.Wait()
+		if k.log != nil {
+			k.log.Close()
+		}
+		fail(err.Error())
+		return
+	}
 	a.mu.Lock()
 	a.kids[m.Session] = k
 	wanted, wasAsked := a.stopWanted[m.Session]
 	delete(a.stopWanted, m.Session)
 	a.mu.Unlock()
 
-	a.send(Msg{T: MsgStarted, Session: m.Session, Token: m.Token,
-		PID: pid, Started: st, BootID: BootID(), RemoteOwner: &o})
+	a.send(Msg{T: MsgStarted, Session: m.Session, Token: m.Token, Agent: agent,
+		PID: pid, Started: st, BootID: BootID(), RemoteOwner: &o, Perm: perm,
+		ClaudeID: k.conv.SessionID()})
 	if wasAsked {
 		go a.stop(Msg{Session: m.Session, Token: m.Token, Mode: wanted})
 	}
 
-	go a.drainScanner(k, sc)
+	go a.drainConv(k, sc)
 
 	err = cmd.Wait()
 	code, reason := exitOf(err)
@@ -350,11 +398,16 @@ func (a *Agent) reapRemote(o *RemoteOwner) (string, string) {
 	if campScopeRe.MatchString(o.Scope) {
 		scope = o.Scope
 	}
+	// しるし（セッション id）。**自分で作った形しか通さない**（向こうの grep に渡る）。
+	sess := "-"
+	if sessionIDRe.MatchString(o.Session) {
+		sess = o.Session
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), a.ReapWait)
 	defer cancel()
 	tb := &tailBuf{max: 2048}
 	cmd := exec.CommandContext(ctx, a.SSH, a.sshArgs("--", o.Host,
-		remoteCommand(reapScript, strconv.Itoa(o.PID), st, boot, scope))...)
+		remoteCommand(reapScript, strconv.Itoa(o.PID), st, boot, scope, sess))...)
 	cmd.Stderr = tb
 	out, _ := cmd.Output()
 	res, detail := parseReap(string(out))

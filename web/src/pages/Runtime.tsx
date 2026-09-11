@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api, type Destination, type Pinned, type RuntimeSession } from '../api'
+import { api, type AgentInfo, type Destination, type Pinned, type RuntimeSession } from '../api'
 import { Empty, Failed, Loading, short, useAsync } from '../ui'
 
 // Camp が起こしたセッションの一覧と、新しく起こす口。
@@ -26,15 +26,23 @@ export default function Runtime() {
 
   const [cwd, setCwd] = useState('')
   const [host, setHost] = useState('')
-  const [agent, setAgent] = useState('claude')
+  const [agent, setAgent] = useState('')
+  const [perm, setPerm] = useState('cli')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+  // 起こせるエージェントは実行面が名乗り、API が並べる。**画面は名前を決め打ちしない**（D-031）。
+  const agents = list.data?.agents ?? []
+  const chosen = agents.find((a) => a.name === agent) ?? agents[0]
+  const localOnly = !!chosen && !chosen.remote
+  // 確認の度合いは、そのエージェントが名乗ったものから選ぶ（向こうのホストでも同じ。M42）。
+  const perms = chosen?.perms ?? ['cli']
+  const chosenPerm = perms.includes(perm) ? perm : 'cli'
 
   const start = async () => {
     setErr('')
     setBusy(true)
     try {
-      await api.runtimeStart(cwd, host, agent)
+      await api.runtimeStart(cwd, localOnly ? '' : host, chosen?.name ?? '', chosenPerm)
       setCwd('')
       setN((v) => v + 1)
     } catch (e) {
@@ -76,7 +84,7 @@ export default function Runtime() {
       </div>
 
       {tab === 'allow' && <Allowlist reload={() => setN((v) => v + 1)} rows={allow} hosts={hosts} />}
-      {tab === 'ssh' && <SSHLedger />}
+      {tab === 'ssh' && <SSHLedger agents={agents} />}
       {tab === 'ended' && (
         <Ended kind={sp.get('kind') ?? ''} before={sp.get('before') ?? ''} set={set} />
       )}
@@ -91,22 +99,27 @@ export default function Runtime() {
           )}
 
           <form className="filters" onSubmit={(e) => { e.preventDefault(); void start() }}>
-            <select value={agent} aria-label="どのエージェントで起こすか"
+            <select value={chosen?.name ?? ''} aria-label="どのエージェントで起こすか"
+              disabled={agents.length === 0}
               onChange={(e) => {
                 setAgent(e.target.value)
-                // Codex はまだこのマシンだけ（向こうのホストは後のタスク）。
-                if (e.target.value === 'codex') setHost('')
+                // 向こうのホストで起こせないエージェントなら、選んでいたホストを外す。
+                if (!agents.find((a) => a.name === e.target.value)?.remote) setHost('')
               }}>
-              <option value="claude">Claude Code</option>
-              <option value="codex">Codex</option>
+              {agents.length === 0 && <option value="">（起こせるエージェントが無い）</option>}
+              {agents.map((a) => <option key={a.name} value={a.name}>{a.label}</option>)}
             </select>
-            <select value={host} onChange={(e) => setHost(e.target.value)} aria-label="どこで起こすか"
-              disabled={agent === 'codex'}
-              title={agent === 'codex' ? 'Codex はまだこのマシンだけで起こせる' : undefined}>
+            <select value={localOnly ? '' : host} onChange={(e) => setHost(e.target.value)}
+              aria-label="どこで起こすか" disabled={localOnly}
+              title={localOnly ? `${chosen.label} はまだこのマシンだけで起こせる` : undefined}>
               <option value="">このマシン</option>
               {startable.map((d) => (
                 <option key={d.alias} value={d.alias}>{d.alias}（{pinLabel(d.pinned)}）</option>
               ))}
+            </select>
+            <select value={chosenPerm} onChange={(e) => setPerm(e.target.value)}
+              aria-label="確認の度合い">
+              {perms.map((p) => <option key={p} value={p}>{permLabel(p)}</option>)}
             </select>
             <input
               type="text"
@@ -115,7 +128,7 @@ export default function Runtime() {
                 : '起こす場所（許可リストの中の絶対パス）'}
               value={cwd} onChange={(e) => setCwd(e.target.value)} style={{ minWidth: '24rem' }}
             />
-            <button disabled={busy || !cwd || !list.data?.agent_connected}>起こす</button>
+            <button disabled={busy || !cwd || !list.data?.agent_connected || !chosen}>起こす</button>
           </form>
           {err && <Failed error={err} />}
 
@@ -126,7 +139,8 @@ export default function Runtime() {
             <table>
               <thead>
                 <tr>
-                  <th className="nowrap">状態</th><th className="nowrap">エージェント</th><th>場所</th>
+                  <th className="nowrap">状態</th><th className="nowrap">エージェント</th>
+                  <th className="nowrap">確認の度合い</th><th>場所</th>
                   <th className="nowrap">起こした時刻</th><th className="num">pid</th>
                 </tr>
               </thead>
@@ -139,7 +153,8 @@ export default function Runtime() {
                           リンクにする。 */}
                       <Link to={`/runtime/${s.id}`}><StateBadge state={s.state} /></Link>
                     </td>
-                    <td className="nowrap">{agentLabel(s.agent)}</td>
+                    <td className="nowrap">{s.agent_label ?? s.agent ?? ''}</td>
+                    <td className="nowrap">{permLabel(s.perm)}</td>
                     <td className="mono wrap">
                       <Link to={`/runtime/${s.id}`}>{where(s)}</Link>
                     </td>
@@ -156,9 +171,16 @@ export default function Runtime() {
   )
 }
 
-// agentLabel はエージェントの名前。**無ければ Claude Code**（2026-09-11 より前の行）。
-export function agentLabel(a?: string): string {
-  return a === 'codex' ? 'Codex' : 'Claude Code'
+// 確認の度合いの名前。**エージェントによらない Camp の語**（エージェントごとの渡し方の違いは、
+// 駆動器の説明に出る）。
+const PERM_LABEL: Record<string, string> = {
+  cli: 'CLI と同じ', ask: '毎回訊く', edits: '編集は訊かない', auto: '自動で判断', full: '全部任せる',
+  legacy: 'Phase 3.6 の専用の置き場',
+}
+
+// permLabel は確認の度合いの名前。**無ければ CLI と同じ**（2026-09-12 より前の行。台帳も cli で埋まる）。
+export function permLabel(p?: string): string {
+  return PERM_LABEL[p || 'cli'] ?? p ?? ''
 }
 
 // where は起こした場所。向こうなら `host:/path`。
@@ -389,13 +411,17 @@ function Allowlist({ rows, reload, hosts }: {
   )
 }
 
-function SSHLedger() {
+function SSHLedger({ agents }: { agents: AgentInfo[] }) {
   const [n, setN] = useState(0)
   const rows = useAsync(() => api.sshHosts(), [n])
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
   const [ca, setCa] = useState('')
+  const [cg, setCg] = useState('')
   const [cp, setCp] = useState('')
+  // どのエージェントの場所か。選択肢は API の agents から（名前を決め打ちしない）。
+  const agent = cg || agents[0]?.name || ''
+  const labelOf = (name: string) => agents.find((a) => a.name === name)?.label ?? name
 
   const run = async (fn: () => Promise<unknown>) => {
     setErr('')
@@ -424,16 +450,21 @@ function SSHLedger() {
           onChange={(e) => setPw(e.target.value)} autoComplete="current-password" />
       </form>
       <form className="filters" onSubmit={(e) => e.preventDefault()}>
-        <select value={ca} onChange={(e) => setCa(e.target.value)} aria-label="claude の場所を書く先">
-          <option value="">claude の場所を書く先</option>
+        <select value={ca} onChange={(e) => setCa(e.target.value)} aria-label="実体の場所を書く接続先">
+          <option value="">実体の場所を書く接続先</option>
           {(Array.isArray(rows.data) ? rows.data : []).map((d) => (
             <option key={d.alias} value={d.alias}>{d.alias}</option>
           ))}
         </select>
-        <input type="text" placeholder="向こうの claude の絶対パス（空なら向こうで探す）" value={cp}
+        <select value={agent} onChange={(e) => setCg(e.target.value)} aria-label="どのエージェントの場所か"
+          disabled={agents.length === 0}>
+          {agents.length === 0 && <option value="">（実行面が名乗っていない）</option>}
+          {agents.map((a) => <option key={a.name} value={a.name}>{a.label}</option>)}
+        </select>
+        <input type="text" placeholder="向こうの実体の絶対パス（空なら向こうで探す）" value={cp}
           onChange={(e) => setCp(e.target.value)} style={{ minWidth: '18rem' }} />
-        <button disabled={!ca || !pw}
-          onClick={() => void run(() => api.sshClaude(ca, cp, pw))}>書く</button>
+        <button disabled={!ca || !pw || !agent}
+          onClick={() => void run(() => api.sshPath(ca, agent, cp, pw))}>書く</button>
       </form>
       {err && <Failed error={err} />}
       {rows.loading && <Loading />}
@@ -445,7 +476,7 @@ function SSHLedger() {
           <thead>
             <tr>
               <th className="nowrap">許可</th><th>エイリアス</th><th>接続先</th>
-              <th className="nowrap">固定した行き先</th><th className="nowrap">claude</th>
+              <th className="nowrap">固定した行き先</th><th className="nowrap">実体の場所</th>
               <th className="nowrap">Tailscale</th><th>覚え書き</th>
             </tr>
           </thead>
@@ -471,7 +502,11 @@ function SSHLedger() {
                       : <span className="muted">—</span>}
                 </td>
                 <td className="mono" style={{ overflowWrap: 'anywhere', minWidth: '10rem' }}>
-                  {d.claude_path || <span className="muted">探す</span>}
+                  {Object.keys(d.agent_paths ?? {}).length === 0
+                    ? <span className="muted">探す</span>
+                    : Object.entries(d.agent_paths ?? {}).map(([a, p]) => (
+                      <div key={a}>{labelOf(a)}: {p}</div>
+                    ))}
                 </td>
                 <td className="mono muted">{d.tailscale_ip}</td>
                 <td>{d.note}</td>

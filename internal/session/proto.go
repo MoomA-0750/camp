@@ -92,6 +92,13 @@ type Msg struct {
 	Agent string `json:"agent,omitempty"`
 	// Agents は実行面が起こせるエージェント（hello）。空なら claude だけ（古い実行面）。
 	Agents []string `json:"agents,omitempty"`
+	// Drivers はその駆動器の説明（hello）。**Agents とは別の欄にしてある**——古い campd・古い
+	// 実行面と hello が読めなくならないように（Fable の設計レビュー）。名乗らない実行面の分は
+	// campd が手元の駆動器から補い、確認の度合いは cli だけとみなす。
+	Drivers []AgentInfo `json:"drivers,omitempty"`
+	// Perm は確認の度合い。start で頼み、started で実行面が「こう起こした」と名乗る。
+	// **空は cli と読む**（Phase 3.7 より前の実行面は名乗らない）。
+	Perm string `json:"perm,omitempty"`
 
 	// frame（実行面 → campd）: 駆動器が畳んだ意味。**種類の文字列を campd が読み分けない**
 	// （Claude の result と Codex の turn/completed を、どちらも TurnEnd で伝える）。
@@ -99,10 +106,16 @@ type Msg struct {
 	Ask     bool `json:"ask,omitempty"` // 承認の要求。ReqID・Text（工具）・Frame（中身）を添える
 	// Interrupted は中断でターンが終わった（Codex）。**走っていた工具は残りうる。**
 	Interrupted bool `json:"interrupted,omitempty"`
+	// Note は止めずに記録するだけの一言（frame）。設定が途中で変わった等。**監査にはエラーでなく
+	// 記録として残す**（2026-09-12、本人: 途中の変化は止めずに見せる）。
+	Note string `json:"note,omitempty"`
 	// Withdrawn は ReqID の承認が、答えを待つものではなくなった（Codex）。実行面が断った
 	// （訊いたあとで差分が変わった）・Codex 側で片付いた・答えが子へ届かなかった。
 	// **campd の台帳を「待っている」のまま残さない**（Fable の実装後レビュー 2）。
 	Withdrawn bool `json:"withdrawn,omitempty"`
+	// Halt は、頼んだ確認の度合いで起きていなかった（frame。理由は Error）。**campd は孫まで止めて
+	// 「起こせなかった」と書く**（起こしたときに1回だけ照らす。途中の変化は Note で記録するだけ）。
+	Halt bool `json:"halt,omitempty"`
 }
 
 // HeldAsk は実行面が抱えている、まだ答えていない承認1つ。
@@ -219,8 +232,11 @@ const (
 	// 上限は運用で下げられるが、既定は控えめにする。
 	defaultMaxConcurrent = 4
 
-	idleTimeout = 30 * time.Minute // 何も来なくなってから
-	turnTimeout = 60 * time.Minute // 1ターンが終わらない
+	// **放置とターンの長さで Camp から止めない**（D-030、本人の決定 2026-09-12）。
+	// CLI のセッションは開けっぱなしにでき、auto mode の1ターンは1時間を超える。
+	// 0 は「見ない」。運用で入れたければ Supervisor.IdleAfter・TurnAfter に長さを入れる。
+	idleTimeout = 0                // 何も来なくなってから（0 = 閉じない）
+	turnTimeout = 0                // 1ターンが終わらない（0 = 止めない）
 	startGrace  = 60 * time.Second // started が返ってこない
 	stopGrace   = 2 * time.Minute  // 止めろと言ったのに止まらない
 

@@ -45,14 +45,90 @@ type agentConn struct {
 	// agents はこの実行面が起こせるエージェント（hello で名乗る）。
 	// **名乗らない古い実行面は claude だけ。** Codex を頼むと claude が起きてしまう（Fable 7）。
 	agents []string
+	// infos は hello で名乗った駆動器の説明。
+	infos map[string]AgentInfo
 }
 
-// can は agent を起こせる実行面か。
-func (a *agentConn) can(agent string) bool {
+// announced は hello で名乗った起こせる名前か。**名乗らない古い実行面は claude だけ。**
+func (a *agentConn) announced(agent string) bool {
 	if len(a.agents) == 0 {
 		return agent == AgentClaude
 	}
 	return contains(a.agents, agent)
+}
+
+// can は agent を起こせる実行面か。
+//
+// **駆動器を名乗らない実行面（Phase 3.7 より前）には claude しか頼まない。** Phase 3.6 の実行面は
+// codex を名乗るが、Codex を専用の置き場で approvalPolicy untrusted 固定のまま起こす。それを
+// 「CLI と同じ」として台帳に書いてしまう（started の perm も空で返るので照らしても気づけない）。
+// claude は古い実行面でも本人の設定のまま起こすので、cli として扱ってよい。
+func (a *agentConn) can(agent string) bool {
+	if !a.announced(agent) {
+		return false
+	}
+	if _, named := a.infos[agent]; !named {
+		return agent == AgentClaude
+	}
+	return true
+}
+
+// info はその実行面での agent の説明。**駆動器を名乗らない古い実行面の claude は、手元の駆動器から
+// 補い、確認の度合いは cli だけとみなす**——古い実行面は perm を読まずに本人の設定のまま起こす
+// （claude 以外は can が断る）。
+func (a *agentConn) info(agent string) (AgentInfo, bool) {
+	if !a.can(agent) {
+		return AgentInfo{}, false
+	}
+	d, ok := drivers[agent]
+	if !ok {
+		return AgentInfo{}, false
+	}
+	if in, named := a.infos[agent]; named {
+		return in, true
+	}
+	local := d.Info()
+	local.Perms = []string{PermCLI}
+	return local, true
+}
+
+// leavesTools は、中断でターンが終わっても走っていた工具が残るエージェントか。
+//
+// **起こせるかどうかと切り離して見る**——引き取り直した子は、いまの実行面が起こせない
+// エージェントのこともある。どちらか（手元の駆動器・実行面の名乗り）が残ると言えば残るとみなす
+// （止めすぎるほうへ倒す）。
+func (a *agentConn) leavesTools(agent string) bool {
+	if d, ok := drivers[agent]; ok && d.Info().InterruptLeavesTools {
+		return true
+	}
+	return a.infos[agent].InterruptLeavesTools
+}
+
+// canPerm は agent を確認の度合い perm で起こせる実行面か。
+func (a *agentConn) canPerm(agent, perm string) bool {
+	in, ok := a.info(agent)
+	return ok && contains(in.Perms, perm)
+}
+
+// namedInfos は hello の Drivers から、知っている駆動器・知っている度合いだけを採る。
+func namedInfos(a *agentConn, ds []AgentInfo) map[string]AgentInfo {
+	out := map[string]AgentInfo{}
+	for _, d := range ds {
+		// **can ではなく announced で見る。** can は「駆動器を名乗ったか」を見るので、
+		// いま組み立てている最中の infos を参照してしまう。
+		if !validAgent(d.Name) || !a.announced(d.Name) {
+			continue
+		}
+		perms := []string{}
+		for _, p := range d.Perms {
+			if validPerm(p) {
+				perms = append(perms, p)
+			}
+		}
+		d.Perms = perms
+		out[d.Name] = d
+	}
+	return out
 }
 
 func (a *agentConn) send(m Msg) error {
@@ -187,6 +263,7 @@ func (c *Control) handle(conn net.Conn) {
 		return
 	}
 	a.agents = hello.Agents
+	a.infos = namedInfos(a, hello.Drivers)
 	c.s.agent = a
 	c.s.mu.Unlock()
 
@@ -430,7 +507,13 @@ func (c *Control) reapOrphans(a *agentConn) {
 	}
 }
 
+// dispatchHook はテストが campd に届いた Msg の列を採るための口（golden_test.go）。本番では nil。
+var dispatchHook func(Msg)
+
 func (c *Control) dispatch(a *agentConn, m Msg) {
+	if dispatchHook != nil {
+		dispatchHook(m)
+	}
 	s := c.s
 	switch m.T {
 	case MsgStarted:
@@ -478,10 +561,16 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		// **頼んだエージェントが起きたか。** 古い実行面は agent を読まずに claude を起こす
 		// （Fable 7）。台帳と違うものを走らせたままにしない。
 		s.mu.Lock()
-		host, want := ls.rec.Host, agentOr(ls.rec.Agent)
+		host, want, wantPerm := ls.rec.Host, agentOr(ls.rec.Agent), permOr(ls.rec.Perm)
 		s.mu.Unlock()
+		why := ""
 		if got := agentOr(m.Agent); got != want {
-			why := fmt.Sprintf("%s を頼んだのに %s が起きた", want, got)
+			why = fmt.Sprintf("%s を頼んだのに %s が起きた", want, got)
+		} else if got := permOr(m.Perm); got != wantPerm {
+			// **頼んだ確認の度合いで起きたか。** 違う度合いで走らせたままにしない。
+			why = fmt.Sprintf("確認の度合い %s を頼んだのに %s で起きた", wantPerm, got)
+		}
+		if why != "" {
 			_ = a.send(Msg{T: MsgStop, Session: m.Session, Token: m.Token, Mode: StopTerminate})
 			s.audit(m.Session, "session.started", strconv.Itoa(m.PID), why, audit.Denied)
 			s.fail(m.Session, why, EndStartFailed)
@@ -524,13 +613,29 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		ls.last = s.Now()
 		s.mu.Unlock()
 
-		_ = setOwner(s.db, m.Session, o, m.Scope)
+		// **idle にするのは最後。** setOwner が state を idle にするので、先に書くと、
+		// 台帳を読んだ者が「起きた」のに向こうの pid やセッション id がまだ無い行を見る
+		// （2026-09-12、並列度を下げたテストで実測。セッション id の書き込みを間に足して窓が広がった）。
+		// **書けなかったら言う。** 台帳に持ち主が残らないと、campd を入れ替えたあとに
+		// 引き取り直せず、向こうの残りも始末できない（codex exec のレビュー、2026-09-12）。
 		if m.ClaudeID != "" {
 			// Codex は話し始める前にスレッド id が決まっている。
-			_ = setClaudeID(s.db, m.Session, m.ClaudeID)
+			if err := setClaudeID(s.db, m.Session, m.ClaudeID); err != nil {
+				s.audit(m.Session, "session.started", host,
+					"エージェントのセッション id を台帳に書けない: "+err.Error(), audit.Error)
+			}
 		}
 		if ro != nil {
-			_ = setRemote(s.db, m.Session, *ro)
+			if err := setRemote(s.db, m.Session, *ro); err != nil {
+				s.audit(m.Session, "session.started", host,
+					"向こうの持ち主を台帳に書けない: "+err.Error(), audit.Error)
+			}
+		}
+		if err := setOwner(s.db, m.Session, o, m.Scope); err != nil {
+			s.audit(m.Session, "session.started", host,
+				"持ち主を台帳に書けない: "+err.Error(), audit.Error)
+		}
+		if ro != nil {
 			s.auditFromAgent(m.Session, "session.started", host,
 				fmt.Sprintf("向こうの pid %d（scope=%s）", ro.PID, ro.Scope), audit.OK)
 		}
@@ -555,10 +660,10 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 				ls.rec.State = StateIdle
 				idle = true
 			}
-			// **Codex の中断は効くが、走っていた工具は残る**（実測）。ターンが長すぎて
-			// Camp が中断を投げ、それで終わったなら、続けて止める。Claude の
-			// 「中断が効かなければ止める」には届かないので（Fable 8）。
-			escalate = !ls.interrupted.IsZero() && agentOr(ls.rec.Agent) == AgentCodex
+			// **中断は効くが、走っていた工具は残る**エージェントがある（Codex。実測）。ターンが
+			// 長すぎて Camp が中断を投げ、それで終わったなら、続けて止める。「中断が効かなければ
+			// 止める」には届かないので（Fable 8）。どのエージェントかは駆動器の説明で決める。
+			escalate = !ls.interrupted.IsZero() && a.leavesTools(agentOr(ls.rec.Agent))
 			ls.turn = time.Time{}
 			ls.interrupted = time.Time{}
 		}
@@ -576,9 +681,18 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		if isAsk {
 			s.recordAsk(m)
 		}
+		if m.Note != "" {
+			// 止めずに記録する（設定が途中で変わった等）。エラーではない。枠の中で。
+			s.auditFromAgent(m.Session, "session.note", m.Kind, m.Note, audit.OK)
+		}
 		if m.Withdrawn && m.ReqID != "" {
 			// 実行面が取り下げた承認を、待っているまま残さない。
 			s.withdrawAsk(m)
+		} else if m.Halt {
+			// **頼んだ確認の度合いで起きていない。** 違う度合いで走らせたままにしない（起こしたときに
+			// 1回だけ照らす。本人の決定）。孫まで止めて「起こせなかった」と書く。
+			s.audit(m.Session, "session.perm", m.Kind, m.Error, audit.Denied)
+			_ = s.stop(m.Session, StopTerminate, EndStartFailed)
 		} else if m.Error != "" {
 			// 断った・方針が変わった・ターンが失敗した。**黙って流さない。**
 			// 実行面が何度でも起こせるので枠の中で。
@@ -586,7 +700,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 		}
 		if escalate {
 			s.audit(m.Session, "session.timeout", StopTerminate,
-				"中断でターンは終わったが、Codex は走っていた工具を残すので止める", audit.Timeout)
+				"中断でターンは終わったが、このエージェントは走っていた工具を残すので止める", audit.Timeout)
 			_ = s.stop(m.Session, StopTerminate, EndTurnTimeout)
 		}
 

@@ -85,8 +85,8 @@ func fakeCodexMain() {
 			"threadId": thread, "turnId": turnID, "itemId": item, "startedAtMs": 1,
 			// cwd は本物と同じくスレッドの作業場所（CAMP_FAKE_CODEX_ASKCWD で外を指せる）。
 			"kind": "command", "command": cmd,
-			"cwd": env("CAMP_FAKE_CODEX_ASKCWD", os.Getenv("CAMP_FAKE_CODEX_THREADCWD")),
-			"commandActions":    []any{map[string]any{"type": "unknown", "command": cmd}},
+			"cwd":                env("CAMP_FAKE_CODEX_ASKCWD", os.Getenv("CAMP_FAKE_CODEX_THREADCWD")),
+			"commandActions":     []any{map[string]any{"type": "unknown", "command": cmd}},
 			"availableDecisions": []any{"accept", "cancel"},
 		}, func(res json.RawMessage, e *rpcErr) {
 			var r struct {
@@ -160,10 +160,10 @@ func fakeCodexMain() {
 				continue
 			}
 			var p struct {
-				Cwd              string `json:"cwd"`
-				ApprovalPolicy   string `json:"approvalPolicy"`
+				Cwd               string `json:"cwd"`
+				ApprovalPolicy    string `json:"approvalPolicy"`
 				ApprovalsReviewer string `json:"approvalsReviewer"`
-				Sandbox          string `json:"sandbox"`
+				Sandbox           string `json:"sandbox"`
 			}
 			json.Unmarshal(m.Params, &p)
 			os.Setenv("CAMP_FAKE_CODEX_THREADCWD", p.Cwd) // 承認の cwd に使う
@@ -178,8 +178,8 @@ func fakeCodexMain() {
 					"writableRoots": []any{}, "networkAccess": false,
 					"excludeTmpdirEnvVar": false, "excludeSlashTmp": false},
 				"activePermissionProfile": nil,
-				"cwd":               env("CAMP_FAKE_CODEX_CWD", p.Cwd),
-				"model":             "fake",
+				"cwd":                     env("CAMP_FAKE_CODEX_CWD", p.Cwd),
+				"model":                   "fake",
 			})
 			notify("thread/started", map[string]any{"thread": map[string]any{"id": thread}})
 		case "turn/start":

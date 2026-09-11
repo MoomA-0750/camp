@@ -2276,7 +2276,7 @@ func cmdAgent(args []string) error {
 	claudeBin := fs.String("claude", defaultClaudeBin(), "claude の実体")
 	codexBin := fs.String("codex", defaultCodexBin(), "codex の実体（無ければ Codex は起こさない）")
 	codexHome := fs.String("codex-home", session.DefaultCodexHome(),
-		"Camp 専用の Codex の置き場（本人の ~/.codex とは別。起こすたびに設定を作り直す）")
+		"本人の Codex の置き場（CLI と同じ。Codex がここで起きたかを照らす。Camp は書き換えない）")
 	scope := fs.Bool("scope", true, "systemd の transient scope で包む（孫まで止めるため）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -2297,8 +2297,8 @@ func cmdAgent(args []string) error {
 	fmt.Printf("実行面    %s\nclaude    %s\nscope     %v\n落とし先  %s\n",
 		*sock, *claudeBin, *scope, a.LogDir)
 	if a.CanCodex() {
-		fmt.Printf("codex     %s（置き場 %s、道具とログインは %s から借りる）\n",
-			a.Codex, a.CodexHome, a.CodexSource)
+		fmt.Printf("codex     %s（本人の置き場 %s のまま。CLI と同じ設定で動く）\n",
+			a.Codex, a.CodexHome)
 	} else {
 		fmt.Printf("codex     起こさない（実体 %s が無いか、scope を使わない構成）\n", *codexBin)
 	}
@@ -2364,8 +2364,8 @@ func cmdRuntime(args []string) error {
 		if r.Host != "" {
 			where = r.Host + ":" + r.Cwd
 		}
-		fmt.Printf("%-10s %-9s %-6s pid=%-7d %s\n  cwd=%s\n",
-			firstN(r.ID, 8), r.State, r.Agent, r.PID, r.CreatedAt, where)
+		fmt.Printf("%-10s %-9s %-6s 度合い=%-6s pid=%-7d %s\n  cwd=%s\n",
+			firstN(r.ID, 8), r.State, r.Agent, r.Perm, r.PID, r.CreatedAt, where)
 		if r.Host != "" && r.RemotePID != 0 {
 			fmt.Printf("  向こうの pid=%d\n", r.RemotePID)
 		}
@@ -2530,8 +2530,13 @@ func cmdSSH(args []string) error {
 					fmt.Println("     **行き先（ホスト鍵）が固定されていない（起こせない）。画面から許し直す**")
 				}
 			}
-			if d.ClaudePath != "" {
-				fmt.Printf("     claude: %s\n", d.ClaudePath)
+			names := make([]string, 0, len(d.AgentPaths))
+			for a := range d.AgentPaths {
+				names = append(names, a)
+			}
+			sort.Strings(names)
+			for _, a := range names {
+				fmt.Printf("     %s: %s\n", a, d.AgentPaths[a])
 			}
 		}
 		fmt.Println("\n（許 = 許可済み。起こせるのは行き先を固定したものだけ）")

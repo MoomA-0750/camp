@@ -1,0 +1,44 @@
+[
+  {
+    "t": "started",
+    "agent": "codex",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "thread/started",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "response",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "turn/started",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "item/completed",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "request/item/permissions/requestApproval",
+    "agent_session_id": "thr-fake-1",
+    "error": "答えられない要求を断った: item/permissions/requestApproval"
+  },
+  {
+    "t": "frame",
+    "kind": "serverRequest/resolved",
+    "agent_session_id": "thr-fake-1"
+  },
+  {
+    "t": "frame",
+    "kind": "turn/completed",
+    "agent_session_id": "thr-fake-1",
+    "turn_end": true
+  }
+]

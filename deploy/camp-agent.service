@@ -28,10 +28,11 @@ RestartSec=10s
 
 # **DB には触らない。** 触る口をコードが持っていないことは
 # internal/session の TestTheExecutionSideHasNoWayToTouchTheDatabase で見ている。
-# ここでは念のため、開ける必要が無いものを開けなくしておく。
-NoNewPrivileges=yes
-PrivateTmp=yes
-UMask=0077
+#
+# **ここに縛りを足さない**（D-030、本人の決定 2026-09-12）。以前は NoNewPrivileges・PrivateTmp・
+# UMask=0077 を掛けていたが、そうすると Camp で起こしたエージェントは端末の CLI と違う環境で動く
+# ——sudo（setuid）が効かない・/tmp が別・作るファイルが 600。Camp は CLI の忠実なリモコンなので、
+# 守りはネットワーク（tailnet）と Camp のログインの層に任せる。
 
 [Install]
 WantedBy=default.target

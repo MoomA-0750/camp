@@ -24,8 +24,9 @@ type Agent struct {
 	Claude string // `claude` の実体
 	Scope  bool   // systemd の transient scope で包むか
 
-	// Command はテストで差し替える。既定は systemd-run で包んだ `claude`。
-	Command func(id, cwd string) *exec.Cmd
+	// Command は子を起こすコマンドを作る。argv は実体と駆動器の引数。既定は systemd-run の
+	// scope で包む。テストで差し替える。
+	Command func(agent, id string, argv []string) *exec.Cmd
 
 	// LogDir はフレームの落とし先。**子の隣**（本人のユーザーの領域）。
 	LogDir string
@@ -43,11 +44,10 @@ type Agent struct {
 	ReapRetry  time.Duration // 見に行けなかったとき、もう一度行くまで
 
 	// Codex（codex.go）。
-	Codex       string // codex の実体。空なら Codex は起こさない
-	CodexHome   string // Camp 専用の置き場（CODEX_HOME にする）
-	CodexSource string // 本人の置き場（道具とログインを借りる。**書かない**）
-	// CodexCommand はテストで差し替える。既定は systemd-run で包んだ `codex app-server`。
-	CodexCommand func(id string) *exec.Cmd
+	Codex string // codex の実体。空なら Codex は起こさない
+	// CodexHome は本人の Codex の置き場（CLI と同じ。$CODEX_HOME か ~/.codex）。
+	// Codex がここで起きたかを話し始める前に照らす。**Camp は書き換えない。**
+	CodexHome string
 	// CodexWithoutScope は scope 無しでも Codex を起こしてよいか。**テストの偽物のためだけ。**
 	CodexWithoutScope bool
 
@@ -89,19 +89,16 @@ type child struct {
 	// deliberate は Camp が止めに入ったか。**止めて ssh が 255 で終わったのを、
 	// 接続が切れたと読まないため。**
 	deliberate bool
-	// codex は Codex の子の状態（codex.go）。Claude の子なら nil。
-	codex *codexState
+	// conv は子との会話（conversation.go）。**子とはこれを通してしか話さない。**
+	conv Conversation
+	// name はエージェント。空は claude。
+	name string
 	// dropped は落とし先が溢れて捨てた数（最後に campd へ言った値）。
 	dropped int64
 }
 
 // agent は子のエージェント。
-func (k *child) agent() string {
-	if k.codex != nil {
-		return AgentCodex
-	}
-	return AgentClaude
-}
+func (k *child) agent() string { return agentOr(k.name) }
 
 // NewAgent は実行面を作る。Codex は Codex の実体を入れたときだけ起こせる。
 func NewAgent(sock, claude string) *Agent {
@@ -109,33 +106,27 @@ func NewAgent(sock, claude string) *Agent {
 		LogDir: DefaultLogDir(), SSHConfig: DefaultSSHConfig(),
 		SSH: "ssh", SSHKeygen: "ssh-keygen", SSHFile: os.Getenv("CAMP_SSH_CONFIG"),
 		HeaderWait: headerWait, ReapWait: reapWait, ReapRetry: 3 * time.Second,
-		CodexHome: DefaultCodexHome(), CodexSource: DefaultCodexSource(),
-		kids: map[string]*child{}, stopWanted: map[string]string{}}
+		CodexHome: DefaultCodexHome(),
+		kids:      map[string]*child{}, stopWanted: map[string]string{}}
 	a.Command = a.defaultCommand
-	a.CodexCommand = a.defaultCodexCommand
 	return a
 }
 
-// defaultCommand は `claude` を transient scope で包んで起こす。
+// defaultCommand は子を transient scope で包んで起こす。**環境は実行面のまま**（CLI と同じ設定・
+// 同じ置き場で動かす。D-030）。
 //
 // **孫まで数えて止めるため。** セッションはテスト・LSP・ssh を産む。
-// プロセスグループでは、自分で切り離した孫を取り逃がす。cgroup なら取り逃がさない。
-func (a *Agent) defaultCommand(id, cwd string) *exec.Cmd {
-	args := []string{
-		"-p",
-		"--input-format", "stream-json",
-		"--output-format", "stream-json",
-		"--verbose",
-		"--permission-prompt-tool", "stdio",
-	}
+// プロセスグループでは、自分で切り離した孫を取り逃がす。cgroup なら取り逃がさない
+// （Codex の子は別のプロセスグループ・別のセッションに居る。実測）。
+func (a *Agent) defaultCommand(_, id string, argv []string) *exec.Cmd {
 	if !a.Scope {
-		return exec.Command(a.Claude, args...)
+		return exec.Command(argv[0], argv[1:]...)
 	}
 	full := append([]string{
 		"--user", "--scope", "--quiet", "--collect",
 		"--unit", scopeName(id),
-		"--", a.Claude,
-	}, args...)
+		"--",
+	}, argv...)
 	return exec.Command("systemd-run", full...)
 }
 
@@ -157,11 +148,21 @@ func (a *Agent) Dial(version string) error {
 	// **起こせるエージェントも名乗る。** 名乗らないと、campd は Codex を頼んでよいか
 	// 分からない（古い実行面は claude を起こしてしまう）。
 	if err := a.send(Msg{T: MsgHello, Version: version, Held: a.held(),
-		Agents: a.agents()}); err != nil {
+		Agents: a.agents(), Drivers: a.driverInfos()}); err != nil {
 		c.Close()
 		return err
 	}
 	return nil
+}
+
+// driverInfos は起こせるエージェントの説明（hello で名乗る）。
+func (a *Agent) driverInfos() []AgentInfo {
+	names := a.agents()
+	out := make([]AgentInfo, 0, len(names))
+	for _, n := range names {
+		out = append(out, drivers[n].Info())
+	}
+	return out
 }
 
 // held はいま抱えている子の一覧。
@@ -188,9 +189,9 @@ func (a *Agent) held() []Held {
 		// 台帳は向こうの pid を知らないまま**になり、あとで始末できない（codex の指摘）。
 		h := Held{ID: id, Token: k.token, PID: pid, Started: st, BootID: BootID(),
 			Scope: k.scope, State: state, RemoteOwner: k.remote, Agent: k.agent()}
-		if k.codex != nil {
+		if k.conv != nil {
 			// **待っている承認も名乗る。** campd が居ない間に来たものは台帳に無い。
-			h.Waiting = k.codex.waiting()
+			h.Waiting = k.conv.Waiting()
 		}
 		out = append(out, h)
 	}
@@ -255,11 +256,16 @@ func (a *Agent) Run() error {
 		case MsgWelcome:
 			// 受理された。
 		case MsgStart:
-			switch agent := agentOr(m.Agent); {
-			case agent == AgentCodex && m.Remote == nil:
-				go a.startCodex(m)
-			case agent != AgentClaude:
-				// **知らないものを claude で代わりに起こさない。**
+			agent, perm := agentOr(m.Agent), permOr(m.Perm)
+			if d, ok := drivers[agent]; ok && !contains(d.Info().Perms, perm) {
+				// **頼まれた度合いで起こせないなら、別の度合いで代わりに起こさない。**
+				a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
+					Error: fmt.Sprintf("この実行面は %s を確認の度合い %s で起こせない", agent, perm)})
+				continue
+			}
+			switch {
+			case !validAgent(agent) || (m.Remote != nil && !drivers[agent].Info().Remote):
+				// **知らないものを claude で代わりに起こさない。** 向こうのホストで起こせるかは駆動器の説明で。
 				a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
 					Error: fmt.Sprintf("この実行面は %s を %s で起こせない", agent,
 						map[bool]string{true: "向こうのホスト", false: "このマシン"}[m.Remote != nil])})
@@ -268,10 +274,8 @@ func (a *Agent) Run() error {
 			default:
 				go a.start(m)
 			}
-		case MsgInput:
-			a.toChild(m, userFrame(m.Text))
-		case MsgApprove:
-			a.toChild(m, approveFrame(m.ReqID, m.Behavior, m.Text))
+		case MsgInput, MsgApprove:
+			a.toChild(m)
 		case MsgStop:
 			go a.stop(m)
 		case MsgReap:
@@ -317,187 +321,6 @@ func (a *Agent) send(m Msg) error {
 	defer a.enc.Unlock()
 	_, err = a.conn.Write(append(b, '\n'))
 	return err
-}
-
-// start は子を起こす。
-func (a *Agent) start(m Msg) {
-	// **campd 側でも照合しているが、ここでも見る。** 境界として数えるのは
-	// campd 側だけ（同じユーザーで動く以上、ここの検査は迂回できる）。
-	// それでも、campd の取り違えをそのまま実行しないだけの価値はある。
-	real, err := resolveCwd(m.Cwd)
-	if err != nil {
-		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token, Error: err.Error()})
-		return
-	}
-	if m.Root == "" || !under(real, m.Root) {
-		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
-			Error: fmt.Sprintf("許した場所（%s）の外を渡された: %s", m.Root, real)})
-		return
-	}
-	cmd := a.Command(m.Session, real)
-	cmd.Dir = real
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token, Error: err.Error()})
-		return
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token, Error: err.Error()})
-		return
-	}
-	cmd.Stderr = os.Stderr
-	// scope を使わない場合でも、せめて自分のプロセスグループから切る。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token, Error: err.Error()})
-		return
-	}
-	pid := cmd.Process.Pid
-	st, _ := Starttime(pid)
-
-	// **照合したパスと、実際に降りた場所が同じか。**
-	//
-	// 照合してから exec するまでの間に、ディレクトリを rename や symlink で
-	// 差し替えられると、同じ文字列が別の場所を指しうる（TOCTOU）。
-	// 起こしたあとに /proc/<pid>/cwd を読めば、実際どこに居るかが分かる。
-	// 違えば、その場で止める。
-	if where, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
-		if !under(where, m.Root) {
-			cmd.Process.Kill()
-			a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
-				Error: fmt.Sprintf("起こした先が許した場所の外だった（%s）。止めた", where)})
-			return
-		}
-	} else {
-		// 読めなかったことを「合っていた」と読ませない。
-		fmt.Fprintf(os.Stderr,
-			"camp agent: %s の実際の cwd を確かめられない: %v\n", m.Session[:8], err)
-	}
-
-	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
-		pending: map[string]chan []byte{}}
-	if a.Scope {
-		k.scope = scopeName(m.Session)
-	}
-	// **落とし先を先に開く。** 開けなければ drain は行き場を失い、
-	// パイプが詰まって子が止まる。黙って進めない。
-	if lg, err := OpenLog(a.LogDir, m.Session); err == nil {
-		k.log = lg
-	} else {
-		// **campd にも言う。** stderr にしか出さないと、画面は
-		// 「フレームは来ているのに中身が無い」を「中身が無かった」と読む。
-		k.logBroken = true
-		fmt.Fprintf(os.Stderr, "camp agent: 落とし先を開けない（%v）。フレームは残らない\n", err)
-		a.send(Msg{T: MsgDropped, Session: m.Session, Token: m.Token, Dropped: -1,
-			Error: "落とし先を開けない: " + err.Error()})
-	}
-	a.mu.Lock()
-	a.kids[m.Session] = k
-	wanted, wasAsked := a.stopWanted[m.Session]
-	delete(a.stopWanted, m.Session)
-	a.mu.Unlock()
-
-	a.send(Msg{T: MsgStarted, Session: m.Session, Token: m.Token,
-		PID: pid, Started: st, BootID: BootID(), Scope: k.scope})
-
-	// **生まれる前に止めろと言われていたなら、生まれた直後に止める。**
-	if wasAsked {
-		fmt.Fprintf(os.Stderr, "camp agent: %s は生まれる前に止めろと言われていた\n",
-			m.Session[:8])
-		go a.stop(Msg{Session: m.Session, Token: m.Token, Mode: wanted})
-	}
-
-	// **stdout は常時読む。** 読まないと子が詰まる（M27 で永続化する）。
-	go a.drain(k, stdout)
-
-	err = cmd.Wait()
-	code, reason := 0, "終わった"
-	if err != nil {
-		reason = err.Error()
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			code = -1
-		}
-	}
-	k.mu.Lock()
-	k.dead = true
-	k.mu.Unlock()
-	// **子が終わっても、scope に残りが居るかもしれない。** 数えて止め、止め切れなければそう言う。
-	left := a.leftovers(k)
-	if left != 0 {
-		reason += leftoverNote(left)
-	}
-	if k.log != nil {
-		k.log.Close()
-	}
-	a.mu.Lock()
-	delete(a.kids, m.Session)
-	a.mu.Unlock()
-	a.send(Msg{T: MsgExited, Session: m.Session, Token: m.Token, Code: code, Reason: reason,
-		Leftover: left})
-}
-
-// drain は子の stdout を読み続け、種類だけを campd へ渡す。
-//
-// **中身はまだ渡さない。** 境界を越える量を決めるのは M27 の仕事で、
-// ここで無制限に流すと、あとで絞るのが難しくなる。
-func (a *Agent) drain(k *child, r io.Reader) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), maxLine)
-	a.drainScanner(k, sc)
-}
-
-// drainScanner は読みかけの scanner から続ける。リモートでは向こうの sh の
-// 名乗り（1行目）を読んだあとで、同じ scanner をここへ渡す。
-func (a *Agent) drainScanner(k *child, sc *bufio.Scanner) {
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var f map[string]any
-		if err := json.Unmarshal(line, &f); err != nil {
-			continue
-		}
-		kind := FrameKind(f)
-		// 子からの制御応答は、待っている者へ回す。**画面へは流さない。**
-		if kind == "control_response" {
-			deliverControl(k, f)
-		}
-		a.record(k, kind, line)
-		if kind == "result" {
-			k.mu.Lock()
-			k.turn = false
-			k.mu.Unlock()
-		}
-		m := Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: kind,
-			TurnEnd: kind == "result", Ask: kind == "control_request/can_use_tool"}
-		if s, ok := f["session_id"].(string); ok {
-			m.ClaudeID = s
-		}
-		if debugFrames {
-			fmt.Fprintf(os.Stderr, "camp agent: %s %s\n", k.id[:8], m.Kind)
-		}
-		if m.Kind == "control_request/can_use_tool" {
-			if id, ok := f["request_id"].(string); ok {
-				m.ReqID = id
-			}
-			if req, ok := f["request"].(map[string]any); ok {
-				if n, ok := req["tool_name"].(string); ok {
-					m.Text = n
-				}
-				// **何を承認しようとしているかは、画面に出さないと答えられない。**
-				// 承認要求だけは中身を渡す（他のフレームは種類だけ）。
-				if b, err := json.Marshal(req); err == nil && len(b) <= maxApprovalDetail {
-					m.Frame = b
-				}
-			}
-		}
-		a.send(m)
-	}
 }
 
 // FrameKind は stream-json の1フレームを「種類」に畳む。
@@ -547,44 +370,43 @@ func (a *Agent) record(k *child, kind string, line []byte) {
 	}
 }
 
-func (a *Agent) toChild(m Msg, frame []byte) {
+// toChild は入力・承認の答えを子へ渡す。**子へ書く1行は会話が組む**（campd から来た文字列を
+// そのまま埋めない）。
+func (a *Agent) toChild(m Msg) {
 	a.mu.Lock()
 	k := a.kids[m.Session]
 	a.mu.Unlock()
 	if k == nil || k.token != m.Token {
 		return
 	}
-	if k.codex != nil {
-		// Codex は JSON-RPC。Claude 用に組んだ frame は使わず、状態から組み直す。
-		var err error
-		switch m.T {
-		case MsgInput:
-			frame, err = k.codex.input(m.Text)
-		case MsgApprove:
-			frame, err = k.codex.approve(m.ReqID, m.Behavior)
-		default:
-			err = fmt.Errorf("Codex へ渡せない種類: %s", m.T)
+	var frame []byte
+	var err error
+	switch m.T {
+	case MsgInput:
+		frame, err = k.conv.Input(m.Text)
+	case MsgApprove:
+		frame, err = k.conv.Answer(m.ReqID, m.Behavior, m.Text)
+	default:
+		err = fmt.Errorf("子へ渡せない種類: %s", m.T)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "camp agent: %s: %v\n", k.id[:8], err)
+		if m.T == MsgInput {
+			// **渡せなかったターンを、終わったターンとして返す。** 黙ると campd は
+			// running のまま入力を受けなくなる。
+			a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/input_failed",
+				TurnEnd: true, Error: "入力を渡せなかった: " + err.Error()})
 		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "camp agent: %s: %v\n", k.id[:8], err)
-			if m.T == MsgInput {
-				// **渡せなかったターンを、終わったターンとして返す。** 黙ると campd は
-				// running のまま入力を受けなくなる。
-				a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/input_failed",
-					TurnEnd: true, Error: "入力を渡せなかった: " + err.Error()})
-			}
-			if m.T == MsgApprove {
-				// **届かなかった答えを、届いたことにしない。** campd の台帳は「本人が答えた」の
-				// ままになるので、取り下げとして返す（Fable の実装後レビュー 2）。
-				a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/withdrawn",
-					ReqID: m.ReqID, Withdrawn: true, Error: "答えが子へ届かなかった: " + err.Error()})
-			}
-			return
+		if m.T == MsgApprove {
+			// **届かなかった答えを、届いたことにしない。** campd の台帳は「本人が答えた」の
+			// ままになるので、取り下げとして返す（Fable の実装後レビュー 2）。
+			a.send(Msg{T: MsgFrame, Session: k.id, Token: k.token, Kind: "camp/withdrawn",
+				ReqID: m.ReqID, Withdrawn: true, Error: "答えが子へ届かなかった: " + err.Error()})
 		}
+		return
 	}
 	k.mu.Lock()
 	dead := k.dead
-	var err error
 	if !dead {
 		if m.T == MsgInput {
 			k.turn = true // result が返るまでターン中
@@ -663,27 +485,14 @@ func (a *Agent) stop(m Msg) {
 	if k.token != m.Token {
 		return
 	}
-	if m.Mode == StopInterrupt && k.codex != nil {
-		// Codex の中断はターン id が要る。まだ無ければ、来たところで投げる（codex.go）。
-		// **走っていた工具は残る**（実測）。確実に止めるのは terminate。
-		if b := k.codex.interrupt(); b != nil {
+	if m.Mode == StopInterrupt {
+		// 今は投げられない中断（Codex はターン id が要る）は、来たところで会話が投げる。
+		// **走っていた工具が残るエージェントがある**（Codex。実測）。確実に止めるのは terminate。
+		if b := k.conv.Interrupt(); b != nil {
 			if err := k.write(b); err != nil {
 				fmt.Fprintf(os.Stderr, "camp agent: %s を中断できない: %v\n", k.id[:8], err)
 			}
 		}
-		return
-	}
-	if m.Mode == StopInterrupt {
-		b, _ := json.Marshal(map[string]any{
-			"type":       "control_request",
-			"request_id": "camp-stop-" + m.Session,
-			"request":    map[string]any{"subtype": "interrupt"},
-		})
-		k.mu.Lock()
-		if !k.dead {
-			k.stdin.Write(append(b, '\n'))
-		}
-		k.mu.Unlock()
 		return
 	}
 	a.killChild(k)
@@ -824,37 +633,7 @@ func (a *Agent) scanSSH(m Msg) {
 	a.send(out)
 }
 
-// deliverControl は子の制御応答を、待っている者へ渡す。
-func deliverControl(k *child, f map[string]any) {
-	resp, ok := f["response"].(map[string]any)
-	if !ok {
-		return
-	}
-	id, _ := resp["request_id"].(string)
-	if id == "" {
-		return
-	}
-	k.mu.Lock()
-	ch := k.pending[id]
-	delete(k.pending, id)
-	k.mu.Unlock()
-	if ch == nil {
-		return
-	}
-	b, err := json.Marshal(resp["response"])
-	if err != nil {
-		b = []byte("null")
-	}
-	select {
-	case ch <- b:
-	default:
-	}
-}
-
-// control は子へ制御フレームを1つ投げて、答えを返す。
-//
-// 残量（get_usage / get_context_usage）はこの経路でしか取れない。
-// **モデル呼び出しは起きない**ので、押すたびにトークンを使うことはない。
+// control は子へ問い合わせを1つ投げて、答えを返す（残量。会話の Query）。
 func (a *Agent) control(m Msg) {
 	out := Msg{T: MsgCtlRes, Session: m.Session, ReqID: m.ReqID}
 	a.mu.Lock()
@@ -865,47 +644,5 @@ func (a *Agent) control(m Msg) {
 		a.send(out)
 		return
 	}
-	if k.codex != nil {
-		a.controlCodex(k, m)
-		return
-	}
-	childReq := "camp-ctl-" + newID()
-	ch := make(chan []byte, 1)
-	k.mu.Lock()
-	dead := k.dead
-	if !dead {
-		k.pending[childReq] = ch
-	}
-	k.mu.Unlock()
-	if dead {
-		out.Error = "子はもう居ない"
-		a.send(out)
-		return
-	}
-	defer func() {
-		k.mu.Lock()
-		delete(k.pending, childReq)
-		k.mu.Unlock()
-	}()
-
-	b, _ := json.Marshal(map[string]any{
-		"type": "control_request", "request_id": childReq,
-		"request": map[string]any{"subtype": m.Kind},
-	})
-	k.mu.Lock()
-	_, err := k.stdin.Write(append(b, '\n'))
-	k.mu.Unlock()
-	if err != nil {
-		out.Error = err.Error()
-		a.send(out)
-		return
-	}
-	select {
-	case payload := <-ch:
-		out.Frame = payload
-	case <-time.After(10 * time.Second):
-		// **返ってこないことを「空」と読まない。**
-		out.Error = "子が答えない"
-	}
-	a.send(out)
+	a.controlConv(k, m)
 }

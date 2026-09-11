@@ -71,6 +71,10 @@ type Line struct {
 	At    string          `json:"at"`
 	Kind  string          `json:"kind"`
 	Frame json.RawMessage `json:"frame"`
+	// Summary・Own は campd が読むときに駆動器が添える（落とし先には書かない）。
+	// **画面はフレームの形を知らない**（D-031）。Own は Camp 自身の問い合わせのやりとり。
+	Summary string `json:"summary,omitempty"`
+	Own     bool   `json:"own,omitempty"`
 }
 
 // 1世代あたりの上限。2世代持つので、最大でこの倍が残る。
