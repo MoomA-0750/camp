@@ -20,15 +20,20 @@ AIとの作業が散らばっている。
 ブラウザ / Android / Wear OS
     ↓ Tailscale（tailscale serve でHTTPS）
 general-console（lpve VM 200・Fedora 44・4コア/16GB/128GB）
-    ├── Web UI（Next.js）
-    ├── バックエンド（Hono / Node.js）
-    │     ├── 取り込みワーカー（JSONL追尾 + codex SQLite）
-    │     ├── セッション駆動（claude -p 双方向stream-json）
-    │     ├── Vault API（正本の作業コピーを読み書き）
-    │     └── SSH クライアント（他ホストの履歴取得・リモート起動）
-    ├── SQLite（履歴の独立保持・全文検索・使用量集計）
+    ├── campd serve（Go・専用ユーザー camp）
+    │     ├── Web UI（Vite + React。バイナリに埋め込み）
+    │     ├── 取り込み（Claude Code の JSONL 追尾）
+    │     ├── Vault 索引（読み取りのみ。Camp は Vault に書かない）
+    │     ├── MCP サーバー（stdio・読み取り専用）
+    │     └── SQLite（履歴の独立保持・全文検索・使用量集計・監査ログ）
+    ├── campd agent（本人のユーザー）── claude -p 双方向stream-json
+    │     └── /run/camp/agent.sock で campd と話す
     └── Vault 作業コピー（= 正本）
 ```
+
+campd は `claude` を起こせない（`ProtectHome=read-only` と `NoNewPrivileges`）。
+起こすのは本人のユーザーで動く実行面 `campd agent`（D-025）。
+他ホストへの SSH は台帳と許可リストまで作ってあり、実際のリモート起動はまだ無い。
 
 クライアントは全部同じAPIを叩く薄いクライアントにする。Android・Wear OSを後から足すときに実装を1本化するため。
 
@@ -49,4 +54,4 @@ general-console（lpve VM 200・Fedora 44・4コア/16GB/128GB）
 | `10-decisions.md` | 意思決定ログ（なぜそう決めたか） |
 | `20-data-model.md` | SQLiteスキーマと取り込み仕様 |
 | `30-session-protocol.md` | `claude -p` 双方向stream-jsonのプロトコル |
-| `40-view-engine.md` | ビュー機構（人間向け表示とLLM文脈供給の両立） |
+| `40-layout.md` | リポジトリ構成・ルーティング・認証の位置・画面の状態の置き方 |

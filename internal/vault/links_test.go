@@ -72,7 +72,7 @@ func TestLinkShapesAreSplit(t *testing.T) {
 }
 
 // [[#見出し]] は「このノートのこの見出し」。Obsidian では有効なリンクなので
-// 捨てない（実測4本、すべて AI/Context/body.md）。
+// 捨てない（実測4本、すべて同じ1ノート）。
 func TestSelfHeadingLinkIsKept(t *testing.T) {
 	ls := ExtractLinks([]byte("……([[#年別トレンド(Apple Health)|年別トレンド]]参照)……\n"))
 	if len(ls) != 1 {
