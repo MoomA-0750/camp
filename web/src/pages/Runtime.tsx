@@ -97,6 +97,15 @@ export default function Runtime() {
               実行面が繋がっていない。<code>systemctl --user start camp-agent</code> で起こす。
             </p>
           )}
+          {/* **実行面だけ古いまま動いている。** 入れ替えの順序（バイナリ → campd → 実行面）を
+              間違えると起きる。直したはずの不具合が直らないのに、画面には何も出なかった
+              （2026-09-12）。**止めはしない。知らせるだけ。** */}
+          {list.data?.agent_connected && list.data.agent_stale && (
+            <p className="warn">
+              実行面が campd と違うビルドで動いている。
+              <code>systemctl --user restart camp-agent</code> で入れ替える。
+            </p>
+          )}
 
           <form className="filters" onSubmit={(e) => { e.preventDefault(); void start() }}>
             <select value={chosen?.name ?? ''} aria-label="どのエージェントで起こすか"

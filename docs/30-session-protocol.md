@@ -283,6 +283,7 @@ Camp はこのマシンの AI 作業環境の忠実なリモコンなので、Co
 | 口 | 欄 |
 |---|---|
 | hello | `agents`（起こせる名前の配列。古い campd のために残す）と `drivers`（駆動器の説明: `name`・`label`・`perms`・`notes`・`interrupt_leaves_tools`・`remote`）。**名乗らない古い実行面**の分は campd が手元の駆動器から補い、確認の度合いは `cli` だけとみなす |
+| hello | `build`（実行ファイルの指紋。Go が埋める VCS の版から作る）。campd は自分のものと照らし、違えば画面に出す。**止めはしない。** 版の文字列（`version`）では足りない——campd と実行面は同じバイナリで、どちらも同じ文字列を名乗る。**名乗らない実行面は古いとみなす**（この仕組みより前のバイナリだから）。自分の指紋が取れないとき（VCS の外・試験）は何も言わない |
 | start | `agent`・`perm`（空は `cli`）。実行面は名乗っていない度合いなら起こさない |
 | started | 実行面が起こした `agent`・`perm` を名乗る。campd が頼んだものと照らし、違えば止める |
 | frame | 駆動器が畳んだ意味（`turn_end`・`ask`・`interrupted`・`note`・`withdrawn`）。campd は種類の文字列を読み分けない |

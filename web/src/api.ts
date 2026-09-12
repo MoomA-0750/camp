@@ -147,7 +147,13 @@ export type AgentInfo = {
   remote?: boolean
 }
 
-export type RuntimeList = { agent_connected: boolean; agents?: AgentInfo[]; sessions: RuntimeSession[] }
+export type RuntimeList = {
+  agent_connected: boolean
+  // agent_stale は実行面が campd と違うビルドで動いている（知らせるだけ。止めない）。
+  // 入れ替えの順序を間違えると、実行面だけ古い実体を掴んだまま動く。
+  agent_stale?: boolean; agent_build?: string
+  agents?: AgentInfo[]; sessions: RuntimeSession[]
+}
 
 // 終わったセッションの1頁。counts は頁に関係なく全体の件数。
 export type RuntimeEnded = {

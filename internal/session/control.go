@@ -47,6 +47,8 @@ type agentConn struct {
 	agents []string
 	// infos は hello で名乗った駆動器の説明。
 	infos map[string]AgentInfo
+	// build は hello で名乗った実行ファイルの指紋。**空なら名乗らない古い実行面。**
+	build string
 }
 
 // announced は hello で名乗った起こせる名前か。**名乗らない古い実行面は claude だけ。**
@@ -264,6 +266,7 @@ func (c *Control) handle(conn net.Conn) {
 	}
 	a.agents = hello.Agents
 	a.infos = namedInfos(a, hello.Drivers)
+	a.build = hello.Build
 	c.s.agent = a
 	c.s.mu.Unlock()
 

@@ -456,6 +456,21 @@ func (s *Supervisor) AgentConnected() bool {
 	return s.agent != nil
 }
 
+// AgentStale は実行面が campd と違うビルドで動いているか（build.go）。
+//
+// **止めない。知らせるだけ。** 古い実行面でも動くことは動く。ただし直したはずの不具合が
+// 直っていないので、画面に出さないと気づけない（2026-09-12、向こうのホストの記録が
+// 読めないまま「最後に読めた」と出ていた）。
+func (s *Supervisor) AgentStale() (stale bool, build string) {
+	s.mu.Lock()
+	a := s.agent
+	s.mu.Unlock()
+	if a == nil {
+		return false, ""
+	}
+	return buildMismatch(selfBuild(), a.build), a.build
+}
+
 // fail は起こせなかった・止まらなかったセッションを閉じる。
 // **控えてある理由より、こちらが正しい**（止めろと言ったが止まらなかった、など）。
 func (s *Supervisor) fail(id, reason, cause string) {

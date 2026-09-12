@@ -46,8 +46,13 @@ func (s *Server) handleRuntimeList(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
+	stale, build := s.sessions.AgentStale()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agent_connected": s.sessions.AgentConnected(),
+		// 実行面が campd と違うビルドで動いているか。**知らせるだけで止めない。**
+		// 入れ替えの順序（バイナリ → campd → 実行面）を間違えると、実行面だけ古いまま動く。
+		"agent_stale": stale,
+		"agent_build": build,
 		// 起こせるエージェント（名前・表示名・確認の度合い・起こせる場所・説明）。**画面は
 		// ここから選択肢を作り、エージェントの名前を決め打ちしない**（D-031）。
 		"agents":   s.sessions.Agents(),

@@ -150,7 +150,7 @@ func (a *Agent) Dial(version string) error {
 	a.conn = c
 	// **起こせるエージェントも名乗る。** 名乗らないと、campd は Codex を頼んでよいか
 	// 分からない（古い実行面は claude を起こしてしまう）。
-	if err := a.send(Msg{T: MsgHello, Version: version, Held: a.held(),
+	if err := a.send(Msg{T: MsgHello, Version: version, Build: selfBuild(), Held: a.held(),
 		Agents: a.agents(), Drivers: a.driverInfos()}); err != nil {
 		c.Close()
 		return err

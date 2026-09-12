@@ -111,6 +111,11 @@ type Msg struct {
 
 	// hello / welcome
 	Version string `json:"version,omitempty"`
+	// Build は実行面の**実行ファイルの指紋**（build.go）。campd は自分のものと照らし、
+	// 違えば画面に出す。**止めはしない**——古い実行面でも動くことは動く。
+	// 版の文字列（Version）では足りない: campd と実行面は同じバイナリで、どちらも同じ
+	// 文字列を名乗るため（2026-09-12、実行面だけ古いまま動いていたのに気づけなかった）。
+	Build string `json:"build,omitempty"`
 	// Held は実行面がいま抱えている子。**campd を入れ替えても殺さないため。**
 	Held []Held `json:"held,omitempty"`
 
