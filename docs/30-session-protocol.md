@@ -47,7 +47,12 @@ error: unknown option '--this-flag-does-not-exist'                 ← 比較対
 
 注意点:
 
-- **既定のパーク期限は5分**（`CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS`）。UIが応答しないとターンが落ちる
+- **この経路の承認に期限は無い**（2026-09-12 実測。`dev/scripts/park_probe.py` に相当する測り方で、Camp と
+  同じ起こし方のまま `can_use_tool` を10分放置した——`claude` はフレームを1つも出さずに待ち続け、
+  コマンドも走らなかった）。**Phase 3 で「5分で子が諦める」と読んだのは誤り**: 実体の説明によれば
+  `CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS`（既定5分・`never` で無効）は**遠くの相手へ回した**ダイアログと
+  抱えたセッション間メッセージの期限で、「local-only の承認は影響を受けない」と書いてある。対話の CLI も
+  承認に期限は無い（公式の説明では、放置で自動的に解けるのは `AskUserQuestion` の選択肢だけ）
 - **フラグを付けない場合、CLIは単独で自動拒否する**（`{"type":"system","subtype":"permission_denied",…}` だけが出る）
 - **読み取り専用コマンドは安全コマンドのfastpathを通り、承認なしで実行される**（`Bash(id -un)` が承認要求なしで走った）。**どの呼び出しが承認を出すかをCampが予測することはできない**ので、UIは「来たら出す」設計にする
 
@@ -257,8 +262,14 @@ Camp はこのマシンの AI 作業環境の忠実なリモコンなので、Co
 （initialize の `codexHome` を実パスで）・作業場所・スレッド id だけ。承認のコマンドが起こした場所の
 外なら、断らずに印を付けて見せる。設定が途中で変わっても（`thread/settings/updated`）止めずに記録する。
 
-**確かめていない**: Codex 自身に承認待ちの期限があるか（Camp は 4分30秒で自分から断る）。
-権限の拡張・質問・MCP の問い合わせに断りを返したときの振る舞い（偽物でしか試せていない）。
+**承認に期限は無い**（2026-09-12 実測、`dev/scripts/park_probe.py codex`）: `untrusted` で
+`item/commandExecution/requestApproval` が来たあと、答えないまま10分放置しても Codex は何も出さず、
+コマンドも走らなかった。**Claude Code も同じ**（同じ probe の claude。§1 も見よ）。それを受けて
+**Camp も期限切れにしない**（本人の決定。以前は 4分30秒で自分から断っていた。`Supervisor.ParkAfter`
+が 0 なら見ない＝既定）。
+
+**確かめていない**: 権限の拡張・質問・MCP の問い合わせに断りを返したときの振る舞い（偽物でしか
+試せていない）。画面から答えられるようにするのは Phase 3.8。
 
 ## 12. 駆動器（Phase 3.7、2026-09-12）
 

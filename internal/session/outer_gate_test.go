@@ -150,7 +150,7 @@ func TestAnswerTheSameApprovalConcurrently(t *testing.T) {
 	s, _ := wire(t, db)
 	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 
@@ -318,7 +318,7 @@ done
 	attach(t, s, p)
 	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if err := ask(db, rec.ID, "pending", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, rec.ID, "pending", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Input(rec.ID, "go"); err != nil {
@@ -394,7 +394,7 @@ func TestOneSessionCannotAnswerAnothersApproval(t *testing.T) {
 	b, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, a.ID) == StateIdle })
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, b.ID) == StateIdle })
-	if err := ask(db, a.ID, "r-a", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, a.ID, "r-a", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 	// b の側から a の承認に答えようとする。
@@ -546,7 +546,7 @@ func TestOrphansAreNotLeftLyingAround(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 
@@ -789,7 +789,7 @@ func TestTheAuditChainSurvivesConcurrency(t *testing.T) {
 			}
 			for j := 0; j < 5; j++ {
 				s.Input(rec.ID, "go")
-				ask(db, rec.ID, fmt.Sprintf("r%d", j), "Write", "{}", time.Now())
+				ask(db, rec.ID, fmt.Sprintf("r%d", j), "Write", "{}", time.Now(), parkLimit)
 				s.Approve(rec.ID, fmt.Sprintf("r%d", j), "allow", "")
 			}
 			s.Stop(rec.ID, StopTerminate)
@@ -1088,7 +1088,7 @@ func TestAnUndeliverableApprovalGoesBackToWaiting(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 	// 実行面を「書けない」ものに差し替える。
@@ -1282,7 +1282,7 @@ func TestTheSupervisorFillsInADenialReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, rec.ID, "r", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Approve(rec.ID, "r", "deny", ""); err != nil {

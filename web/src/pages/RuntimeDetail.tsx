@@ -255,14 +255,14 @@ function Ask({ id, rows, onAnswered }: {
       <h3>承認を待っている（{waiting.length}）</h3>
       <p className="sub muted">
         答えるまで、そのターンは止まっている。
-        <strong>答えないままにすると期限切れで拒否になる</strong>（4分30秒）。
+        <strong>放っておいても期限切れにはならない</strong>（CLI と同じ。答えるまで待つ）。
       </p>
       {err && <Failed error={err} />}
       {waiting.map((a) => (
         <div key={a.request_id} className="ask-row">
           <div>
             <strong>{a.tool}</strong>{' '}
-            <span className="muted">期限 {short(a.expires_at)}</span>
+            {a.expires_at && <span className="muted">期限 {short(a.expires_at)}</span>}
             <pre className="mono small">{askText(a.detail)}</pre>
           </div>
           <div className="ask-buttons">

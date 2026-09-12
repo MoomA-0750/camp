@@ -39,8 +39,11 @@ type Supervisor struct {
 	// テストで時間を進めるために差し替える。
 	Now func() time.Time
 	// テストで待たずに済ませるために差し替える。
-	IdleAfter  time.Duration
-	TurnAfter  time.Duration
+	IdleAfter time.Duration
+	TurnAfter time.Duration
+	// ParkAfter は承認を待つ長さ。**0 は「期限切れにしない」**（既定。New は入れない）。
+	// CLI にも承認の期限は無い（D-030、本人の決定 2026-09-12。approval.go の parkLimit を見よ）。
+	ParkAfter  time.Duration
 	StartAfter time.Duration
 	StopAfter  time.Duration
 	// RemoteReapEvery は向こうを確かめられなかった孤児を見に行き直す間隔。
@@ -535,13 +538,16 @@ func (s *Supervisor) Tick() {
 	}
 	s.mu.Unlock()
 
-	// **期限切れを、期限切れとして答える。**
-	// 放っておくと `claude` 自身のパーク期限（5分）で子が勝手に諦め、
-	// 何が起きたか分からない記録になる。
-	late, err := expired(s.db, s.Now())
-	if err != nil {
-		// **読めなかったことを「期限切れは無い」と読ませない。**
-		s.audit("", "tool.approve", "", "期限切れを数えられない: "+err.Error(), audit.Error)
+	// **期限切れを、期限切れとして答える。ただし既定では期限を見ない**（ParkAfter は 0。
+	// Phase 3 の「`claude` 自身が5分で諦める」は誤りだった。approval.go の parkLimit を見よ）。
+	var late []Approval
+	if s.ParkAfter > 0 {
+		got, err := expired(s.db, s.Now())
+		if err != nil {
+			// **読めなかったことを「期限切れは無い」と読ませない。**
+			s.audit("", "tool.approve", "", "期限切れを数えられない: "+err.Error(), audit.Error)
+		}
+		late = got
 	}
 	{
 		for _, a := range late {

@@ -367,7 +367,7 @@ func TestAnAnswerThatCannotReachTheChildIsWithdrawn(t *testing.T) {
 	s, _, _ := wireCodex(t, db)
 	rec := startCodexHere(t, s, db)
 	// 実行面が見ていない承認（campd の台帳にだけある）。
-	codexNoErr(t, ask(db, rec.ID, "99", "codex:command", `{}`, time.Now()))
+	codexNoErr(t, ask(db, rec.ID, "99", "codex:command", `{}`, time.Now(), parkLimit))
 	codexNoErr(t, s.Approve(rec.ID, "99", "allow", ""))
 	waitFor(t, 5*time.Second, func() bool { return historyReason(t, db, rec.ID, "99") == ByWithdrawn })
 	if !auditHas(t, db, "tool.withdrawn", "届かなかった") {

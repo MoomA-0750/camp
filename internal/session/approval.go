@@ -30,26 +30,44 @@ const (
 	BySessionEnd = "session_ended"
 )
 
-// parkLimit は Camp が待つ長さ。
+// parkLimit は「期限を入れるなら」の目安の長さ。**既定では使わない**（Supervisor.ParkAfter は 0）。
 //
-// `claude` 自身のパーク期限は5分。**その手前で自分から拒否する。**
-// 子に先に諦められると、Camp の記録は「答えなかった」で終わり、
-// 実際に何が起きたか（拒否として扱われたのか、ターンごと落ちたのか）が
-// 分からなくなる。
+// Phase 3 では「`claude` 自身のパーク期限は5分だから、その手前で自分から拒否する」としていた。
+// **それは誤りだった**（2026-09-12 実測、`dev/scripts/park_probe.py`）: Camp と同じ起こし方
+// （`-p`・stream-json・`--permission-prompt-tool stdio`）で承認を10分放置しても、claude は
+// フレームを1つも出さずに待ち続けた。`CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS`（既定5分）は
+// **遠くの相手へ回した**ダイアログの期限で、local-only の承認には効かない。対話の CLI にも
+// 承認の期限は無い。**CLI と同じく、答えるまで待つ**（D-030、本人の決定 2026-09-12）。
 const parkLimit = 4*time.Minute + 30*time.Second
 
+// noDeadline は「期限を見ない」ときに書く値。列は NOT NULL なので、決して来ない時刻を入れる
+// （expired の `expires_at <= now` に当たらない）。**読むときは空にして**、画面に嘘の期限を出さない。
+const noDeadline = "9999-12-31T23:59:59Z"
+
+// shownDeadline は「期限を見ない」印を空にする。
+func shownDeadline(s string) string {
+	if s == noDeadline {
+		return ""
+	}
+	return s
+}
+
 // ask は承認要求を残す。同じ request_id が二度来ても増やさない。
-func ask(db *store.DB, sessionID, reqID, tool, detail string, now time.Time) error {
+func ask(db *store.DB, sessionID, reqID, tool, detail string, now time.Time, park time.Duration) error {
 	if len(detail) > maxApprovalDetail {
 		detail = detail[:maxApprovalDetail] + "…（切り詰めた）"
+	}
+	// park が 0 なら期限を見ない（既定）。
+	exp := noDeadline
+	if park > 0 {
+		exp = now.Add(park).UTC().Format(time.RFC3339)
 	}
 	_, err := db.Exec(`
 		insert or ignore into approvals(session_id, request_id, tool, detail_json,
 			asked_at, expires_at)
 		values(?,?,?,?,?,?)`,
 		sessionID, reqID, tool, detail,
-		now.UTC().Format(time.RFC3339),
-		now.Add(parkLimit).UTC().Format(time.RFC3339))
+		now.UTC().Format(time.RFC3339), exp)
 	return err
 }
 
@@ -122,12 +140,13 @@ func openApprovals(db *store.DB, sessionID string) ([]Approval, error) {
 			&a.AskedAt, &a.ExpiresAt); err != nil {
 			return nil, err
 		}
+		a.ExpiresAt = shownDeadline(a.ExpiresAt)
 		out = append(out, a)
 	}
 	return out, rows.Err()
 }
 
-// expired は期限を過ぎた未回答を返す。
+// expired は期限を過ぎた未回答を返す。**期限を見ない設定なら呼ばない**（Supervisor.Tick）。
 func expired(db *store.DB, now time.Time) ([]Approval, error) {
 	rows, err := db.Query(`
 		select id, session_id, request_id, coalesce(tool,''), coalesce(detail_json,''),

@@ -162,7 +162,7 @@ export type LogLine = {
 
 export type Approval = {
   id: number; session_id: string; request_id: string
-  tool?: string; detail?: string; asked_at: string; expires_at: string
+  tool?: string; detail?: string; asked_at: string; expires_at?: string
   answered_at?: string; behavior?: string; reason?: string
 }
 

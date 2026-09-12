@@ -186,6 +186,9 @@ func TestStoppingByHandRecordsWhatItWasDoing(t *testing.T) {
 // **「放置した承認があった」は、終わり方とは別に残る。**
 func TestAnApprovalLeftToExpireIsRecorded(t *testing.T) {
 	s, db, rec := startWith(t, askingBody)
+	// 既定では承認を期限切れにしない（D-030）。ここでは入れて確かめる。
+	// **訊かれる前に入れる**——期限は承認を記録するときに決まる。
+	s.ParkAfter = parkLimit
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 	if err := s.Input(rec.ID, "書いて"); err != nil {
 		t.Fatal(err)
@@ -268,7 +271,7 @@ func TestLosingTheAgentIsRecordedAsTheCause(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustInsert(t, db, "lost", StateRunning, dead.Process.Pid, 1, BootID())
-	if err := ask(db, "lost", "req-1", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, "lost", "req-1", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 	a := &agentConn{who: "test"}
@@ -303,7 +306,7 @@ func TestAGhostKeepsItsWaitingApprovalsAsSuch(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustInsert(t, db, "ghost", StateRunning, dead.Process.Pid, 1, BootID())
-	if err := ask(db, "ghost", "req-1", "Write", "{}", time.Now().Add(-time.Hour)); err != nil {
+	if err := ask(db, "ghost", "req-1", "Write", "{}", time.Now().Add(-time.Hour), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := s.Reconcile(); err != nil {

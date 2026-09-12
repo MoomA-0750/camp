@@ -860,7 +860,7 @@ func (s *Supervisor) recordAsk(m Msg) {
 		}
 		return
 	}
-	if err := ask(s.db, m.Session, m.ReqID, m.Text, string(m.Frame), s.Now()); err != nil {
+	if err := ask(s.db, m.Session, m.ReqID, m.Text, string(m.Frame), s.Now(), s.ParkAfter); err != nil {
 		s.audit(m.Session, "tool.ask", m.Text, "承認の記録に失敗: "+err.Error(), audit.Error)
 		return
 	}

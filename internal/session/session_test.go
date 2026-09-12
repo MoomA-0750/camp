@@ -306,7 +306,7 @@ func TestAnApprovalCanOnlyBeAnsweredOnce(t *testing.T) {
 	if err := s.Approve(rec.ID, "req-1", "allow", ""); err == nil {
 		t.Fatal("待っていない承認に答えられてしまった")
 	}
-	if err := ask(db, rec.ID, "req-1", "Write", `{"tool_name":"Write"}`, time.Now()); err != nil {
+	if err := ask(db, rec.ID, "req-1", "Write", `{"tool_name":"Write"}`, time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 
@@ -416,6 +416,26 @@ func TestIdleAndLongTurnsAreCollected(t *testing.T) {
 		st := state(t, db, rec.ID)
 		return st == StateStopping || st == StateExited
 	})
+}
+
+// **既定では、放置やターンの長さで Camp から止めない**（D-030、本人の決定 2026-09-12）。
+// CLI のセッションは開けっぱなしにでき、auto mode の1ターンは1時間を超える。
+func TestByDefaultNothingIsCollectedForBeingIdleOrSlow(t *testing.T) {
+	db := newDB(t)
+	s, _ := wire(t, db)
+	if s.IdleAfter != 0 || s.TurnAfter != 0 {
+		t.Fatalf("既定で時間切れを見ている: idle=%v turn=%v", s.IdleAfter, s.TurnAfter)
+	}
+	rec, _ := s.Start("test", allowHere(t, db))
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+
+	// ずっと先の時計で Tick しても閉じない。
+	s.Now = func() time.Time { return time.Now().Add(72 * time.Hour) }
+	s.Tick()
+	time.Sleep(100 * time.Millisecond)
+	if got := state(t, db, rec.ID); got != StateIdle {
+		t.Fatalf("放置で閉じた: %s", got)
+	}
 }
 
 func TestAStartThatNeverReportsIsGivenUp(t *testing.T) {
@@ -896,7 +916,7 @@ func TestAWaitingApprovalSurvivesCampdRestarting(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if err := ask(db, rec.ID, "req-9", "Write", `{"tool_name":"Write"}`, time.Now()); err != nil {
+	if err := ask(db, rec.ID, "req-9", "Write", `{"tool_name":"Write"}`, time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 
@@ -947,6 +967,7 @@ func TestAWaitingApprovalSurvivesCampdRestarting(t *testing.T) {
 // 答えを届いたことにしない）。
 func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
 	s, db, rec := startWith(t, askingBody)
+	s.ParkAfter = parkLimit // 既定では見ない（D-030）。ここでは入れて確かめる
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 	if err := s.Input(rec.ID, "書いて"); err != nil {
 		t.Fatal(err)
@@ -981,13 +1002,43 @@ func TestAnExpiredApprovalIsDeniedAndSaidSo(t *testing.T) {
 	}
 }
 
+// **既定では承認を期限切れにしない**（D-030、本人の決定 2026-09-12）。
+// `claude` 自身にこの経路の期限が無いことを `dev/scripts/park_probe.py` で測った
+// （10 分放置してもフレームは来ない）。画面にも嘘の期限を出さない。
+func TestByDefaultAnApprovalNeverExpires(t *testing.T) {
+	s, db, rec := startWith(t, askingBody)
+	if s.ParkAfter != 0 {
+		t.Fatalf("既定で承認の期限を見ている: %v", s.ParkAfter)
+	}
+	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
+	if err := s.Input(rec.ID, "書いて"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return len(pending(t, s, rec.ID)) == 1 })
+
+	// ずっと先の時計で Tick しても、待っている承認はそのまま。
+	s.Now = func() time.Time { return time.Now().Add(72 * time.Hour) }
+	s.Tick()
+	time.Sleep(100 * time.Millisecond)
+	if got := pending(t, s, rec.ID); len(got) != 1 {
+		t.Fatalf("期限切れにした: %v", got)
+	}
+	open, err := openApprovals(db, rec.ID)
+	if err != nil || len(open) != 1 {
+		t.Fatalf("待っている承認を読めない: %+v (%v)", open, err)
+	}
+	if open[0].ExpiresAt != "" {
+		t.Fatalf("期限を名乗っている: %q", open[0].ExpiresAt)
+	}
+}
+
 // セッションが終わったら、宙に浮いた承認を閉じる。
 func TestApprovalsDoNotStayWaitingAfterTheSessionEnds(t *testing.T) {
 	db := newDB(t)
 	s, _ := wire(t, db)
 	rec, _ := s.Start("test", allowHere(t, db))
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
-	if err := ask(db, rec.ID, "req-x", "Write", "{}", time.Now()); err != nil {
+	if err := ask(db, rec.ID, "req-x", "Write", "{}", time.Now(), parkLimit); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1015,7 +1066,7 @@ func TestApprovalsAreAQueueNotASingleSlot(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return state(t, db, rec.ID) == StateIdle })
 
 	for _, id := range []string{"r1", "r2", "r3"} {
-		if err := ask(db, rec.ID, id, "Write", "{}", time.Now()); err != nil {
+		if err := ask(db, rec.ID, id, "Write", "{}", time.Now(), parkLimit); err != nil {
 			t.Fatal(err)
 		}
 	}
