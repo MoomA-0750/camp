@@ -532,18 +532,31 @@ root=$home/$sub
 rootreal=$(cd -- "$root" 2>/dev/null && pwd -P) || bad "記録の置き場が向こうに無い: $root" 91
 [ "$rootreal" = / ] && bad '記録の置き場を辿ると / になる' 91
 case "$rootreal" in *"$nl"*|*"$tab"*) bad '実パスに改行かタブがある' 90 ;; esac
+# **道具は名乗りより先に見極める。**
+#
+# 名乗ってから失敗すると、受け手は1行目のタグを見て「読めた」と判断し、中身が
+# 来ないのを「0件」と読む。2026-09-12、macOS で実際にそうなった（GNU の
+# find -printf も stat -c も無いので、名乗った直後に bad へ落ちていた）。
+mode=
+if find "$rootreal" -maxdepth 0 -printf '' 2>/dev/null; then mode=gnufind
+elif stat -c '%s' -- "$rootreal" >/dev/null 2>&1; then mode=gnustat
+elif stat -f '%z' -- "$rootreal" >/dev/null 2>&1; then mode=bsdstat
+else bad '向こうの find も stat も大きさを出せない' 96
+fi
 printf 'CAMP-REC\t1\t%s\n' "$rootreal"
-if find "$rootreal" -maxdepth 0 -printf '' 2>/dev/null; then
+if [ "$mode" = gnufind ]; then
   find "$rootreal" -type f -name '*.jsonl' -printf 'F\t%s\t%Ts\t%p\n'
-elif stat -c '%s' -- "$rootreal" >/dev/null 2>&1; then
+else
   find "$rootreal" -type f -name '*.jsonl' -print | while IFS= read -r p; do
     case "$p" in *"$tab"*) continue ;; esac
-    set -- $(stat -c '%s %Y' -- "$p" 2>/dev/null) || continue
+    if [ "$mode" = gnustat ]; then
+      set -- $(stat -c '%s %Y' -- "$p" 2>/dev/null) || continue
+    else
+      set -- $(stat -f '%z %m' -- "$p" 2>/dev/null) || continue
+    fi
     [ -n "$2" ] || continue
     printf 'F\t%s\t%s\t%s\n' "$1" "$2" "$p"
   done
-else
-  bad '向こうの find も stat も大きさを出せない' 96
 fi
 while IFS="$tab" read -r p off; do
   case "$p" in "$rootreal"/*) ;; *) continue ;; esac
@@ -559,6 +572,7 @@ while IFS="$tab" read -r p off; do
   tail -c +$((st + 1)) -- "$p" 2>/dev/null | head -c "$n" | base64 | tr -d '\n'
   printf '\n'
 done
+printf 'END\n'
 `
 
 // recReadScript は頼まれた範囲だけ返す（M47）。**向こうへは書かない。**
@@ -597,6 +611,7 @@ while IFS="$tab" read -r p off n; do
   printf '\n'
   total=$((total + n))
 done
+printf 'END\n'
 `
 
 // reapScript は向こうの残りを始末する。

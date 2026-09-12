@@ -229,9 +229,18 @@ func (a *Agent) recRun(cmd *exec.Cmd, alias string) (lines []string, root string
 	for sc.Scan() {
 		lines = append(lines, sc.Text())
 	}
-	// **タグが読めていれば、終了コードが悪くても中身は採る**——蓋で切ったときや、
-	// 1本読めなかったときに全部を捨てない。
-	return lines, root, nil
+	// **終わりの印が無ければ、途中で切れている。**
+	//
+	// 名乗りだけ読めて中身が来ないのを「読めたが0件」と読まない——2026-09-12、
+	// macOS で実際にそうなった（向こうに GNU の道具が無く、名乗った直後に落ちていた）。
+	// 蓋で切ったときは向こうが最後まで走って印を出すので、ここでは捨てない。
+	if len(lines) == 0 || lines[len(lines)-1] != "END" {
+		if runErr != nil {
+			return nil, "", fmt.Errorf("%s", explainSSHFailure(alias, tb.String()))
+		}
+		return nil, "", fmt.Errorf("向こうの返事が途中で切れた（%s の記録を読めていない）", alias)
+	}
+	return lines[:len(lines)-1], root, nil
 }
 
 func recDash(s string) string {
