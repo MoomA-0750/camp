@@ -1,15 +1,18 @@
 package ingest
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/store"
 )
 
@@ -22,6 +25,8 @@ type Result struct {
 	CWDs        int
 	Sessions    int
 	Runs        int
+	Limits      int // 記録から拾ったプラン枠の観測（Codex）
+	LimitErrors int // 拾えたが書けなかった数（黙って捨てない）
 	SessionRuns int
 	SourceFiles int
 	Messages    int
@@ -33,23 +38,52 @@ type Result struct {
 	Reread      int           // (dev,inode,size) の食い違いで世代を進めたファイル
 	Missing     int           // 今回の走査で消えていたファイル（行は残す）
 	Unchanged   int           // 追記が無く、要約を再利用して読み飛ばしたファイル
-	Suppressed  int           // tombstone があるので取り込まなかった行
-	Unreadable  []string      // 権限で開けなかったファイル
-	Orphans     []string      // 親が見つからず stub に落としたサイドカー候補
+	Capped      int           // 蓋で途中まで読んだファイル（次回に続きから）
+	// Collisions は**別のホストの同じ id なので書かなかった**セッションの数。
+	// sessions.id はホストを含まない主キーなので、書くと手元の行を上書きしてしまう。
+	Collisions int
+	Suppressed int      // tombstone があるので取り込まなかった行
+	Unreadable []string // 権限で開けなかったファイル
+	Orphans    []string // 親が見つからず stub に落としたサイドカー候補
 }
 
 // Ingest は root 以下の会話記録を DB に取り込む。再実行しても重複しない。
+// Ingest は Claude Code の記録を取り込む。**既存の呼び出しのための包み**（M44）。
 func Ingest(db *store.DB, host, root string) (*Result, error) {
-	res := &Result{Host: host, Root: root, RoleCounts: map[string]int{}}
+	return IngestWith(db, claudeCollector{}, host, root)
+}
+
+// IngestWith は取り込み器を選んで取り込む。**本体はエージェントを知らない**——
+// どのファイルを見るか・1行をどう読むか・役割と主キーの決め方だけが取り込み器から来る（D-031）。
+func IngestWith(db *store.DB, col Collector, host, root string) (*Result, error) {
+	return IngestLimited(db, col, host, root, 0)
+}
+
+// IngestLimited は1ファイルにつき limit バイトまでで切り上げる（0 は蓋なし）。
+// **蓋は要約の側で切る**（summarize のコメント）。行を入れる側は要約が決めた終点に必ず合わせる。
+func IngestLimited(db *store.DB, col Collector, host, root string, limit int64) (*Result, error) {
+	fset, err := LocalFiles{Root: root}.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer fset.Close()
+	return IngestFrom(db, col, host, fset, limit)
+}
+
+// IngestFrom は読み手から取り込む。**置き場がどこかは読み手が決める**——
+// 向こうのホストでは向こうが解決して名乗るので、campd は頼む時点では知らない（M47）。
+func IngestFrom(db *store.DB, col Collector, host string, fset FileSet, limit int64) (*Result, error) {
+	res := &Result{Host: host, RoleCounts: map[string]int{}}
 
 	prior, err := loadPrior(db, host)
 	if err != nil {
 		return nil, err
 	}
-	corpus, err := Survey(root, prior)
+	corpus, err := SurveyFrom(col, fset, prior, limit)
 	if err != nil {
 		return nil, err
 	}
+	res.Root = corpus.Root
 	res.Unreadable = corpus.Unreadable
 	for _, f := range corpus.Files {
 		if p, ok := prior[f.Path]; ok && p.Offset > 0 && p.Offset == f.EndOffset {
@@ -59,6 +93,9 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 
 	for _, f := range corpus.Files {
 		res.RoleCounts[f.Role]++
+		if f.Capped {
+			res.Capped++
+		}
 	}
 
 	hostID, err := upsertHost(db, host)
@@ -82,6 +119,15 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	res.CWDs = len(projectIDs)
 
 	sessions := groupBySession(corpus)
+	// **別のホストが既に使っている id は書かない。** 書くと手元のセッションを上書きする。
+	collided, err := dropCollidedSessions(tx, hostID, sessions)
+	if err != nil {
+		return nil, err
+	}
+	if len(collided) > 0 {
+		corpus.dropSessions(collided)
+		res.Collisions = len(collided)
+	}
 	if err := writeSessions(tx, hostID, projectIDs, corpus, sessions); err != nil {
 		return nil, err
 	}
@@ -116,9 +162,19 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	// messages はファイル単位のトランザクションにする。オフセットの前進と
 	// レコードの挿入が同じ tx に入るので、途中で落ちても取りこぼさない。
 	for _, f := range corpus.Files {
-		c, err := writeMessages(db, corpus, f, fileIDs, knownRuns)
+		c, err := writeMessages(db, corpus, f, fileIDs, knownRuns, fset)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", f.Rel, err)
+		}
+		// **tx を閉じたあとに書く**（writeCounts.Limits の説明のとおり）。
+		for _, raw := range c.Limits {
+			if _, err := limits.Record(db, bytes.NewReader(raw), col.Name(), limits.SourceCodexRollout); err != nil {
+				if !errors.Is(err, limits.ErrNoWindows) {
+					res.LimitErrors++
+				}
+				continue
+			}
+			res.Limits++
 		}
 		res.Messages += c.Messages
 		res.Usage += c.Usage
@@ -138,11 +194,17 @@ func Ingest(db *store.DB, host, root string) (*Result, error) {
 	// 実体の捕獲は取り込みのたびに走らせる。CLI 側の GC と競争しており、
 	// 参照（JSONL）だけ残って中身が消えると復元できない。
 	// 参照の索引を先に作る必要があるので、必ず取り込みのあとに置く。
-	b, err := CaptureBackups(db, DefaultFileHistoryDir(root))
-	if err != nil {
-		return nil, err
+	//
+	// **ただし手元だけ。** 向こうのホストの記録には対応する置き場が無く、手元の
+	// 置き場を読んでも別のマシンの控えになる（M47）。走らせなければ Backups は
+	// nil のまま＝「捕獲は0」。
+	if local, ok := fset.(*localSet); ok {
+		b, err := CaptureBackups(db, DefaultFileHistoryDir(local.root))
+		if err != nil {
+			return nil, err
+		}
+		res.Backups = b
 	}
-	res.Backups = b
 
 	// 追記が1行も無ければ集計は変わらない。ポーリングで回すので、
 	// 何も起きていないときのコストをゼロに寄せる。
@@ -281,6 +343,38 @@ func groupBySession(c *Corpus) map[string][]*FileSummary {
 	return g
 }
 
+// dropCollidedSessions は、**別のホストが既に使っている id** を書かないように外す。
+//
+// `sessions.id` はホストを含まない主キー（0001）。向こうのホストに同じ id があると、
+// upsert が手元のセッションの題名・作業場所・モデル・更新時刻を向こうの値で上書きし、
+// 向こうの messages が手元のセッションにぶら下がる（`host_id` は更新されないので、
+// 所属は手元のまま）。2026-09-12 の codex のフェーズレビュー 1——設計に「書かずに数える」と
+// 書いておきながら、実装していなかった。
+//
+// **主キーを (host_id, id) に変える移行はしない**（本人は記録をホスト間で同期していない。
+// 2026-09-12 の決定）。衝突は例外的な事故なので、書かずに数えて上へ伝える。
+func dropCollidedSessions(tx *sql.Tx, hostID int64, g map[string][]*FileSummary) ([]string, error) {
+	var skipped []string
+	for key := range g {
+		var owner sql.NullInt64
+		err := tx.QueryRow(`select host_id from sessions where id = ?`, key).Scan(&owner)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if owner.Valid && owner.Int64 != hostID {
+			skipped = append(skipped, key)
+		}
+	}
+	sort.Strings(skipped)
+	for _, k := range skipped {
+		delete(g, k)
+	}
+	return skipped, nil
+}
+
 func writeSessions(tx *sql.Tx, hostID int64, projectIDs map[string]int64, c *Corpus, g map[string][]*FileSummary) error {
 	keys := make([]string, 0, len(g))
 	for k := range g {
@@ -321,9 +415,9 @@ func writeSessions(tx *sql.Tx, hostID int64, projectIDs map[string]int64, c *Cor
 			insert into sessions(
 				id, host_id, project_id, agent, parent_session_id, parent_agent_id,
 				ai_title, first_user_message, last_prompt, last_prompt_leaf,
-				git_branch, last_cwd, last_cli_version, last_mode, last_permission_mode,
+				git_branch, last_cwd, last_cli_version, last_model, last_mode, last_permission_mode,
 				bridge_session_id, is_sidechain, started_at, updated_at, total_cost_usd)
-			values(?,?,?,'claude-code',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			on conflict(id) do update set
 				ai_title=excluded.ai_title,
 				first_user_message=excluded.first_user_message,
@@ -332,14 +426,15 @@ func writeSessions(tx *sql.Tx, hostID int64, projectIDs map[string]int64, c *Cor
 				git_branch=excluded.git_branch,
 				last_cwd=excluded.last_cwd,
 				last_cli_version=excluded.last_cli_version,
+				last_model=coalesce(excluded.last_model, sessions.last_model),
 				last_mode=excluded.last_mode,
 				last_permission_mode=excluded.last_permission_mode,
 				bridge_session_id=excluded.bridge_session_id,
 				updated_at=excluded.updated_at,
 				total_cost_usd=coalesce(excluded.total_cost_usd, sessions.total_cost_usd)`,
-			key, hostID, projectID, parentSession, parentAgent,
+			key, hostID, projectID, c.Agent, parentSession, parentAgent,
 			nz(s.aiTitle), nz(s.firstUser), nz(s.lastPrompt), nz(s.lastPromptLeaf),
-			nz(s.gitBranch), nz(s.cwdLast), nz(s.cliVersion), nz(s.mode), nz(s.permissionMode),
+			nz(s.gitBranch), nz(s.cwdLast), nz(s.cliVersion), nz(s.model), nz(s.mode), nz(s.permissionMode),
 			nz(s.bridge), b2i(primary.Role == RoleSubagent || primary.IsSidechain),
 			s.startedAt, s.updatedAt, s.cost)
 		if err != nil {
@@ -355,6 +450,7 @@ type sessionFields struct {
 	aiTitle, firstUser           string
 	lastPrompt, lastPromptLeaf   string
 	gitBranch, cliVersion        string
+	model                        string
 	mode, permissionMode, bridge string
 	cost                         any
 }
@@ -383,6 +479,7 @@ func mergeSession(files []*FileSummary) sessionFields {
 		set(&s.lastPromptLeaf, f.LastPromptLeaf)
 		set(&s.gitBranch, f.GitBranch)
 		set(&s.cliVersion, f.CLIVersion)
+		set(&s.model, f.Model)
 		set(&s.mode, f.Mode)
 		set(&s.permissionMode, f.PermissionMode)
 		set(&s.bridge, f.BridgeSessionID)
@@ -507,6 +604,13 @@ func markMissing(tx *sql.Tx, hostID int64, c *Corpus, now string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	for _, p := range c.Deferred {
+		// **在るが今回は運ばなかったもの。** 消えた印を付けない（付けたら嘘になる）。
+		if _, err := stmt.Exec(p); err != nil {
+			stmt.Close()
+			return 0, err
+		}
+	}
 	for _, f := range c.Files {
 		if _, err := stmt.Exec(f.Path); err != nil {
 			stmt.Close()
@@ -515,10 +619,22 @@ func markMissing(tx *sql.Tx, hostID int64, c *Corpus, now string) (int, error) {
 	}
 	stmt.Close()
 
+	// **今回見た置き場の下だけに絞る。**
+	//
+	// 絞らないと、同じホストの別のエージェントの記録に「消えた」印が付く——取り込み器は
+	// 1回に1つなので、Corpus には片方のファイルしか入らない（2026-09-12、codex の
+	// フェーズレビューで指摘され、実データで確かめた: `campd ingest -agent codex` のあと
+	// Claude の 38 本すべてに印が付いていた）。置き場はエージェントごとに別（`~/.claude/projects`
+	// と `~/.codex/sessions`）なので、接頭辞で分けられる。
+	//
+	// LIKE は使わない（パスに `%` や `_` が入りうる）。
+	prefix := strings.TrimSuffix(c.Root, "/") + "/"
 	r, err := tx.Exec(`
 		update source_files set missing_at = ?
 		 where host_id = ? and superseded_at is null and missing_at is null
-		   and path not in (select path from seen_paths)`, now, hostID)
+		   and substr(path, 1, ?) = ?
+		   and path not in (select path from seen_paths)`,
+		now, hostID, len(prefix), prefix)
 	if err != nil {
 		return 0, err
 	}
@@ -617,6 +733,11 @@ type writeCounts struct {
 	Blocks     int
 	Files      int
 	Suppressed int // tombstone があるので取り込まなかった行
+
+	// Limits は行から拾ったプラン枠の観測。**tx の中では書かない。**
+	// store は接続を1本しか開かない（SetMaxOpenConns(1)）ので、ファイル単位の tx を
+	// 握ったまま limits.Record（別の Exec）を呼ぶと自分で自分を待つ（M46）。
+	Limits [][]byte
 }
 
 // suppressedOffsets は、取り込まない行の目印を集める。位置と、行そのものの sha256。
@@ -683,7 +804,7 @@ func suppressedOffsets(db *store.DB, fileID int64) (suppression, error) {
 	return out, hr.Err()
 }
 
-func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}) (writeCounts, error) {
+func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]int64, knownRuns map[string]struct{}, fset FileSet) (writeCounts, error) {
 	if f.Role == RoleEmpty {
 		return writeCounts{}, nil
 	}
@@ -770,7 +891,16 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 	var end int64
 	// 前回の位置から読む。ファイル全体を読み直して古い行を捨てる書き方だと、
 	// 2行の追記のために165MBを走査することになる。
-	res, walkErr := WalkFileFrom(f.Path, offset, func(l *Line) error {
+	// **要約が決めた終点で止める。** EOF まで走ると、要約の後に書かれた行まで
+	// 入れてしまい、ingested_offset（ここの終点）と resume_sha（要約の終点）が
+	// 食い違う。次回それが「同じ位置に違う中身」と読まれ、世代が進んで
+	// ファイル1本ぶんの行がもう一度入る。
+	rc, err := fset.Reader(f.Path, offset, f.EndOffset)
+	if err != nil {
+		return writeCounts{}, err
+	}
+	defer rc.Close()
+	res, walkErr := WalkReader(rc, offset, f.EndOffset, corpusParse(c, f), func(l *Line) error {
 		if suppressed.has(l.Offset, l.Raw) {
 			cnt.Suppressed++
 			return nil
@@ -832,6 +962,9 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 			}
 			cnt.Usage++
 		}
+		if len(l.Limits) > 0 {
+			cnt.Limits = append(cnt.Limits, l.Limits)
+		}
 		if l.Type == "cost-state" && l.TotalCostUSD != nil {
 			if maxCost == nil || *l.TotalCostUSD > *maxCost {
 				v := *l.TotalCostUSD
@@ -844,10 +977,15 @@ func writeMessages(db *store.DB, c *Corpus, f *FileSummary, fileIDs map[string]i
 		return writeCounts{}, walkErr
 	}
 	end = res.EndOffset
+	// 再開点は**台帳へ書く終点**で取り直す。summary_json の中身も同じ値にしたいので、
+	// 下の Marshal より前に入れ直す。
+	f.ResumeSHA = fset.Window(f.Path, end)
 
+	// 未完了の末尾は**要約が見たもの**を使う。終点を要約に合わせた以上、
+	// ここは EOF まで読まないので res.Pending は埋まらない。
 	var pending any
-	if len(res.Pending) > 0 {
-		pending = res.Pending
+	if len(f.Pending) > 0 {
+		pending = f.Pending
 	}
 	summary, err := json.Marshal(f)
 	if err != nil {

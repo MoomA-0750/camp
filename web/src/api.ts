@@ -184,6 +184,15 @@ export type Destination = {
   allowed: boolean; source: string; seen_at: string; updated_at: string
   // agent_paths は向こうでのエージェントごとの実体（駆動器の名前 → 絶対パス）。無ければ向こうで探す。
   pinned?: Pinned; agent_paths?: Record<string, string>
+  // records はエージェントごとの「記録を読むか」と、その跡。行が無ければ読まない。
+  records?: Record<string, RecordRoot>
+}
+
+/** 向こうのホストの記録を読むかどうかと、その跡（M47）。 */
+export type RecordRoot = {
+  host: string; agent: string; enabled: boolean
+  // 最後に読めた時刻と、最後の失敗。**何日も入っていないことに気づくため。**
+  last_ok_at?: string; last_error?: string; fail_count: number
 }
 
 /** 承認の中身の共通の形（駆動器が直したもの）。**差分は切り詰めない。** */
@@ -378,6 +387,12 @@ export const api = {
     postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/allow`, { allowed, password }),
   sshPath: (alias: string, agent: string, path: string, password: string) =>
     postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/path`, { agent, path, password }),
+  // 記録を読むかどうか。**読むようにするときだけパスワードが要る**（止めるのは軽く）。
+  sshRecord: (alias: string, agent: string, enabled: boolean, password: string) =>
+    postJSON<{ ok: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/record`, { agent, enabled, password }),
+  // いま読む。**待たない**——結果は台帳の跡と、取り込んだ行に出る。
+  sshRecordRead: (alias: string, agent: string) =>
+    postJSON<{ started: boolean }>(`/api/ssh/${encodeURIComponent(alias)}/record/read`, { agent }),
 
   logout: async () => {
     await fetch('/api/logout', { method: 'POST' })

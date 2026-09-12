@@ -325,7 +325,7 @@ CREATE INDEX ix_links_to ON note_links(to_note_id);
 
 CREATE TABLE usage_windows (
   id         INTEGER PRIMARY KEY,
-  agent      TEXT NOT NULL,               -- codex は会話記録に埋め込んでいる
+  agent      TEXT NOT NULL,               -- claude | codex（0027 で claude-code から揃えた）。codex は会話記録に埋め込んでいる
   account    TEXT,
   kind       TEXT NOT NULL,               -- five_hour|seven_day|spend_limit
   started_at TEXT, ends_at TEXT,

@@ -266,7 +266,7 @@ func (a *Agent) startRemote(m Msg) {
 	o.Session = m.Session
 	// 向こうの sh が確かめているが、名乗りも照らす。
 	if !under(o.Cwd, o.Root) {
-		a.reapRemote(&o)
+		a.reapRemote(&o, spec)
 		syscall.Kill(-pid, syscall.SIGTERM)
 		cmd.Wait()
 		fail(fmt.Sprintf("向こうで降りた先が許した場所の外だった（%s）。止めた", o.Cwd))
@@ -280,7 +280,7 @@ func (a *Agent) startRemote(m Msg) {
 		}
 	}
 	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
-		pending: map[string]chan []byte{}, remote: &o, name: agent,
+		pending: map[string]chan []byte{}, remote: &o, spec: spec, name: agent,
 		conv: d.Open(OpenOpts{Session: m.Session, Perm: perm, Cwd: o.Cwd, Remote: true, RemoteHomes: homes})}
 	if lg, err := OpenLog(a.LogDir, m.Session); err == nil {
 		k.log = lg
@@ -300,7 +300,7 @@ func (a *Agent) startRemote(m Msg) {
 		err = fmt.Errorf("%v 待っても話し始められない（%v）", a.HeaderWait, err)
 	}
 	if err != nil {
-		a.reapRemote(&o)
+		a.reapRemote(&o, spec)
 		syscall.Kill(-pid, syscall.SIGTERM)
 		cmd.Wait()
 		if k.log != nil {
@@ -351,10 +351,10 @@ func (a *Agent) startRemote(m Msg) {
 
 	// **終わったら必ず向こうを見に行く。** 手元の ssh が終わっても、
 	// 向こうの子や孫が残っていることがある（実測）。
-	res, detail := a.reapRemote(&o)
+	res, detail := a.reapRemote(&o, spec)
 	if res == RemoteUnreachable && a.ReapRetry > 0 {
 		time.Sleep(a.ReapRetry)
-		res, detail = a.reapRemote(&o)
+		res, detail = a.reapRemote(&o, spec)
 	}
 	reason += "。向こう: " + RemoteEndLabel(res, detail)
 
@@ -384,9 +384,25 @@ var campScopeRe = regexp.MustCompile(`^camp-session-[0-9a-f]{32}\.scope$`)
 //
 // **scope 名は自分で作った形しか通さない。** 向こうの `systemctl --user stop` に
 // 渡るので、任意の名前を通すと同じユーザーの無関係な unit を止められる。
-func (a *Agent) reapRemote(o *RemoteOwner) (string, string) {
+//
+// **繋ぐ前に行き先を照らす**（spec。M47 で足した）。起こすときは照らしているのに
+// ここは飛ばしていたので、`~/.ssh/config` の HostName を書き換えれば、固定と違う先へ
+// 繋ぎに行けた（Fable の M47 設計レビュー 4）。照らせないときは**繋がない**——
+// 掃除のために、行き先の固定を破らない。残りは「確かめられない」として残る。
+func (a *Agent) reapRemote(o *RemoteOwner, spec *RemoteSpec) (string, string) {
 	if o == nil || validAlias(o.Host) != nil || o.PID <= 0 {
 		return RemoteUnreachable, "向こうの身元が無い"
+	}
+	if spec == nil || spec.Alias != o.Host || !spec.Pin.Pinned() {
+		return RemoteUnreachable, "行き先（ホスト鍵）の固定が無いので、確かめに行かない"
+	}
+	now, err := a.resolve(o.Host)
+	if err != nil {
+		return RemoteUnreachable, err.Error()
+	}
+	if d := spec.Pin.Diff(now); d != "" {
+		return RemoteUnreachable, fmt.Sprintf(
+			"行き先が、許したときと違う（%s）。確かめに行かない", d)
 	}
 	st, boot, scope := "-", "-", "-"
 	if o.Started != 0 {
@@ -438,9 +454,10 @@ func (a *Agent) killChild(k *child) {
 	k.mu.Lock()
 	k.deliberate = true
 	remote := k.remote
+	spec := k.spec
 	k.mu.Unlock()
 	if remote != nil {
-		if res, why := a.reapRemote(remote); res == RemoteUnreachable {
+		if res, why := a.reapRemote(remote, spec); res == RemoteUnreachable {
 			fmt.Fprintf(os.Stderr, "camp agent: %s の向こうを止められない: %s\n", k.id[:8], why)
 		}
 	}
@@ -456,7 +473,7 @@ func (a *Agent) reapOrphanRemote(m Msg) {
 	if alive, known := o.Alive(); alive && known {
 		syscall.Kill(-m.PID, syscall.SIGTERM)
 	}
-	res, detail := a.reapRemote(m.RemoteOwner)
+	res, detail := a.reapRemote(m.RemoteOwner, m.Remote)
 	a.send(Msg{T: MsgReaped, Session: m.Session, Reason: RemoteEndLabel(res, detail),
 		RemoteEnd: res})
 }

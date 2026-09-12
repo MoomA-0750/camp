@@ -112,7 +112,16 @@ func WalkFile(path string, fn func(*Line) error) (WalkResult, error) {
 	return WalkFileFrom(path, 0, fn)
 }
 
-// WalkFileFrom は start バイト目から読む。差分追尾で使う。
+// ParseFunc は1行を Line に落とす関数。取り込み器ごとに違う（collector.go）。
+type ParseFunc func(raw []byte, offset int64) (*Line, error)
+
+// WalkFileFrom は start バイト目から読む。差分追尾で使う。行の解釈は Claude の形。
+func WalkFileFrom(path string, start int64, fn func(*Line) error) (WalkResult, error) {
+	return WalkFileFromWith(path, start, ParseLine, fn)
+}
+
+// WalkFileFromWith は行の解釈を差し替えて読む。**エージェントごとに違うのは
+// 1行の形だけで、読み進め方（部分行・壊れた行・再開点）は共通**（M44）。
 //
 // start は「完了した行だけを消費した後の位置」なので、前回の走査で
 // 未完了だった末尾は自然に読み直される。pending_tail は診断用であって
@@ -120,7 +129,22 @@ func WalkFile(path string, fn func(*Line) error) (WalkResult, error) {
 //
 // 1行が壊れていてもファイル全体の読み取りは止めない。壊れた行は
 // Broken に積んで先へ進む。fn がエラーを返した場合だけ中断する。
-func WalkFileFrom(path string, start int64, fn func(*Line) error) (WalkResult, error) {
+func WalkFileFromWith(path string, start int64, parse ParseFunc, fn func(*Line) error) (WalkResult, error) {
+	return WalkFileRange(path, start, 0, parse, fn)
+}
+
+// WalkFileRange は stop で読み終える。**0 は「最後まで」**。
+//
+// 2つの用途がある。(1) 1回に運ぶ量に蓋をする（向こうのホストの記録。M47）。
+// (2) **要約が決めた終点に、台帳へ書く側を必ず合わせる。** 取り込みは同じ範囲を
+// 2回読み（summarize と writeMessages）、片方が EOF まで走ると
+// 「ingested_offset は2周目の終点・resume_sha は1周目の終点」になって食い違う。
+// 次回の rotatedFrom がそれを「同じ位置に違う中身」と見て世代を進め、
+// ファイル1本ぶんの行がもう一度入る（2026-09-03 の事故と同じ経路）。
+//
+// stop は**行の途中では切らない**。「次の行の先頭が stop 以上になったら止める」
+// なので、蓋として使うと最後の1行ぶんだけ超えることがある。
+func WalkFileRange(path string, start, stop int64, parse ParseFunc, fn func(*Line) error) (WalkResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return WalkResult{}, err
@@ -133,9 +157,22 @@ func WalkFileFrom(path string, start int64, fn func(*Line) error) (WalkResult, e
 		}
 	}
 
+	return WalkReader(f, start, stop, parse, fn)
+}
+
+// WalkReader は**既に start の位置へ進めてある読み口**から読む。
+//
+// 向こうのホストの記録は、繋いだ先で1回にまとめて取り寄せた「写し」を読む（M47）。
+// 開き方を知らないこの形にしておくと、読み進め方（部分行・壊れた行・再開点・終点）を
+// 手元と向こうで1つに保てる。
+func WalkReader(r io.Reader, start, stop int64, parse ParseFunc, fn func(*Line) error) (WalkResult, error) {
 	var res WalkResult
-	rd := NewReader(f, start)
+	rd := NewReader(r, start)
 	for {
+		if stop > 0 && rd.Offset() >= stop {
+			res.EndOffset = rd.Offset()
+			return res, nil
+		}
 		raw, off, err := rd.Next()
 		if err == io.EOF {
 			res.Pending = rd.Pending
@@ -146,7 +183,7 @@ func WalkFileFrom(path string, start int64, fn func(*Line) error) (WalkResult, e
 			res.EndOffset = rd.Offset()
 			return res, err
 		}
-		line, err := ParseLine(raw, off)
+		line, err := parse(raw, off)
 		if err != nil {
 			res.Broken = append(res.Broken, err)
 			continue

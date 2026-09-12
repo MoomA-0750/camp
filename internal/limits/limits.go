@@ -25,8 +25,15 @@ import (
 // SourceStatusLine は statusLine コマンドの stdin JSON 由来であることを示す。
 const SourceStatusLine = "statusline"
 
-// AgentClaudeCode は Claude Code の観測であることを示す。
-const AgentClaudeCode = "claude-code"
+// SourceCodexRollout は Codex の会話記録（rollout-*.jsonl の token_count）由来であることを示す。
+// **Codex はプラン枠を記録の中に埋めている**ので、statusLine のような外からの観測が要らない
+// （docs/20-data-model.md が予定していた値）。
+const SourceCodexRollout = "codex-rollout"
+
+// AgentClaude は Claude Code の観測であることを示す。**語彙は `claude` / `codex`**
+// （sessions.agent・runtime_sessions.agent と揃える。本人の決定 2026-09-12。移行 0027 で
+// 既存の `claude-code` の行も直した）。
+const AgentClaude = "claude"
 
 // windowLen は窓の種類から長さを引く。started_at は ends_at から逆算する。
 var windowLen = map[string]time.Duration{

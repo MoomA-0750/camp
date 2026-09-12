@@ -42,7 +42,7 @@ function app() {
 }
 
 const session = {
-  id: 'abc', host: 'h', project: 'p', repo_path: '/p', agent: 'claude-code',
+  id: 'abc', host: 'h', project: 'p', repo_path: '/p', agent: 'claude',
   title: 'テストの会話', started_at: '2026-09-02T00:00:00Z',
   updated_at: '2026-09-02T01:00:00Z', messages: 10, conversation: 4,
 }

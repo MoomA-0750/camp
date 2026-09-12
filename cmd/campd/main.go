@@ -31,6 +31,7 @@ import (
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/mcp"
+	"github.com/MoomA-0750/camp/internal/remoteingest"
 	"github.com/MoomA-0750/camp/internal/report"
 	"github.com/MoomA-0750/camp/internal/retain"
 	"github.com/MoomA-0750/camp/internal/search"
@@ -243,10 +244,20 @@ func cmdScan(args []string) error {
 func cmdIngest(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
-	root := fs.String("root", defaultClaudeProjects(), "~/.claude/projects 相当のディレクトリ")
+	root := fs.String("root", "", "記録の置き場（既定はエージェントごと）")
 	host := fs.String("host", defaultHost(), "このコーパスを持つホスト名")
+	agent := fs.String("agent", ingest.AgentClaude,
+		"取り込むエージェント（"+strings.Join(ingest.CollectorNames(), " / ")+"）")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	col, ok := ingest.CollectorFor(*agent)
+	if !ok {
+		return fmt.Errorf("知らないエージェント %q（名乗っているのは %s）",
+			*agent, strings.Join(ingest.CollectorNames(), " / "))
+	}
+	if *root == "" {
+		*root = defaultRecordRoot(col)
 	}
 
 	db, err := store.Open(*dbPath)
@@ -260,7 +271,7 @@ func cmdIngest(args []string) error {
 	}
 
 	started := time.Now()
-	res, err := ingest.Ingest(db, *host, *root)
+	res, err := ingest.IngestWith(db, col, *host, *root)
 	if err != nil {
 		return err
 	}
@@ -277,6 +288,14 @@ func cmdIngest(args []string) error {
 	}
 	fmt.Printf("\nprojects        %d（cwd %d 個から）\nsessions        %d\nruns            %d\nsession_runs    %d\nsource_files    %d\nmessages 追加   %d\nblocks 追加     %d\nusage 計上      %d\nファイル結合    %d（うち %d 件を発行元のターンに繋ぎ直した）\n",
 		res.Projects, res.CWDs, res.Sessions, res.Runs, res.SessionRuns, res.SourceFiles, res.Messages, res.Blocks, res.Usage, res.Files, res.Relinked)
+	// プラン枠は記録の中から拾う（Codex）。**書けなかった数も出す**——黙って捨てない。
+	if res.Limits > 0 || res.LimitErrors > 0 {
+		fmt.Printf("プラン枠        %d 回ぶん取り込んだ", res.Limits)
+		if res.LimitErrors > 0 {
+			fmt.Printf("（%d 回は書けなかった）", res.LimitErrors)
+		}
+		fmt.Println()
+	}
 	if res.Reread > 0 {
 		fmt.Printf("世代を進めた   %d\n", res.Reread)
 	}
@@ -501,6 +520,19 @@ func defaultHost() string {
 		return "localhost"
 	}
 	return h
+}
+
+// defaultRecordRoot は取り込み器ごとの記録の置き場（本人の設定のまま。CLI と同じ場所）。
+// Claude だけ従来の上書き（CAMP_CLAUDE_PROJECTS）を残す。
+func defaultRecordRoot(col ingest.Collector) string {
+	if col.Name() == ingest.AgentClaude {
+		return defaultClaudeProjects()
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return col.DefaultRoot(home)
 }
 
 func defaultClaudeProjects() string {
@@ -1010,6 +1042,11 @@ func cmdServe(args []string) error {
 	sockGroup := fs.String("report-group", os.Getenv("CAMP_REPORT_GROUP"), "報告口を持たせるグループ（空なら変えない）")
 	agentSock := fs.String("agent-sock", defaultAgentSock(), "実行面と話す制御口（空なら開かない）")
 	maxConc := fs.Int("max-sessions", 4, "同時に走らせるセッションの上限")
+	// **向こうのホストの記録を見に行く間隔**（本人の決定 2026-09-12: 既定は1時間。
+	// 設定で変えられ、0 でやめる）。0 のときは、押したときと、そのホストのセッションが
+	// 終わった直後だけになる。続けて失敗した接続先は間隔が伸びる。
+	recordEvery := fs.Duration("record-every", time.Hour,
+		"向こうのホストの記録を見に行く間隔（0 でやめる）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1094,6 +1131,23 @@ func cmdServe(args []string) error {
 	defer close(supDone)
 	go sup.Run(supDone, 30*time.Second)
 
+	// **向こうのホストの記録を読む**（M47）。取り込みと実行面を繋ぐのはここだけ——
+	// `internal/session` は取り込みを知らず、`internal/ingest` はセッションを知らない。
+	sup.SetReadRecords(func(host, agent string) {
+		res, err := remoteingest.RunOnce(db, sup, agent, host)
+		if err != nil {
+			// **静かに次回へ。** 跡は台帳に残っているので、画面で気づける。
+			return
+		}
+		if res != nil && res.Messages > 0 {
+			fmt.Printf("%s の %s の記録を %d 行取り込んだ\n", host, agent, res.Messages)
+		}
+	})
+	go sup.RunRecords(supDone, *recordEvery)
+	if *recordEvery > 0 {
+		fmt.Printf("記録の取り込み  %v ごと（向こうのホスト。台帳で許した組み合わせだけ）\n", *recordEvery)
+	}
+
 	// Ctrl-C で受け付けをやめ、走っている要求を待つ。
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -1177,7 +1231,7 @@ func cmdLimits(args []string) error {
 func cmdLimitsRecord(args []string) error {
 	fs := flag.NewFlagSet("limits record", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDBPath(), "SQLite ファイルのパス")
-	agent := fs.String("agent", limits.AgentClaudeCode, "エージェント識別子")
+	agent := fs.String("agent", limits.AgentClaude, "エージェント識別子")
 	source := fs.String("source", limits.SourceStatusLine, "観測元")
 	quiet := fs.Bool("quiet", true, "何も出力しない（フックからの既定）")
 	sock := fs.String("sock", defaultReportSock(), "DBを開けないときに使う報告口")

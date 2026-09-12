@@ -611,6 +611,19 @@ func TestSSHGIsReadAndDifferencesAreSpelledOut(t *testing.T) {
 	}
 }
 
+// farSpec は「いまの far」を固定にした行き先。
+//
+// **掃除でも行き先を照らす**ようにしたので（M47。Fable の設計レビュー 4）、reapRemote を
+// 直に呼ぶテストはこれを渡す。照らして通ることも、ここで一緒に確かめている。
+func farSpec(t *testing.T, r *remoteRig) *RemoteSpec {
+	t.Helper()
+	pin, err := r.a.resolve("far")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &RemoteSpec{Alias: "far", Pin: pin}
+}
+
 // **起動時刻の違う pid は撃たない。** 向こうで pid が使い回されていれば、それは別人。
 func TestAReusedPIDOverThereIsNotKilled(t *testing.T) {
 	r := newRemoteRig(t, remoteClaudeBody)
@@ -628,11 +641,12 @@ func TestAReusedPIDOverThereIsNotKilled(t *testing.T) {
 		return err == nil && sessionOf(pid) == pid
 	})
 
-	res, why := r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st + 1, BootID: BootID()})
+	spec := farSpec(t, r)
+	res, why := r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st + 1, BootID: BootID()}, spec)
 	if res != RemoteGone || !procAlive(pid) {
 		t.Fatalf("起動時刻の違う pid を止めた: %s（%s） alive=%v", res, why, procAlive(pid))
 	}
-	res, why = r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st, BootID: BootID()})
+	res, why = r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st, BootID: BootID()}, spec)
 	if res != RemoteKilled {
 		t.Fatalf("起動時刻の合う pid を止めない: %s（%s）", res, why)
 	}
@@ -743,19 +757,67 @@ func TestTheReaperChecksWhoItIsBeforeStoppingAUnit(t *testing.T) {
 	})
 	unit := scopeName(newID())
 
-	res, why := r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st + 1, BootID: BootID(), Scope: unit})
+	spec := farSpec(t, r)
+	res, why := r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st + 1, BootID: BootID(), Scope: unit}, spec)
 	if res != RemoteGone || called() {
 		t.Fatalf("起動時刻が違うのに scope を止めた: %s（%s） systemctl=%v", res, why, called())
 	}
 	res, why = r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st,
-		BootID: "00000000-0000-0000-0000-000000000000", Scope: unit})
+		BootID: "00000000-0000-0000-0000-000000000000", Scope: unit}, spec)
 	if res != RemoteGone || called() {
 		t.Fatalf("再起動を跨いだのに scope を止めた: %s（%s） systemctl=%v", res, why, called())
 	}
-	res, why = r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st, BootID: BootID(), Scope: unit})
+	res, why = r.a.reapRemote(&RemoteOwner{Host: "far", PID: pid, Started: st, BootID: BootID(), Scope: unit}, spec)
 	if res != RemoteKilled || !called() {
 		t.Fatalf("本人なのに止めない: %s（%s） systemctl=%v", res, why, called())
 	}
+}
+
+// **掃除でも行き先を照らす。** 固定と違う先へは繋ぎに行かない（M47。Fable の設計レビュー 4）。
+//
+// 起こすときは実行面が `ssh -G` と固定を照らしているのに、掃除の経路はそれを飛ばして
+// 繋いでいた。`~/.ssh/config` の HostName を書き換えれば、固定と違う先へ定期的に
+// 繋ぎに行けてしまう。**繋いだ時点で向こうのログインシェルが走る。**
+//
+// 照らせないときは「確かめられない」として残す——掃除のために、行き先の固定を破らない。
+func TestReapingDoesNotDialADestinationThatMoved(t *testing.T) {
+	r := newRemoteRig(t, remoteClaudeBody)
+	cmd := exec.Command("setsid", "sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	go cmd.Wait()
+	defer killIfAlive(pid)
+	var st uint64
+	waitFor(t, 3*time.Second, func() bool {
+		v, err := Starttime(pid)
+		st = v
+		return err == nil && sessionOf(pid) == pid
+	})
+	o := func() *RemoteOwner {
+		return &RemoteOwner{Host: "far", PID: pid, Started: st, BootID: BootID()}
+	}
+
+	// 許したときとは違う行き先を固定にしてある（config を書き換えられた状況）。
+	moved := &RemoteSpec{Alias: "far", Pin: Resolved{
+		HostName: "10.9.9.9", User: "u", Port: "22", HostKeys: []string{"SHA256:x"}}}
+	res, why := r.a.reapRemote(o(), moved)
+	if res != RemoteUnreachable || !procAlive(pid) {
+		t.Fatalf("行き先が変わっているのに繋ぎに行った: %s（%s） alive=%v", res, why, procAlive(pid))
+	}
+
+	// 固定そのものが無いときも繋がない。
+	res, why = r.a.reapRemote(o(), nil)
+	if res != RemoteUnreachable || !procAlive(pid) {
+		t.Fatalf("固定が無いのに繋ぎに行った: %s（%s） alive=%v", res, why, procAlive(pid))
+	}
+
+	// **照らして合えば、いつもどおり始末する。**
+	if res, why = r.a.reapRemote(o(), farSpec(t, r)); res != RemoteKilled {
+		t.Fatalf("行き先が合っているのに始末しない: %s（%s）", res, why)
+	}
+	waitFor(t, 5*time.Second, func() bool { return !procAlive(pid) })
 }
 
 // **「確かめようがない」を「終わった」と書かない。** 孤児のまま残す。

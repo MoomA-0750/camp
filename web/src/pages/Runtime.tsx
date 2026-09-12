@@ -477,6 +477,7 @@ function SSHLedger({ agents }: { agents: AgentInfo[] }) {
             <tr>
               <th className="nowrap">許可</th><th>エイリアス</th><th>接続先</th>
               <th className="nowrap">固定した行き先</th><th className="nowrap">実体の場所</th>
+              <th className="nowrap">記録</th>
               <th className="nowrap">Tailscale</th><th>覚え書き</th>
             </tr>
           </thead>
@@ -507,6 +508,36 @@ function SSHLedger({ agents }: { agents: AgentInfo[] }) {
                     : Object.entries(d.agent_paths ?? {}).map(([a, p]) => (
                       <div key={a}>{labelOf(a)}: {p}</div>
                     ))}
+                </td>
+                {/* 記録を読むか。**行が無ければ読まない**（既定で読みに行かない）。
+                    読むようにするときだけパスワードが要る。最後に読めた時刻と最後の失敗を
+                    出すのは、**何日も入っていないことに気づけるように**。 */}
+                <td className="nowrap">
+                  {agents.length === 0 && <span className="muted">—</span>}
+                  {agents.map((a) => {
+                    const rec = (d.records ?? {})[a.name]
+                    const on = rec?.enabled ?? false
+                    return (
+                      <div key={a.name}>
+                        <button disabled={!d.allowed || (!on && !pw)}
+                          onClick={() => void run(() => api.sshRecord(d.alias, a.name, !on, pw))}>
+                          {labelOf(a.name)}: {on ? '読む' : '読まない'}
+                        </button>
+                        {on && (
+                          <button disabled={!d.allowed}
+                            onClick={() => void run(() => api.sshRecordRead(d.alias, a.name))}>
+                            いま読む
+                          </button>
+                        )}
+                        {on && rec?.last_error && (
+                          <div className="warn-text">{rec.last_error}（{rec.fail_count} 回続けて）</div>
+                        )}
+                        {on && rec?.last_ok_at && !rec.last_error && (
+                          <div className="muted">最後に読めた: {rec.last_ok_at}</div>
+                        )}
+                      </div>
+                    )
+                  })}
                 </td>
                 <td className="mono muted">{d.tailscale_ip}</td>
                 <td>{d.note}</td>

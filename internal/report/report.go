@@ -299,7 +299,7 @@ func (l *Listener) recordLimits(e Event) (int64, error) {
 		return 0, fmt.Errorf("payload が長すぎる（%d バイト、上限 %d）", len(e.Payload), maxDetail)
 	}
 	got, err := limits.Record(l.db, bytes.NewReader(e.Payload),
-		limits.AgentClaudeCode, limits.SourceStatusLine)
+		limits.AgentClaude, limits.SourceStatusLine)
 	if err != nil {
 		if errors.Is(err, limits.ErrNoWindows) {
 			return 0, nil // 窓が出ていないだけ。異常ではない

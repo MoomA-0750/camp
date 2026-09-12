@@ -86,6 +86,9 @@ type child struct {
 	logBroken bool
 	// remote は ssh の向こうの子。このマシンの子なら nil。
 	remote *RemoteOwner
+	// spec は起こしたときの行き先（固定つき）。**止めるときも掃除のときも照らす**——
+	// 繋いだ時点で向こうのログインシェルが走るので、照らさずに繋がない（M47）。
+	spec *RemoteSpec
 	// deliberate は Camp が止めに入ったか。**止めて ssh が 255 で終わったのを、
 	// 接続が切れたと読まないため。**
 	deliberate bool
@@ -286,6 +289,10 @@ func (a *Agent) Run() error {
 			go a.scanSSH(m)
 		case MsgSSHResolve:
 			go a.resolveSSH(m)
+		case MsgRecList:
+			go a.recList(m)
+		case MsgRecRead:
+			go a.recRead(m)
 		case MsgControl:
 			go a.control(m)
 		case MsgError:

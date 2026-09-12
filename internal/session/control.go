@@ -742,6 +742,12 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			out = audit.Error
 		}
 		s.audit(m.Session, "session.exit", strconv.Itoa(m.Code), m.Reason, out)
+		// **向こうのホストなら、記録を1回読む**（本人の決定 2026-09-12。終わった直後が
+		// いちばん見たいとき）。ただし**回線が切れて終わったときは行かない**——そのまま
+		// 繋ぎに行っても通らず、その失敗で「見に行く間隔」が伸びてしまう。
+		if host != "" && !m.ConnLost {
+			s.afterSession(host, agentOr(ls.rec.Agent))
+		}
 
 	case MsgFailed:
 		if _, ok := s.check(m); !ok {
@@ -778,7 +784,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, out)
 		}
 
-	case MsgTailRes, MsgSSHRes, MsgCtlRes, MsgSSHResolved:
+	case MsgTailRes, MsgSSHRes, MsgCtlRes, MsgSSHResolved, MsgRecListRes, MsgRecReadRes:
 		s.deliver(m)
 
 	case MsgDropped:

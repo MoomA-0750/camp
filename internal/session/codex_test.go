@@ -280,12 +280,18 @@ func TestARequestBeforeTheThreadStartsIsRefused(t *testing.T) {
 	db := newDB(t)
 	s, _, logPath := wireCodex(t, db, "CAMP_FAKE_CODEX_EARLYASK=1")
 	startCodexHere(t, s, db)
+	// **断りが落とし先に現れるまで待つ。** 起きた（idle になった）ことと、実行面が早い要求に
+	// 断りを返して偽の子がそれを書き終えたことは別。待たずに読むと空振りする
+	// ——2026-09-12、パッケージごと30回まわして1回だけ再現した。製品ではなく、この待ちの不足。
 	refused := false
-	for _, m := range received(t, logPath) {
-		if _, ok := m["error"]; ok && m["id"] == float64(0) {
-			refused = true
+	waitFor(t, 5*time.Second, func() bool {
+		for _, m := range received(t, logPath) {
+			if _, ok := m["error"]; ok && m["id"] == float64(0) {
+				refused = true
+			}
 		}
-	}
+		return refused
+	})
 	if !refused {
 		t.Fatal("話し始める前の要求に黙った")
 	}

@@ -71,6 +71,11 @@ type Line struct {
 	ToolUseResult json.RawMessage `json:"toolUseResult"`
 	Attachment    json.RawMessage `json:"attachment"`
 
+	// Limits はプラン枠の観測を **limits が読む形**（`{"rate_limits":{窓の名前:{used_percentage,resets_at}}}`）
+	// に直したもの。Codex は記録の中にプラン枠を埋めているので、取り込みのときに拾える（M46）。
+	// Claude は statusLine の別経路なので、ここは空のまま。
+	Limits []byte `json:"-"`
+
 	// Raw は元の行そのもの。加工せずそのまま保存する（D-010）。
 	Raw []byte `json:"-"`
 	// Offset はファイル先頭からのバイト位置。表示順と追尾の再開点を兼ねる。

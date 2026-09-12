@@ -123,6 +123,24 @@ func (r Resolved) String() string {
 	return s
 }
 
+// RecFile は向こうの記録1本（一覧の1件）。
+//
+// **dev・inode は持たない。** 同じ実体かは大きさと再開点の窓だけで決める
+// （2026-09-03 の実測で、再起動で dev が変わっただけで 72 ファイル全部が
+// 「別の実体」と判定された）。
+type RecFile struct {
+	Path  string `json:"path"`
+	Size  int64  `json:"size"`
+	MTime int64  `json:"mtime"` // Unix 秒
+}
+
+// RecRange は取り寄せる範囲。N は最大バイト数。
+type RecRange struct {
+	Path string `json:"path"`
+	Off  int64  `json:"off"`
+	N    int64  `json:"n"`
+}
+
 // RemoteSpec は campd が実行面へ渡す「どこへ繋ぐか」。
 type RemoteSpec struct {
 	Alias string `json:"alias"`
@@ -485,6 +503,100 @@ members $$ $$
 marked "$mark" $$
 stopall
 exit $rc
+`
+
+// recListScript は向こうの記録を**数えて返す**（M47）。**向こうへは書かない。**
+//
+// 引数: 置き場の環境変数名（- なら見ない）、無いときの $HOME からの相対パス、
+// その下の記録の置き場、窓の大きさ。標準入力に `パス<TAB>位置` を並べると、
+// その位置の直前の窓も返す（同じ実体かを見るため）。
+//
+// **ハッシュは向こうで計算させない。** `sha256sum` があるとは限らず、あっても
+// 手元と同じ計算だと保証できない。窓の中身そのものを運び、手元で同じ関数にかける
+// （256 バイト × 40 本で 14KB 程度）。
+//
+// 1行目に必ず `CAMP-REC` か `CAMP-ERR` を出す（wrapperScript と同じ約束）。
+// 読むのは `*.jsonl` だけ・置き場の下だけ・通常ファイルだけ。symlink は辿らない。
+const recListScript = `henv=$1 hdef=$2 sub=$3 win=$4
+nl='
+'
+tab=$(printf '\t')
+bad() { printf 'CAMP-ERR\t%s\t%s\n' "$2" "$1"; exit "$2"; }
+case "$henv" in -) ;; ''|[0-9]*|*[!A-Z0-9_]*) bad "置き場の環境変数名として使えない: $henv" 90 ;; esac
+case "$hdef$sub" in ''|*"$nl"*|*"$tab"*) bad '置き場の指定に改行かタブがある' 90 ;; esac
+case "$win" in ''|*[!0-9]*) bad '窓の大きさが数でない' 90 ;; esac
+home=
+if [ "$henv" != - ]; then eval "home=\${$henv:-}"; fi
+[ -n "$home" ] || home=$HOME/$hdef
+root=$home/$sub
+rootreal=$(cd -- "$root" 2>/dev/null && pwd -P) || bad "記録の置き場が向こうに無い: $root" 91
+[ "$rootreal" = / ] && bad '記録の置き場を辿ると / になる' 91
+case "$rootreal" in *"$nl"*|*"$tab"*) bad '実パスに改行かタブがある' 90 ;; esac
+printf 'CAMP-REC\t1\t%s\n' "$rootreal"
+if find "$rootreal" -maxdepth 0 -printf '' 2>/dev/null; then
+  find "$rootreal" -type f -name '*.jsonl' -printf 'F\t%s\t%Ts\t%p\n'
+elif stat -c '%s' -- "$rootreal" >/dev/null 2>&1; then
+  find "$rootreal" -type f -name '*.jsonl' -print | while IFS= read -r p; do
+    case "$p" in *"$tab"*) continue ;; esac
+    set -- $(stat -c '%s %Y' -- "$p" 2>/dev/null) || continue
+    [ -n "$2" ] || continue
+    printf 'F\t%s\t%s\t%s\n' "$1" "$2" "$p"
+  done
+else
+  bad '向こうの find も stat も大きさを出せない' 96
+fi
+while IFS="$tab" read -r p off; do
+  case "$p" in "$rootreal"/*) ;; *) continue ;; esac
+  case "$p" in *'/../'*|*'/..') continue ;; esac
+  case "$p" in *.jsonl) ;; *) continue ;; esac
+  [ -f "$p" ] || continue
+  case "$off" in ''|*[!0-9]*) continue ;; esac
+  [ "$off" -gt 0 ] || continue
+  st=$((off - win))
+  [ "$st" -lt 0 ] && st=0
+  n=$((off - st))
+  printf 'W\t%s\t' "$p"
+  tail -c +$((st + 1)) -- "$p" 2>/dev/null | head -c "$n" | base64 | tr -d '\n'
+  printf '\n'
+done
+`
+
+// recReadScript は頼まれた範囲だけ返す（M47）。**向こうへは書かない。**
+//
+// 引数は recListScript と同じ（置き場の決め方）＋1回の合計の蓋。標準入力に
+// `パス<TAB>位置<TAB>最大バイト数` を並べる。**まとめて頼むのは、1本ずつ
+// 繋ぎ直さないため。** 蓋で切ったら最後に `CAP` を出す。
+const recReadScript = `henv=$1 hdef=$2 sub=$3 cap=$4
+nl='
+'
+tab=$(printf '\t')
+bad() { printf 'CAMP-ERR\t%s\t%s\n' "$2" "$1"; exit "$2"; }
+case "$henv" in -) ;; ''|[0-9]*|*[!A-Z0-9_]*) bad "置き場の環境変数名として使えない: $henv" 90 ;; esac
+case "$hdef$sub" in ''|*"$nl"*|*"$tab"*) bad '置き場の指定に改行かタブがある' 90 ;; esac
+case "$cap" in ''|*[!0-9]*) bad '蓋が数でない' 90 ;; esac
+home=
+if [ "$henv" != - ]; then eval "home=\${$henv:-}"; fi
+[ -n "$home" ] || home=$HOME/$hdef
+root=$home/$sub
+rootreal=$(cd -- "$root" 2>/dev/null && pwd -P) || bad "記録の置き場が向こうに無い: $root" 91
+[ "$rootreal" = / ] && bad '記録の置き場を辿ると / になる' 91
+printf 'CAMP-REC\t1\t%s\n' "$rootreal"
+total=0
+while IFS="$tab" read -r p off n; do
+  case "$p" in "$rootreal"/*) ;; *) continue ;; esac
+  case "$p" in *'/../'*|*'/..') continue ;; esac
+  case "$p" in *.jsonl) ;; *) continue ;; esac
+  [ -f "$p" ] || continue
+  case "$off$n" in ''|*[!0-9]*) continue ;; esac
+  [ "$n" -gt 0 ] || continue
+  if [ "$total" -ge "$cap" ]; then printf 'CAP\n'; break; fi
+  rem=$((cap - total))
+  [ "$n" -gt "$rem" ] && n=$rem
+  printf 'D\t%s\t%s\t' "$p" "$off"
+  tail -c +$((off + 1)) -- "$p" 2>/dev/null | head -c "$n" | base64 | tr -d '\n'
+  printf '\n'
+  total=$((total + n))
+done
 `
 
 // reapScript は向こうの残りを始末する。

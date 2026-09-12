@@ -249,6 +249,39 @@ func checkRemote(db *store.DB, agent, host, cwd string) (string, string, *Remote
 	return c, root, &RemoteSpec{Alias: host, Pin: *d.Pinned, Bin: d.AgentPaths[agent]}, nil
 }
 
+// checkRecord は向こうのホストの記録を読んでよいかを見る（M47）。**照合するのは campd 側。**
+//
+// checkRemote と違い、作業場所は見ない——読むのは記録の置き場だけで、そこは向こうの sh が
+// $HOME と環境変数から解決する。代わりに**記録の台帳の行**を見る: 起こしてよい接続先でも、
+// 記録を読むかは別に選ぶ（行が無ければ読まない。本人の決定 2026-09-12）。
+//
+// 「いまの行き先が固定と同じか」はここでは見られない（`ssh -G` を引けるのは実行面だけ）。
+// 実行面が繋ぐ前に照らす（recDial）。
+func checkRecord(db *store.DB, agent, host string) (*RemoteSpec, error) {
+	if err := validAlias(host); err != nil {
+		return nil, err
+	}
+	d, err := getDestination(db, host)
+	if err != nil {
+		return nil, err
+	}
+	if !d.Allowed {
+		return nil, fmt.Errorf("まだ許していない接続先: %s", host)
+	}
+	if !d.Pinned.Pinned() {
+		return nil, fmt.Errorf(
+			"%s は行き先（ホスト鍵）を固定しないまま許されている。許し直す", host)
+	}
+	on, err := recordRootEnabled(db, host, agent)
+	if err != nil {
+		return nil, err
+	}
+	if !on {
+		return nil, fmt.Errorf("%s の %s の記録は読まない設定（台帳に行が無いか、止めてある）", host, agent)
+	}
+	return &RemoteSpec{Alias: host, Pin: *d.Pinned}, nil
+}
+
 // under は p が root と同じか、その下かを返す。
 //
 // **文字列の前方一致では駄目。** `/home/x/work` を許したときに

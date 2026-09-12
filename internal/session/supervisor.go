@@ -36,6 +36,13 @@ type Supervisor struct {
 	// Tick のたびに叩かないため。
 	reapAsked map[string]time.Time
 
+	// readRecords は向こうのホストの記録を読む差し込み口（M47）。**campd が外から挿す**
+	// ——ここは取り込みを知らない（`internal/ingest` を import しない）。
+	readRecords ReadRecords
+	// reading は記録の読みが走っている最中か。**同じ周期が重ならないため。**
+	// 携帯の回線では1周に何分もかかりうる。
+	reading bool
+
 	// テストで時間を進めるために差し替える。
 	Now func() time.Time
 	// テストで待たずに済ませるために差し替える。
@@ -647,8 +654,17 @@ func (s *Supervisor) askRemoteReap(r Record, force bool) {
 	if !due {
 		return
 	}
-	_ = agent.send(Msg{T: MsgReap, Session: r.ID, PID: r.PID, Started: r.Started,
-		BootID: r.BootID, RemoteOwner: r.remoteOwner()})
+	// **掃除でも行き先を照らす。** 起こすときは実行面が `ssh -G` と固定を照らしているのに、
+	// 掃除の経路はそれを飛ばして繋いでいた（Fable の M47 設計レビュー 4）。`~/.ssh/config` の
+	// HostName を書き換えれば、固定と違う先へ定期的に繋ぎに行けてしまう。
+	msg := Msg{T: MsgReap, Session: r.ID, PID: r.PID, Started: r.Started,
+		BootID: r.BootID, RemoteOwner: r.remoteOwner()}
+	if r.Host != "" {
+		if d, err := getDestination(s.db, r.Host); err == nil && d.Pinned.Pinned() {
+			msg.Remote = &RemoteSpec{Alias: r.Host, Pin: *d.Pinned}
+		}
+	}
+	_ = agent.send(msg)
 }
 
 // Run は Tick を回し続ける。ctx が終わるまで戻らない。

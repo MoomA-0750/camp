@@ -11,7 +11,7 @@ function stub(rows: unknown) {
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
 
 const base = {
-  id: 1, agent: 'claude-code', kind: 'five_hour', source: 'statusline',
+  id: 1, agent: 'claude', kind: 'five_hour', source: 'statusline',
   started_at: '2026-09-02T09:00:00Z', used_pct: 21, peak_pct: 21,
   samples: 7, fetched_at: '2026-09-02T09:45:00Z', current: true,
 }

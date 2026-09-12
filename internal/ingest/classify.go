@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -35,6 +34,21 @@ type FileSummary struct {
 	Dev   int64
 	Inode int64
 	MTime time.Time
+
+	// Capped は「この1回では読み切らなかった」。蓋（limit）で止めたときだけ立つ。
+	// 次回は ingested_offset から続きを読む。
+	Capped bool
+
+	// Seed は**この範囲を読み始める時点の、解釈器の状態**。
+	//
+	// Codex は `turn_context` の model・cwd を後の行へ持ち回る。差分だけ読むときに空から
+	// 始めると、前回のうちに `turn_context` を読み終えていた場合、後から追記された行の
+	// model・cwd・版が空になる（usage は空の model で計上される）。Claude は状態を持たない
+	// ので、これは Codex にだけ起きる差だった（2026-09-12、codex のフェーズレビュー 4）。
+	//
+	// **要約と書き込みが同じ種から始まるように、summary に残す。** 読み終えた後の状態で
+	// 書き込み側を始めると、範囲の途中で変わった新しい model を前の行へ逆に当ててしまう。
+	Seed ParserSeed `json:"seed,omitempty"`
 
 	// SessionID は会話の同一性。通常はファイル名だが、subagent の場合は
 	// 行の sessionId が親を指すため、そこから採る。
@@ -65,6 +79,7 @@ type FileSummary struct {
 	GitBranch string
 
 	CLIVersion       string
+	Model            string // 最後に見た model。**誰も書いていなかった last_model を埋める**
 	AITitle          string
 	LastPrompt       string
 	LastPromptLeaf   string
@@ -107,7 +122,18 @@ func resumeSHA(path string, offset int64) string {
 	if _, err := f.ReadAt(buf, start); err != nil {
 		return ""
 	}
-	sum := sha256.Sum256(buf)
+	return WindowSHA(buf)
+}
+
+// ResumeWindow は再開点の窓の大きさ。**向こうのホストへ「この大きさで寄こせ」と頼む**のに要る。
+const ResumeWindow = resumeWindow
+
+// WindowSHA は再開点の窓のハッシュ。
+//
+// **向こうのホストから運んだ窓も、必ずこれに通す**（M47）。向こうで計算させると、
+// 取り方がずれても気づけない（そもそも向こうに sha256sum があるとも限らない）。
+func WindowSHA(b []byte) string {
+	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
@@ -164,11 +190,16 @@ type Prior struct {
 // Corpus は1回のスキャンで見えたファイル全体。
 type Corpus struct {
 	Root  string
+	Agent string // どの取り込み器で見たか。sessions.agent にこの値が入る
 	Files []*FileSummary
 
 	// Unreadable は権限で開けなかったファイル。**黙って落とさず、数えて返す。**
 	// ACL が配り直される前の新しいセッションが主にここに来る。
 	Unreadable []string
+
+	// Deferred は「そこに在るが、今回は運ばなかった」ファイル（向こうのホストの蓋）。
+	// **消えた印を付けない**ために、名前だけ後段へ伝える。
+	Deferred []string
 
 	// runOwner は session_id -> それを書いた会話の SessionID。
 	// resume サイドカーの親を引くのに使う。
@@ -183,68 +214,77 @@ type Corpus struct {
 // 分類は全ファイルを見終わるまで確定できない。「参照されているか」が
 // 他ファイルの中身に依存するので、1ファイルずつ完結させられない。
 // そのため取り込みは2パスになる（ここで分類 → 別パスで messages を書く）。
-func Survey(root string, prior map[string]*Prior) (*Corpus, error) {
+func Survey(col Collector, root string, prior map[string]*Prior) (*Corpus, error) {
+	return SurveyWith(col, root, prior, 0)
+}
+
+// SurveyWith は手元の root を1ファイルにつき limit バイトまでで走査する（0 は蓋なし）。
+func SurveyWith(col Collector, root string, prior map[string]*Prior, limit int64) (*Corpus, error) {
+	fset, err := LocalFiles{Root: root}.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer fset.Close()
+	return SurveyFrom(col, fset, prior, limit)
+}
+
+// SurveyFrom は読み手から走査する。**置き場がどこかは読み手が決める**——
+// 向こうのホストでは $HOME や環境変数から向こうが解決して名乗るので、
+// campd は頼む時点では知らない（M47）。
+func SurveyFrom(col Collector, fset FileSet, prior map[string]*Prior, limit int64) (*Corpus, error) {
 	c := &Corpus{
-		Root:         root,
+		Agent:        col.Name(),
 		runOwner:     map[string]string{},
 		bySessionKey: map[string]*FileSummary{},
 	}
 
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		// **1本読めないだけで全部を落とさない。**
-		//
-		// M25.5 で campd は専用ユーザーになり、会話記録は ACL で読ませている。
-		// ACL は持ち主の権限で定期的に配り直すので、**新しいセッションの
-		// ファイルは、次の配り直しまで camp から読めない**。そこで
-		// walk ごと落としていたため、1本の新しいファイルが
-		// 取り込み全体を止めていた（2026-09-04 の outer gate で再現）。
-		// しかも失敗は journal にしか出ないので、**黙って止まる。**
-		//
-		// 読めないものは数えて飛ばし、Corpus に持って上へ伝える。
-		if err != nil {
-			if errors.Is(err, fs.ErrPermission) {
-				c.Unreadable = append(c.Unreadable, path)
-				return nil
-			}
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil // 歩いている最中に消えた
-			}
-			return err
+	// 前回の位置も一緒に渡す。**向こうのホストでは一覧と再開点を1回で取る**——
+	// 同じ実体かを見るためだけに、ファイルの数だけ繋ぎ直さないため。
+	at := map[string]int64{}
+	for path, p := range prior {
+		if p != nil && p.Offset > 0 {
+			at[path] = p.Offset
 		}
-		if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
-			return nil
-		}
-		fsum, err := summarize(root, path, d, prior[path])
-		if err != nil {
-			if errors.Is(err, fs.ErrPermission) {
-				c.Unreadable = append(c.Unreadable, path)
-				return nil
-			}
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		c.Files = append(c.Files, fsum)
-		return nil
-	})
+	}
+	lst, err := fset.List(at)
 	if err != nil {
 		return nil, err
+	}
+	c.Root = lst.Root
+	// 読めなかったものは数えて飛ばし、Corpus に持って上へ伝える（読み手が集める）。
+	c.Unreadable = append(c.Unreadable, lst.Unreadable...)
+	// 「在るが今回は運ばなかった」ものも伝える。**消えた印を付けさせないため。**
+	c.Deferred = append(c.Deferred, lst.Deferred...)
+
+	for _, fi := range lst.Files {
+		if !col.Wants(fi.Path) {
+			continue
+		}
+		fsum, err := summarize(col, lst.Root, fi, prior[fi.Path], limit, fset)
+		if err != nil {
+			if errors.Is(err, fs.ErrPermission) {
+				c.Unreadable = append(c.Unreadable, fi.Path)
+				continue
+			}
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // 歩いている最中に消えた
+			}
+			return nil, err
+		}
+		c.Files = append(c.Files, fsum)
 	}
 
 	// 参照関係を集める。自分自身への参照（初回 run は session_id が
 	// sessionId と同じ）は親の証拠にならないので除く。
 	for _, f := range c.Files {
-		for _, rid := range f.RunIDs {
-			if rid != f.SessionID {
-				c.runOwner[rid] = f.SessionID
-			}
+		for _, rid := range col.RunRefs(f) {
+			c.runOwner[rid] = f.SessionID
 		}
 	}
 
 	for _, f := range c.Files {
-		f.Role = classify(f, c.runOwner)
-		f.SessionKey = sessionKey(f)
+		f.Role = col.Classify(f, c.runOwner)
+		f.SessionKey = col.SessionKey(f)
 		if f.SessionKey != "" && f.Role != RoleSidecar {
 			c.bySessionKey[f.SessionKey] = f
 		}
@@ -289,29 +329,51 @@ func (c *Corpus) ParentSession(f *FileSummary) string {
 	return c.runOwner[f.SessionID]
 }
 
+// dropSessions は、書かないと決めたセッションのファイルを走査結果から外す。
+//
+// **「消えた」印は付けない**——ファイルは向こうに在って、読めてもいる。書かなかった
+// だけなので、Deferred（在るが今回は運ばなかった）へ回す。
+func (c *Corpus) dropSessions(keys []string) {
+	drop := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		drop[k] = true
+	}
+	keep := c.Files[:0:0]
+	for _, f := range c.Files {
+		key := f.SessionKey
+		if f.Role == RoleSidecar {
+			key = c.ParentSession(f)
+		}
+		if drop[key] {
+			c.Deferred = append(c.Deferred, f.Path)
+			continue
+		}
+		keep = append(keep, f)
+	}
+	c.Files = keep
+}
+
 // SessionFile は sessions.id からその主ファイルを引く。
 func (c *Corpus) SessionFile(key string) *FileSummary { return c.bySessionKey[key] }
 
 // summarize は1ファイルを読み切って要約する。
-func summarize(root, path string, d fs.DirEntry, prior *Prior) (*FileSummary, error) {
-	info, err := d.Info()
-	if err != nil {
-		return nil, err
-	}
+//
+// limit は**この1回で読む上限**（0 は蓋なし）。向こうのホストの記録を少しずつ運ぶために使う。
+// **蓋は必ずここ（要約する側）で切る。** 台帳へ行を入れる側は要約が決めた終点に合わせるので、
+// 逆向き（書き込む側にだけ蓋を掛ける）にすると ingested_offset と resume_sha が食い違い、
+// 次回それが「同じ位置に違う中身」と読まれて世代が進む（2026-09-03 の事故と同じ経路）。
+func summarize(col Collector, root string, fi FileInfo, prior *Prior, limit int64, fset FileSet) (*FileSummary, error) {
+	path := fi.Path
 	rel, _ := filepath.Rel(root, path)
 
 	f := &FileSummary{}
 	start := int64(0)
 
 	// 前回の要約が使えるなら、そこから追記分だけ読む。
-	// (dev, inode) が変わっていたら別の実体なので先頭から。
 	// size が前回位置より小さければ切り詰められているので先頭から。
-	var dev, inode int64
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		dev, inode = int64(st.Dev), int64(st.Ino)
-	}
-	rotated := rotatedFrom(prior, info.Size(), func() string {
-		return resumeSHA(path, prior.Offset)
+	// **dev・inode は見ない**（rotatedFrom のコメント）。台帳には残すので持ち回るだけ。
+	rotated := rotatedFrom(prior, fi.Size, func() string {
+		return fset.Window(path, prior.Offset)
 	})
 	if prior != nil && prior.Offset > 0 {
 		if !rotated && prior.Version == SummaryVersion && len(prior.Summary) > 0 {
@@ -323,26 +385,24 @@ func summarize(root, path string, d fs.DirEntry, prior *Prior) (*FileSummary, er
 		}
 	}
 	f.Rotated = rotated
+	// **この範囲を読み始める時点の状態を控える。** 前回の要約から復元した値がそれ。
+	// 先頭から読み直すとき（rotated・prior 無し）は空のまま。
+	f.Seed = ParserSeed{Model: f.Model, CWD: f.LastCWD, Ver: f.CLIVersion}
 
 	f.Path = path
 	f.Rel = rel
-	f.Size = info.Size()
-	f.MTime = info.ModTime().UTC()
-	f.Dev, f.Inode = dev, inode
+	f.Size = fi.Size
+	f.MTime = fi.MTime
+	f.Dev, f.Inode = fi.Dev, fi.Inode
 	f.Broken = 0
 
-	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
-	if strings.Contains(filepath.ToSlash(filepath.Dir(path)), "/subagents") {
-		f.AgentID = strings.TrimPrefix(base, "agent-")
-	} else {
-		f.SessionID = base
-	}
+	col.Identify(root, path, f)
 	if f.Size == 0 {
 		return f, nil
 	}
 	if start > 0 && start == f.Size {
 		f.EndOffset = start
-		f.ResumeSHA = resumeSHA(path, start)
+		f.ResumeSHA = fset.Window(path, start)
 		return f, nil // 追記なし
 	}
 
@@ -350,23 +410,54 @@ func summarize(root, path string, d fs.DirEntry, prior *Prior) (*FileSummary, er
 	for _, r := range f.RunIDs {
 		seenRun[r] = struct{}{}
 	}
-	res, walkErr := WalkFileFrom(path, start, func(l *Line) error {
+	stop := int64(0)
+	if limit > 0 {
+		stop = start + limit
+	}
+	rc, err := fset.Reader(path, start, stop)
+	if err != nil {
+		return nil, err
+	}
+	res, walkErr := WalkReader(rc, start, stop, col.NewParser(f), func(l *Line) error {
 		f.Lines++
-		f.absorb(l, seenRun)
+		col.Absorb(f, l, seenRun)
 		return nil
 	})
+	rc.Close()
 	if walkErr != nil {
 		return nil, walkErr
 	}
 	f.Broken = len(res.Broken)
 	f.EndOffset = res.EndOffset
+	f.Capped = stop > 0 && res.EndOffset < f.Size
 	f.Pending = res.Pending
-	f.ResumeSHA = resumeSHA(path, res.EndOffset)
+	f.ResumeSHA = fset.Window(path, res.EndOffset)
 
-	if f.SessionID == "" {
-		f.SessionID = base // sessionId が1行も無い subagent への保険
-	}
+	col.Identify(root, path, f) // sessionId が1行も無い subagent への保険
 	return f, nil
+}
+
+// hasJSONLSuffix は走査で拾う拡張子か。**置き場の形はエージェントで違うが、
+// どちらも JSONL**（Claude は projects/**.jsonl、Codex は sessions/**/rollout-*.jsonl）。
+func hasJSONLSuffix(path string) bool { return strings.HasSuffix(path, ".jsonl") }
+
+// claudeIdentify はファイルの名前と場所から、会話の同一性とサブエージェントの id を決める。
+// **Claude の形**: <sessionId>.jsonl と <sessionId>/subagents/agent-<agentId>.jsonl。
+// 既に決まっているものは触らない（走査のあとの保険で2度呼ばれる）。
+func claudeIdentify(path string, f *FileSummary) {
+	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	if strings.Contains(filepath.ToSlash(filepath.Dir(path)), "/subagents") {
+		if f.AgentID == "" {
+			f.AgentID = strings.TrimPrefix(base, "agent-")
+		}
+		if f.SessionID == "" && f.Lines > 0 {
+			f.SessionID = base // 行から採れなかったときの保険
+		}
+		return
+	}
+	if f.SessionID == "" {
+		f.SessionID = base
+	}
 }
 
 // absorb は1行から要約に必要な値を吸い上げる。
@@ -411,6 +502,9 @@ func (f *FileSummary) absorb(l *Line, seenRun map[string]struct{}) {
 	}
 	if l.CLIVersion != "" {
 		f.CLIVersion = l.CLIVersion
+	}
+	if l.Message != nil && l.Message.Model != "" {
+		f.Model = l.Message.Model
 	}
 
 	switch l.Type {

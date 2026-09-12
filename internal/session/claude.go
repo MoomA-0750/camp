@@ -31,8 +31,15 @@ var claudeModes = map[string]string{
 // claude も頼めなくなる（いまの Codex がそうなっている）。Phase 3.8 以降の宿題。
 func (claudeDriver) Launch(a *Agent) (Launch, error) { return Launch{Bin: a.Claude}, nil }
 
-// RemoteLaunch は向こうで探す名前。置き場は照らさない。
-func (claudeDriver) RemoteLaunch() RemoteLaunch { return RemoteLaunch{Name: "claude"} }
+// RemoteLaunch は向こうで探す名前と置き場（$CLAUDE_CONFIG_DIR、無ければ ~/.claude。CLI と同じ）。
+//
+// 置き場は M47 で足した。**向こうの記録を読むときに、置き場を向こうに解決させるため**——
+// campd は向こうの $HOME も環境変数も知らないので、パスを打ち込ませる代わりに規則だけ渡す
+// （本人の決定 2026-09-12）。起こすときの振る舞いは変わらない（wrapperScript は名乗るだけで、
+// 置き場が無くても止めない）。
+func (claudeDriver) RemoteLaunch() RemoteLaunch {
+	return RemoteLaunch{Name: "claude", HomeEnv: "CLAUDE_CONFIG_DIR", HomeDefault: ".claude"}
+}
 
 // Argv は `claude -p` を stream-json で起こす引数。承認は stdio で Camp へ訊かせる。
 func (claudeDriver) Argv(perm string) ([]string, error) {

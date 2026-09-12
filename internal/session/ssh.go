@@ -29,6 +29,9 @@ type Destination struct {
 	Pinned *Resolved `json:"pinned,omitempty"`
 	// AgentPaths はエージェントごとの向こうの実体（駆動器の名前 → 絶対パス）。無ければ向こうで探す。
 	AgentPaths map[string]string `json:"agent_paths,omitempty"`
+	// Records はエージェントごとの「記録を読むか」と、その跡（M47）。行が無ければ読まない。
+	// **静かな失敗に画面で気づけるように**、最後に読めた時刻と最後の失敗をここに出す。
+	Records map[string]RecordRoot `json:"records,omitempty"`
 }
 
 const destCols = `
@@ -104,8 +107,33 @@ func ListDestinations(db *store.DB) ([]Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	recs, err := recordRootsOf(db, "")
+	if err != nil {
+		return nil, err
+	}
 	for i := range out {
 		out[i].AgentPaths = paths[out[i].Alias]
+		out[i].Records = recs[out[i].Alias]
+	}
+	return out, nil
+}
+
+// recordRootsOf は記録の台帳を接続先ごとに読む（alias が空なら全部）。
+// agentPathsOf と同じ作法。
+func recordRootsOf(db *store.DB, alias string) (map[string]map[string]RecordRoot, error) {
+	all, err := ListRecordRoots(db)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]map[string]RecordRoot{}
+	for _, r := range all {
+		if alias != "" && r.Host != alias {
+			continue
+		}
+		if out[r.Host] == nil {
+			out[r.Host] = map[string]RecordRoot{}
+		}
+		out[r.Host][r.Agent] = r
 	}
 	return out, nil
 }
@@ -124,6 +152,11 @@ func getDestination(db *store.DB, alias string) (Destination, error) {
 		return d, err
 	}
 	d.AgentPaths = paths[alias]
+	recs, err := recordRootsOf(db, alias)
+	if err != nil {
+		return d, err
+	}
+	d.Records = recs[alias]
 	return d, nil
 }
 

@@ -38,7 +38,7 @@ func statusLine(fiveHour float64, fiveEnds int64, sevenDay float64, sevenEnds in
 
 func record(t *testing.T, db *store.DB, body string) []Reading {
 	t.Helper()
-	got, err := Record(db, strings.NewReader(body), AgentClaudeCode, SourceStatusLine)
+	got, err := Record(db, strings.NewReader(body), AgentClaude, SourceStatusLine)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestPeakSurvivesADip(t *testing.T) {
 func TestMissingRateLimitsIsNotAFailure(t *testing.T) {
 	db := newDB(t)
 	_, err := Record(db, strings.NewReader(`{"model":{"display_name":"Opus 5"}}`),
-		AgentClaudeCode, SourceStatusLine)
+		AgentClaude, SourceStatusLine)
 	if !errors.Is(err, ErrNoWindows) {
 		t.Fatalf("ErrNoWindows のはず: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestCurrentPicksLiveWindowPerKind(t *testing.T) {
 	// 期限切れの窓しか無い種類。残量として出してはいけない。
 	if _, err := Record(db, strings.NewReader(fmt.Sprintf(
 		`{"rate_limits":{"spend_limit":{"used_percentage":88,"resets_at":%d}}}`, past)),
-		AgentClaudeCode, SourceStatusLine); err != nil {
+		AgentClaude, SourceStatusLine); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,7 +208,7 @@ func TestSourcesDoNotCollide(t *testing.T) {
 
 	record(t, db, statusLine(10, ends, 30, week))
 	if _, err := Record(db, strings.NewReader(statusLine(11, ends, 31, week)),
-		AgentClaudeCode, "control"); err != nil {
+		AgentClaude, "control"); err != nil {
 		t.Fatal(err)
 	}
 

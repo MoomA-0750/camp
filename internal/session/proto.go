@@ -66,6 +66,33 @@ type Msg struct {
 	// ssh_scan / ssh_result
 	SSHHosts []SSHHost `json:"ssh_hosts,omitempty"`
 
+	// rec_list / rec_read（campd → 実行面）。接続先と固定は Remote に載せる（start と同じ）。
+	//
+	// RecHomeEnv・RecHomeDefault・RecSub は**置き場の決め方**（駆動器の RemoteLaunch と、
+	// 取り込み器の置き場）。パスそのものを運ばないのは、自由なパスを打ち込む口を作らないため
+	// （本人の決定 2026-09-12）。向こうの sh がこの規則で解決し、実パスを名乗る。
+	RecHomeEnv     string `json:"rec_home_env,omitempty"`
+	RecHomeDefault string `json:"rec_home_default,omitempty"`
+	RecSub         string `json:"rec_sub,omitempty"`
+	// RecAt は「このパスのこの位置の窓も欲しい」。一覧と1回で取るため。
+	RecAt map[string]int64 `json:"rec_at,omitempty"`
+	// RecWin は窓の大きさ。**向こうで計算させない**——運んだ中身を手元で同じ関数に
+	// かけるので、ハッシュの取り方がずれようがない（向こうに sha256sum があるとも限らない）。
+	RecWin int64 `json:"rec_win,omitempty"`
+	// RecWant は取り寄せる範囲の束。RecCap は1回の返事の合計の蓋。
+	RecWant []RecRange `json:"rec_want,omitempty"`
+	RecCap  int64      `json:"rec_cap,omitempty"`
+
+	// rec_list_result / rec_read_result（実行面 → campd）
+	//
+	// RecRoot は**向こうが解決して名乗った置き場の実パス**。
+	RecRoot   string            `json:"rec_root,omitempty"`
+	RecFiles  []RecFile         `json:"rec_files,omitempty"`
+	RecWindow map[string][]byte `json:"rec_window,omitempty"` // 位置の直前 RecWin バイトの中身
+	RecData   map[string][]byte `json:"rec_data,omitempty"`   // 頼んだ範囲の中身
+	// RecMore は「蓋で切った。続きがある」。
+	RecMore bool `json:"rec_more,omitempty"`
+
 	// start（campd → 実行面）: どこへ繋ぐか。nil ならこのマシン。
 	Remote *RemoteSpec `json:"remote,omitempty"`
 	// started / reap: 向こうで起きた子の身元。**campd は確かめられない。**
@@ -162,6 +189,10 @@ const (
 	MsgCtlRes  = "control_result"
 
 	MsgSSHResolved = "ssh_resolved"
+
+	// 向こうのホストの記録（M47）。**読むだけ。向こうへは書かない。**
+	MsgRecListRes = "rec_list_result"
+	MsgRecReadRes = "rec_read_result"
 )
 
 // campd → 実行面
@@ -180,6 +211,14 @@ const (
 	// MsgSSHResolve は `ssh -G <alias>` の結果を寄こせ。**繋がない。**
 	// 許すときに行き先を固定するのに使う。
 	MsgSSHResolve = "ssh_resolve"
+
+	// MsgRecList は向こうのホストの記録の一覧を寄こせ。**繋ぐ。**
+	// 置き場は向こうが $HOME と環境変数から解決して名乗る（campd は知らない）。
+	// 前回の位置を添えると、同じ実体かを見るための窓も1回で返る。
+	MsgRecList = "rec_list"
+	// MsgRecRead は記録の中身を範囲で寄こせ。**まとめて頼む**——1本ずつ繋ぎ直すと、
+	// 変わっていない記録40本でも40回 ssh することになる。
+	MsgRecRead = "rec_read"
 )
 
 // 状態機械。**この5つ以外の状態を作らない。**
