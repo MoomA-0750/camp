@@ -42,6 +42,14 @@ type AgentInfo struct {
 	InterruptLeavesTools bool `json:"interrupt_leaves_tools,omitempty"`
 	// Remote は向こうのホスト（ssh）でも起こせるか。
 	Remote bool `json:"remote,omitempty"`
+	// RemoteOnly は「**この実行面では**手元に実体が無いが、向こうのホストでなら起こせる」
+	// （M49、2026-09-13）。
+	//
+	// **無いことを「手元でも起こせる」と読む。** 逆向き（Local bool）にすると、この欄を
+	// 知らない実行面（Phase 3.9 まで）の名乗りが「手元では起こせない」と読まれ、いままで
+	// 起こせていたものが起こせなくなる。欄を足すときは、**古い名乗りが従来どおりに読まれる
+	// 向き**を選ぶ（hello の drivers を Agents と別の欄にしたのと同じ考え方）。
+	RemoteOnly bool `json:"remote_only,omitempty"`
 	// Resume は終わった会話の続きから起こせるか（M48、2026-09-13）。
 	//
 	// **名乗らない実行面へは再開を頼まない。** 古い実行面は Msg.Resume を読まないので、

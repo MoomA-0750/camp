@@ -2338,23 +2338,19 @@ func cmdAgent(args []string) error {
 	if *sock == "" {
 		return fmt.Errorf("制御口の場所が決まらない。-sock か CAMP_AGENT_SOCK で指す")
 	}
-	if _, err := os.Stat(*claudeBin); err != nil {
-		return fmt.Errorf("claude が見つからない（%s）: %w", *claudeBin, err)
-	}
-
+	// **claude が無くても実行面は起こす**（M49、2026-09-13）。手元に実体が無くても、向こうの
+	// ホストでなら起こせる（向こうで探す実体は台帳の場所か向こうの PATH）。以前はここで
+	// 実行面ごと断っていたので、「手元に claude が無い実行面」は存在すらできなかった。
 	a := session.NewAgent(*sock, *claudeBin)
 	a.Scope = *scope
 	a.CodexHome = *codexHome
 	if _, err := os.Stat(*codexBin); err == nil {
 		a.Codex = *codexBin
 	}
-	fmt.Printf("実行面    %s\nclaude    %s\nscope     %v\n落とし先  %s\n",
-		*sock, *claudeBin, *scope, a.LogDir)
-	if a.CanCodex() {
-		fmt.Printf("codex     %s（本人の置き場 %s のまま。CLI と同じ設定で動く）\n",
-			a.Codex, a.CodexHome)
-	} else {
-		fmt.Printf("codex     起こさない（実体 %s が無いか、scope を使わない構成）\n", *codexBin)
+	fmt.Printf("実行面    %s\nscope     %v\n落とし先  %s\n", *sock, *scope, a.LogDir)
+	// 名乗りと同じ見分け方で出す（駆動器が「この設定なら起こせる」と言うか）。
+	for _, d := range session.AgentSummary(a) {
+		fmt.Printf("%-9s %s\n", d.Name, d.Note)
 	}
 	fmt.Println("**DB には触らない。** 起こす・渡す・止める、それだけ。")
 	// 繋ぎ直しながら動き続ける。**campd の入れ替えで子を殺さない。**

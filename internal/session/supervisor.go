@@ -263,6 +263,14 @@ func (s *Supervisor) startWith(requestedBy, host, cwd, agent, perm string, res r
 		s.audit("", "session.start", target, err.Error(), audit.Denied)
 		return Record{}, err
 	}
+	if host == "" && s.agent.remoteOnly(agent) {
+		// **手元に実体が無い。** 向こうのホストでなら起こせる（M49）。頼めば実行面が
+		// 断るが、ここで止めれば理由がはっきり出る。
+		s.mu.Unlock()
+		err := fmt.Errorf("いまの実行面は %s をこのマシンでは起こせない（実体が無い）。向こうのホストでなら起こせる", agent)
+		s.audit("", "session.start", target, err.Error(), audit.Denied)
+		return Record{}, err
+	}
 	if res.AgentID != "" && !s.agent.canResume(agent) {
 		// **続きからを名乗らない実行面へは頼まない。** 読まれずに落ちると、続きのつもりで
 		// 新しい会話が始まってしまう（M48）。

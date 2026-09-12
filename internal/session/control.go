@@ -91,6 +91,11 @@ func (a *agentConn) info(agent string) (AgentInfo, bool) {
 	}
 	local := d.Info()
 	local.Perms = []string{PermCLI}
+	// **RemoteOnly はここでは触らない**（M49、2026-09-13）。この欄を立てるのは実行面の
+	// driverInfos だけで、駆動器の Info は決して立てない——ここへ来る時点で必ず false。
+	// 落とす行を置くと「守っているつもり」になるが、実際には到達しない（変異で確かめた）。
+	// 古い実行面が手元で起こせることは、remote_only を「無い＝手元でも起こせる」向きに
+	// 決めたことで保たれる（driver_test.go で縛っている）。
 	// **続きからも頼まない**（M48、2026-09-13）。古い実行面は start の resume を読まないので、
 	// 頼んでも黙って落ち、**続きのつもりで新しい会話が始まる**。度合いと同じ考え方。
 	local.Resume = false
@@ -113,6 +118,15 @@ func (a *agentConn) leavesTools(agent string) bool {
 func (a *agentConn) canPerm(agent, perm string) bool {
 	in, ok := a.info(agent)
 	return ok && contains(in.Perms, perm)
+}
+
+// remoteOnly は、この実行面が agent を**このマシンでは起こせない**か（M49、2026-09-13）。
+// 名乗りに載っていても手元に実体が無いことがある（向こうのホストでなら起こせる）。
+//
+// **名乗らない実行面は false**（手元で起こせる）。古い実行面は起こせるものしか名乗らなかった。
+func (a *agentConn) remoteOnly(agent string) bool {
+	in, ok := a.info(agent)
+	return ok && in.RemoteOnly
 }
 
 // canResume は agent を「終わった会話の続きから」起こせる実行面か（M48、2026-09-13）。

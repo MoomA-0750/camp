@@ -77,6 +77,89 @@ func TestAnOldAgentIsAskedOnlyCLIAndOnlyClaude(t *testing.T) {
 	}
 }
 
+// **remote_only を名乗らない実行面は、いままでどおりこのマシンで起こせる**（M49、2026-09-13）。
+//
+// この欄は「無い＝手元でも起こせる」向きにしてある。逆向き（`local`）にすると、欄を知らない
+// 実行面の名乗りが「手元では起こせない」と読まれ、**起こせていたものが起こせなくなる**。
+// 欄を足すときは、古い名乗りが従来どおりに読まれる向きを選ぶ。
+func TestAnAgentThatDoesNotNameRemoteOnlyCanStillStartHere(t *testing.T) {
+	// 駆動器を名乗らない実行面（Phase 3.7 より前）。
+	if (&agentConn{}).remoteOnly(AgentClaude) {
+		t.Fatal("古い実行面の claude を「手元では起こせない」と読んだ")
+	}
+	// 駆動器は名乗るが、remote_only を知らない実行面（Phase 3.9 まで）。
+	old := &agentConn{agents: []string{AgentClaude, AgentCodex}}
+	old.infos = namedInfos(old, []AgentInfo{
+		{Name: AgentClaude, Label: "Claude Code", Perms: []string{PermCLI}},
+		{Name: AgentCodex, Label: "Codex", Perms: []string{PermCLI}},
+	})
+	if old.remoteOnly(AgentClaude) || old.remoteOnly(AgentCodex) {
+		t.Fatal("remote_only を名乗らない実行面を「手元では起こせない」と読んだ")
+	}
+	// 名乗れば、そのとおりに読む。
+	now := &agentConn{agents: []string{AgentClaude, AgentCodex}}
+	now.infos = namedInfos(now, []AgentInfo{
+		{Name: AgentClaude, Label: "Claude Code", Perms: []string{PermCLI}},
+		{Name: AgentCodex, Label: "Codex", Perms: []string{PermCLI}, RemoteOnly: true},
+	})
+	if now.remoteOnly(AgentClaude) {
+		t.Fatal("手元で起こせる claude を remote_only と読んだ")
+	}
+	if !now.remoteOnly(AgentCodex) {
+		t.Fatal("名乗った remote_only を読んでいない")
+	}
+}
+
+// **手元に実体が無いものを、このマシンで起こそうとしない**（M49、2026-09-13。実行面の側）。
+//
+// 名乗りには載る（向こうのホストでなら起こせるから）。だからこそ、手元で頼まれたときに
+// 弾く必要がある——弾かないと exec まで進んで、分かりにくい失敗になる。
+func TestTheAgentRefusesToStartAnAgentItHasNoBinaryFor(t *testing.T) {
+	srv, cli := net.Pipe()
+	defer srv.Close()
+	a := NewAgent("x", "/nonexistent/claude")
+	a.conn = cli
+	var started atomic.Bool
+	a.Command = func(_, _ string, _ []string) *exec.Cmd {
+		started.Store(true)
+		return exec.Command("/bin/true")
+	}
+	go a.Run()
+	b, _ := json.Marshal(Msg{T: MsgStart, Session: "s1", Token: "t",
+		Cwd: os.TempDir(), Root: os.TempDir()})
+	go srv.Write(append(b, '\n'))
+	srv.SetReadDeadline(time.Now().Add(5 * time.Second))
+	sc := bufio.NewScanner(srv)
+	var got Msg
+	for sc.Scan() {
+		if json.Unmarshal(sc.Bytes(), &got) == nil && got.T != MsgPing {
+			break
+		}
+	}
+	if got.T != MsgFailed || !strings.Contains(got.Error, "この実行面は claude を このマシン で起こせない") {
+		t.Fatalf("手元に実体が無いのに起こそうとした: %+v", got)
+	}
+	if started.Load() {
+		t.Fatal("子を起こしてしまった")
+	}
+}
+
+// **campd も手前で断る**（M49。理由がはっきり出るように）。
+func TestCampdRefusesALocalStartWhenTheAgentIsRemoteOnly(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	bin := t.TempDir() + "/claude"
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 手元に codex の実体が無い実行面。codex は remote_only として名乗られる。
+	attach(t, s, bin, func(a *Agent) { a.Codex = "" })
+	_, err := s.StartWith("test", "", allowHere(t, db), AgentCodex, PermCLI)
+	if err == nil || !strings.Contains(err.Error(), "このマシンでは起こせない") {
+		t.Fatalf("手元に実体の無いエージェントを、このマシンで起こそうとした: %v", err)
+	}
+}
+
 // **工具が残るエージェントを、名乗りで「残らない」にできない。** 起こせないエージェントでも見る。
 func TestLeavesToolsCannotBeTurnedOffByHello(t *testing.T) {
 	a := &agentConn{agents: []string{AgentClaude, AgentCodex}}

@@ -4,7 +4,9 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 )
 
@@ -29,7 +31,18 @@ var claudeModes = map[string]string{
 // 「手元では起こせないが向こうでなら起こせる」を名乗れるようにするのが先**——hello は手元の
 // Launch だけから作るので、ここで実体を確かめると、手元に claude の無い実行面が向こうのホストの
 // claude も頼めなくなる（いまの Codex がそうなっている）。Phase 3.8 以降の宿題。
-func (claudeDriver) Launch(a *Agent) (Launch, error) { return Launch{Bin: a.Claude}, nil }
+// **実体を確かめる**（M49、2026-09-13。Codex と対等にした。D-031）。確かめないと、手元に
+// claude の無い実行面が「起こせる」と名乗り、頼まれてから初めて失敗する。確かめておけば
+// 「手元では起こせないが、向こうのホストでなら起こせる」と名乗れる（agents）。
+func (claudeDriver) Launch(a *Agent) (Launch, error) {
+	if a.Claude == "" {
+		return Launch{}, errors.New("この実行面は Claude Code を起こせない（claude の実体が無い）")
+	}
+	if _, err := os.Stat(a.Claude); err != nil {
+		return Launch{}, fmt.Errorf("この実行面は Claude Code を起こせない（%s が無い）", a.Claude)
+	}
+	return Launch{Bin: a.Claude}, nil
+}
 
 // RemoteLaunch は向こうで探す名前と置き場（$CLAUDE_CONFIG_DIR、無ければ ~/.claude。CLI と同じ）。
 //

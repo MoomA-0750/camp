@@ -34,6 +34,8 @@ export default function Runtime() {
   const agents = list.data?.agents ?? []
   const chosen = agents.find((a) => a.name === agent) ?? agents[0]
   const localOnly = !!chosen && !chosen.remote
+  // **手元に実体が無いエージェント**（2026-09-13）。このマシンは選べない。
+  const remoteOnly = !!chosen?.remote_only
   // 確認の度合いは、そのエージェントが名乗ったものから選ぶ（向こうのホストでも同じ。M42）。
   const perms = chosen?.perms ?? ['cli']
   const chosenPerm = perms.includes(perm) ? perm : 'cli'
@@ -112,16 +114,22 @@ export default function Runtime() {
               disabled={agents.length === 0}
               onChange={(e) => {
                 setAgent(e.target.value)
+                const a = agents.find((x) => x.name === e.target.value)
                 // 向こうのホストで起こせないエージェントなら、選んでいたホストを外す。
-                if (!agents.find((a) => a.name === e.target.value)?.remote) setHost('')
+                if (!a?.remote) setHost('')
+                // 手元に実体が無いなら、このマシンは選べない。最初の接続先を選んでおく。
+                else if (a.remote_only && !host) setHost(startable[0]?.alias ?? '')
               }}>
               {agents.length === 0 && <option value="">（起こせるエージェントが無い）</option>}
               {agents.map((a) => <option key={a.name} value={a.name}>{a.label}</option>)}
             </select>
             <select value={localOnly ? '' : host} onChange={(e) => setHost(e.target.value)}
               aria-label="どこで起こすか" disabled={localOnly}
-              title={localOnly ? `${chosen.label} はまだこのマシンだけで起こせる` : undefined}>
-              <option value="">このマシン</option>
+              title={localOnly ? `${chosen.label} はまだこのマシンだけで起こせる`
+                : remoteOnly ? `${chosen?.label} の実体が手元に無い。向こうのホストでなら起こせる`
+                  : undefined}>
+              {/* **手元に実体が無いなら、このマシンは選べない**（2026-09-13）。 */}
+              {!remoteOnly && <option value="">このマシン</option>}
               {startable.map((d) => (
                 <option key={d.alias} value={d.alias}>{d.alias}（{pinLabel(d.pinned)}）</option>
               ))}
@@ -137,7 +145,8 @@ export default function Runtime() {
                 : '起こす場所（許可リストの中の絶対パス）'}
               value={cwd} onChange={(e) => setCwd(e.target.value)} style={{ minWidth: '24rem' }}
             />
-            <button disabled={busy || !cwd || !list.data?.agent_connected || !chosen}>起こす</button>
+            <button disabled={busy || !cwd || !list.data?.agent_connected || !chosen
+              || (remoteOnly && !host)}>起こす</button>
           </form>
           {err && <Failed error={err} />}
 

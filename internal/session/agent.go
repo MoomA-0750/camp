@@ -159,11 +159,16 @@ func (a *Agent) Dial(version string) error {
 }
 
 // driverInfos は起こせるエージェントの説明（hello で名乗る）。
+//
+// **手元で起こせないものには remote_only を立てる**（M49、2026-09-13）。名乗りに載っていても
+// このマシンでは起こせない、を campd と画面へ伝えるため。
 func (a *Agent) driverInfos() []AgentInfo {
 	names := a.agents()
 	out := make([]AgentInfo, 0, len(names))
 	for _, n := range names {
-		out = append(out, drivers[n].Info())
+		in := drivers[n].Info()
+		in.RemoteOnly = !a.localOK(n)
+		out = append(out, in)
 	}
 	return out
 }
@@ -267,7 +272,8 @@ func (a *Agent) Run() error {
 				continue
 			}
 			switch {
-			case !validAgent(agent) || (m.Remote != nil && !drivers[agent].Info().Remote):
+			case !validAgent(agent) || (m.Remote != nil && !drivers[agent].Info().Remote) ||
+				(m.Remote == nil && !a.localOK(agent)):
 				// **知らないものを claude で代わりに起こさない。** 向こうのホストで起こせるかは駆動器の説明で。
 				a.send(Msg{T: MsgFailed, Session: m.Session, Token: m.Token,
 					Error: fmt.Sprintf("この実行面は %s を %s で起こせない", agent,

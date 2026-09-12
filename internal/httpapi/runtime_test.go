@@ -675,6 +675,8 @@ func TestTheScreenGetsAgentsAndLabelsFromTheAPI(t *testing.T) {
 			Label  string   `json:"label"`
 			Perms  []string `json:"perms"`
 			Remote bool     `json:"remote"`
+			// remote_only は「この実行面では手元に実体が無い」（2026-09-13）。
+			RemoteOnly bool `json:"remote_only"`
 		} `json:"agents"`
 		Sessions []struct {
 			ID         string `json:"id"`
@@ -682,10 +684,23 @@ func TestTheScreenGetsAgentsAndLabelsFromTheAPI(t *testing.T) {
 		} `json:"sessions"`
 	}
 	getJSON("/api/runtime", &list)
-	// この実行面は codex の実体を持たないので、claude だけを名乗る。
-	if len(list.Agents) != 1 || list.Agents[0].Name != "claude" || list.Agents[0].Label != "Claude Code" ||
-		!list.Agents[0].Remote || len(list.Agents[0].Perms) == 0 {
+	// **codex の実体が手元に無くても名乗りには載る**（M49、2026-09-13）。向こうのホストで
+	// なら起こせるため。ただし remote_only が立ち、「このマシンでは起こせない」が画面へ伝わる。
+	idx := map[string]int{}
+	for i, a := range list.Agents {
+		idx[a.Name] = i
+	}
+	ci, okc := idx["claude"]
+	xi, okx := idx["codex"]
+	if len(list.Agents) != 2 || !okc || !okx {
 		t.Fatalf("起こせるエージェントが API に出ない: %+v", list.Agents)
+	}
+	if list.Agents[ci].Label != "Claude Code" || !list.Agents[ci].Remote ||
+		len(list.Agents[ci].Perms) == 0 || list.Agents[ci].RemoteOnly {
+		t.Fatalf("claude の説明が違う: %+v", list.Agents[ci])
+	}
+	if !list.Agents[xi].RemoteOnly {
+		t.Fatalf("手元に実体の無い codex に remote_only が立っていない: %+v", list.Agents[xi])
 	}
 	labeled := false
 	for _, s := range list.Sessions {

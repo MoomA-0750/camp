@@ -665,28 +665,60 @@ func TestVerifyCodexStartChecksWhereItStarted(t *testing.T) {
 	}
 }
 
-// hello で名乗るのは、本当に起こせるものだけ。
-func TestTheExecutionSideNamesCodexOnlyWhenItCanStartIt(t *testing.T) {
-	a := NewAgent("x", "y")
+// hello で名乗るのは、**手元で起こせるもの、または向こうのホストでなら起こせるもの**
+// （M49、2026-09-13）。手元で起こせないものには remote_only が立つ。
+//
+// 以前は「手元で起こせるものだけ」だった。それだと、手元に codex が無い実行面は、向こうの
+// ホストに codex があっても頼めなかった（向こうで探す実体は台帳の場所か向こうの PATH なので、
+// 手元の実体は要らない）。
+func TestTheExecutionSideMarksAgentsItCannotStartHere(t *testing.T) {
+	a := NewAgent("x", os.Args[0])
 	a.Codex = ""
-	if contains(a.agents(), AgentCodex) {
-		t.Fatal("codex の実体が無いのに名乗った")
-	}
-	a.Codex = os.Args[0]
-	a.Scope = true
+	// 向こうで起こせるので、手元に実体が無くても名乗りには載る。
 	if !contains(a.agents(), AgentCodex) {
-		t.Fatal("起こせるのに名乗らない")
+		t.Fatal("向こうでなら起こせるのに名乗らない")
+	}
+	if a.localOK(AgentCodex) {
+		t.Fatal("実体が無いのに手元で起こせると言った")
+	}
+	if !remoteOnlyIn(a.driverInfos(), AgentCodex) {
+		t.Fatal("手元で起こせないのに remote_only が立っていない")
+	}
+	a.Codex, a.Scope = os.Args[0], true
+	if !a.localOK(AgentCodex) {
+		t.Fatal("起こせるのに手元で起こせないと言った")
+	}
+	if remoteOnlyIn(a.driverInfos(), AgentCodex) {
+		t.Fatal("手元で起こせるのに remote_only が立った")
 	}
 	a.Scope, a.CodexWithoutScope = false, false
-	if contains(a.agents(), AgentCodex) {
-		t.Fatal("scope を使わない構成で名乗った")
+	if a.localOK(AgentCodex) {
+		t.Fatal("scope を使わない構成で手元で起こせると言った")
 	}
+	// **claude も同じ扱い**（D-031）。手元に実体が無ければ remote_only。
+	b := NewAgent("x", "/nonexistent/claude")
+	if b.localOK(AgentClaude) {
+		t.Fatal("実体が無いのに claude を手元で起こせると言った")
+	}
+	if !remoteOnlyIn(b.driverInfos(), AgentClaude) {
+		t.Fatal("claude に remote_only が立っていない")
+	}
+}
+
+func remoteOnlyIn(infos []AgentInfo, name string) bool {
+	for _, in := range infos {
+		if in.Name == name {
+			return in.RemoteOnly
+		}
+	}
+	return false
 }
 
 // 起こす口は、本人の置き場を触らない（CODEX_HOME を渡さない。CLI と同じ）。どのエージェントも
 // 実体の後ろに駆動器の引数をそのまま付け、scope を使うなら systemd-run で包む。
 func TestTheDefaultCommandUsesTheUsersOwnSettings(t *testing.T) {
-	a := NewAgent("x", "/usr/bin/claude-fake")
+	// **実体のあるパスを渡す**（M49 で Launch が実体を確かめるようになった）。
+	a := NewAgent("x", os.Args[0])
 	a.Codex, a.CodexWithoutScope = "/usr/bin/true", true
 	for _, scope := range []bool{false, true} {
 		a.Scope = scope

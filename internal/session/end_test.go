@@ -251,7 +251,10 @@ func TestATurnThatIgnoresInterruptIsStoppedAfterAWhile(t *testing.T) {
 func TestAStartThatFailsIsRecordedAsSuch(t *testing.T) {
 	db := newDB(t)
 	s := New(db)
-	attach(t, s, filepath.Join(t.TempDir(), "居ない-claude"))
+	// **実体はあるが起こせない。** M49 から「手元に実体が無い」は campd が手前で断るので、
+	// ここで試したいのは**起こしてみて失敗する**経路のほう（ディレクトリを指しているので、
+	// 名乗りは通り、exec で失敗する）。
+	attach(t, s, t.TempDir())
 	rec, err := s.Start("test", allowHere(t, db))
 	if err != nil {
 		t.Fatal(err)

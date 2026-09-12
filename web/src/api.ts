@@ -151,6 +151,9 @@ export type AgentInfo = {
   interrupt_leaves_tools?: boolean
   // 向こうのホスト（ssh）でも起こせるか。
   remote?: boolean
+  // remote_only は、この実行面では手元に実体が無く、向こうのホストでだけ起こせる
+  // （2026-09-13 から）。**無ければ手元でも起こせる**（古い実行面は名乗らない）。
+  remote_only?: boolean
   // 終わった会話の続きから起こせるか（2026-09-13 から）。**古い実行面は名乗らない。**
   resume?: boolean
 }

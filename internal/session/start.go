@@ -16,8 +16,12 @@ import (
 // 手順: 照合 → 起こす → 実際に降りた場所を照らす → 落とし先を開く → 話し始める（駆動器）
 // → 名乗る → 読み続ける → 終わったら scope の残りを数える。
 
-// agents は起こせるエージェント（hello で名乗る）。**駆動器が「この設定なら起こせる」と
-// 言うものだけ。**
+// agents は起こせるエージェント（hello で名乗る）。**手元で起こせるもの、**および
+// **手元に実体は無いが向こうのホストでなら起こせるもの**（M49、2026-09-13）。
+//
+// 以前は「手元で起こせるものだけ」だった。それだと、手元に codex が無い実行面は、向こうの
+// ホストに codex があっても頼めなかった（向こうで探す実体は台帳の場所か向こうの PATH なので、
+// 手元の実体は要らないのに）。どちらで起こせるかは localOK が見分ける。
 func (a *Agent) agents() []string {
 	names := make([]string, 0, len(drivers))
 	for n := range drivers {
@@ -26,11 +30,21 @@ func (a *Agent) agents() []string {
 	sort.Strings(names)
 	out := []string{}
 	for _, n := range names {
-		if _, err := drivers[n].Launch(a); err == nil {
+		if a.localOK(n) || drivers[n].Info().Remote {
 			out = append(out, n)
 		}
 	}
 	return out
+}
+
+// localOK はこのマシンで起こせるか（駆動器が「この設定なら起こせる」と言うか）。
+func (a *Agent) localOK(name string) bool {
+	d, ok := drivers[name]
+	if !ok {
+		return false
+	}
+	_, err := d.Launch(a)
+	return err == nil
 }
 
 // start は子を起こす（このマシン）。
