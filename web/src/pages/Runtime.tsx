@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { api, type AgentInfo, type Destination, type Pinned, type RuntimeSession } from '../api'
 import { Empty, Failed, Loading, short, useAsync } from '../ui'
 
@@ -261,6 +261,34 @@ export function atEndLabel(state?: string): string {
   return AT_END[state] ?? state
 }
 
+// 「続きから」。終わったセッションの続きを起こし、起きた新しい行へ移る（2026-09-13）。
+//
+// **元のものが生き返ったように見せる**（本人の決定）。台帳では別の行になるが、エージェント側の
+// 会話は1本のまま繋がる（記録も同じファイルへ追記される）。
+function ResumeButton({ s }: { s: RuntimeSession }) {
+  const nav = useNavigate()
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  // **二重に起こさない。** 続きが既に起きているなら、そちらへの入口だけを出す。
+  if (s.resumed_by) return <Link to={`/runtime/${s.resumed_by}`}>続きへ</Link>
+  // エージェント側の id を名乗らないまま終わった行は、続きから起こせない。
+  if (!(s.agent_session_id ?? s.claude_id)) return <span className="muted">—</span>
+  const go = async () => {
+    setErr(''); setBusy(true)
+    try {
+      nav(`/runtime/${(await api.runtimeResume(s.id)).id}`)
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e))
+    } finally { setBusy(false) }
+  }
+  return (
+    <>
+      <button disabled={busy} onClick={() => void go()}>続きから</button>
+      {err && <div className="muted">{err}</div>}
+    </>
+  )
+}
+
 function Ended({ kind, before, set }: {
   kind: string
   before: string
@@ -299,7 +327,8 @@ function Ended({ kind, before, set }: {
                   狭い画面ではパスの手前までしか見えない（2026-09-11、400px で撮った）。 */}
               <th className="nowrap">終わった時刻</th>
               <th className="nowrap">終わり方</th><th className="nowrap">そのとき</th>
-              <th className="nowrap">承認</th><th>場所</th><th className="num nowrap">コード</th>
+              <th className="nowrap">承認</th><th className="nowrap">続き</th>
+              <th>場所</th><th className="num nowrap">コード</th>
             </tr>
           </thead>
           <tbody>
@@ -311,6 +340,7 @@ function Ended({ kind, before, set }: {
                 <td className="nowrap">{endLabel(s.end_cause)}</td>
                 <td className="nowrap">{atEndLabel(s.end_state)}</td>
                 <td className="nowrap"><ApprovalSummary s={s} /></td>
+                <td className="nowrap"><ResumeButton s={s} /></td>
                 <td className="mono wrap"><Link to={`/runtime/${s.id}`}>{where(s)}</Link></td>
                 <td className="num">{s.exit_code ?? ''}</td>
               </tr>

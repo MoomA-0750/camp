@@ -12,7 +12,7 @@ type claudeDriver struct{}
 
 func (claudeDriver) Info() AgentInfo {
 	return AgentInfo{Name: AgentClaude, Label: "Claude Code", Perms: append([]string(nil), allPerms...),
-		Remote: true}
+		Remote: true, Resume: true}
 }
 
 // claudeModes は確認の度合いごとの --permission-mode。Camp の起こし方（-p・stream-json・
@@ -42,13 +42,23 @@ func (claudeDriver) RemoteLaunch() RemoteLaunch {
 }
 
 // Argv は `claude -p` を stream-json で起こす引数。承認は stdio で Camp へ訊かせる。
-func (claudeDriver) Argv(perm string) ([]string, error) {
+func (claudeDriver) Argv(perm, resume string) ([]string, error) {
 	args := []string{
 		"-p",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--permission-prompt-tool", "stdio",
+	}
+	// **続きから起こす**（M48、2026-09-13）。実測: Camp と同じ引数のまま `--resume <id>` を
+	// 足すと文脈が続き、子が名乗る session_id も記録の JSONL も**元のまま**（追記される）。
+	//
+	// **`--fork-session` は使わない。** 複製した別ファイルができ、その**全行に isSidechain**
+	// が付く（2026-09-13 実測）。取り込みはそれを見てサブエージェントとして入れるので、
+	// fork した会話が丸ごとサブエージェント扱いになり、同じ会話が2本になる。
+	// 記録には「fork された」と分かる印が無く、本物のサブエージェントと見分けられない。
+	if resume != "" {
+		args = append(args, "--resume", resume)
 	}
 	if perm == PermCLI {
 		return args, nil

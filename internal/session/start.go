@@ -61,7 +61,7 @@ func (a *Agent) start(m Msg) {
 		fail(err.Error())
 		return
 	}
-	args, err := d.Argv(perm)
+	args, err := d.Argv(perm, m.Resume)
 	if err != nil {
 		fail(err.Error())
 		return
@@ -91,7 +91,8 @@ func (a *Agent) start(m Msg) {
 
 	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
 		pending: map[string]chan []byte{}, name: agent,
-		conv: d.Open(OpenOpts{Session: m.Session, Perm: perm, Cwd: real, Home: l.Home})}
+		conv: d.Open(OpenOpts{Session: m.Session, Perm: perm, Cwd: real, Home: l.Home,
+			Resume: m.Resume})}
 	if a.Scope {
 		k.scope = scopeName(m.Session)
 	}

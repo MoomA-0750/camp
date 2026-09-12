@@ -58,7 +58,10 @@ func fakeCodexMain() {
 		return def
 	}
 
-	const thread = "thr-fake-1"
+	// **続きから（thread/resume）では、頼まれた id に差し替える**（本物と同じ。M48、2026-09-13）。
+	// そのため定数ではなく変数。CAMP_FAKE_CODEX_RESUMEID を置くと別の id を返す
+	// （「別の会話を続けた」を Camp が弾くかを試すため）。
+	thread := "thr-fake-1"
 	var (
 		turnN    int
 		turnID   string
@@ -153,7 +156,7 @@ func fakeCodexMain() {
 					func(json.RawMessage, *rpcErr) {})
 			}
 		case "initialized":
-		case "thread/start":
+		case "thread/start", "thread/resume":
 			if os.Getenv("CAMP_FAKE_CODEX_STARTERR") != "" {
 				send(map[string]any{"id": m.ID, "error": map[string]any{"code": -32000,
 					"message": "偽の失敗"}})
@@ -161,11 +164,25 @@ func fakeCodexMain() {
 			}
 			var p struct {
 				Cwd               string `json:"cwd"`
+				ThreadID          string `json:"threadId"`
 				ApprovalPolicy    string `json:"approvalPolicy"`
 				ApprovalsReviewer string `json:"approvalsReviewer"`
 				Sandbox           string `json:"sandbox"`
 			}
 			json.Unmarshal(m.Params, &p)
+			// **続きから。** 本物は cwd を渡されず、応答に元スレッドの cwd と**同じ id** を返す
+			// （2026-09-13 実測）。偽物も同じにする。
+			if m.Method == "thread/resume" {
+				if p.ThreadID != "" {
+					thread = p.ThreadID
+				}
+				if v := os.Getenv("CAMP_FAKE_CODEX_RESUMEID"); v != "" {
+					thread = v
+				}
+				if p.Cwd == "" {
+					p.Cwd, _ = os.Getwd()
+				}
+			}
 			os.Setenv("CAMP_FAKE_CODEX_THREADCWD", p.Cwd) // 承認の cwd に使う
 			sandbox := map[string]string{"workspace-write": "workspaceWrite",
 				"read-only": "readOnly", "danger-full-access": "dangerFullAccess"}[p.Sandbox]

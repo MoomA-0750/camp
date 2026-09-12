@@ -174,6 +174,20 @@ func (s *Supervisor) StartAgent(requestedBy, host, cwd, agent string) (Record, e
 // StartWith は host（空ならこのマシン）に agent のセッションを、確認の度合い perm で起こす。
 // **起こすのは実行面だが、決めるのはここ。**
 func (s *Supervisor) StartWith(requestedBy, host, cwd, agent, perm string) (Record, error) {
+	return s.startWith(requestedBy, host, cwd, agent, perm, resumeOf{})
+}
+
+// resumeOf は「どの会話の、どの行の続きか」。空なら新しく起こす（M48、2026-09-13）。
+type resumeOf struct {
+	// AgentID はエージェント自身のセッション id（Claude の session_id・Codex のスレッド id）。
+	// **これを実行面へ渡す。** 実測（2026-09-13）: 続きから起こしてもこの id は変わらず、
+	// 記録も同じファイルへ追記される——取り込みは何も変えなくてよい。
+	AgentID string
+	// From は続きの元になった台帳の行（runtime_sessions.id）。記録として残すだけ。
+	From string
+}
+
+func (s *Supervisor) startWith(requestedBy, host, cwd, agent, perm string, res resumeOf) (Record, error) {
 	agent, perm = agentOr(agent), permOr(perm)
 	if !validAgent(agent) {
 		err := fmt.Errorf("知らないエージェント: %q", agent)
@@ -223,7 +237,7 @@ func (s *Supervisor) StartWith(requestedBy, host, cwd, agent, perm string) (Reco
 	rec := Record{
 		ID: id, Agent: agent, Perm: perm, Cwd: real, State: StateStarting, RequestedBy: requestedBy,
 		CreatedAt: t.Format(time.RFC3339), UpdatedAt: t.Format(time.RFC3339),
-		Host: host,
+		Host: host, ResumedFrom: res.From,
 	}
 
 	// **枠は数えたその場で押さえる。**
@@ -249,6 +263,14 @@ func (s *Supervisor) StartWith(requestedBy, host, cwd, agent, perm string) (Reco
 		s.audit("", "session.start", target, err.Error(), audit.Denied)
 		return Record{}, err
 	}
+	if res.AgentID != "" && !s.agent.canResume(agent) {
+		// **続きからを名乗らない実行面へは頼まない。** 読まれずに落ちると、続きのつもりで
+		// 新しい会話が始まってしまう（M48）。
+		s.mu.Unlock()
+		err := fmt.Errorf("いまの実行面は %s を続きから起こせない（実行面が古い。camp-agent を入れ替える）", agent)
+		s.audit("", "session.start", target, err.Error(), audit.Denied)
+		return Record{}, err
+	}
 	if n := len(s.live); n >= s.maxConc {
 		s.mu.Unlock()
 		err := fmt.Errorf("同時に走らせる上限（%d本）に達している", s.maxConc)
@@ -271,7 +293,7 @@ func (s *Supervisor) StartWith(requestedBy, host, cwd, agent, perm string) (Reco
 	s.audit(id, "session.start", target, "実行面へ起動を依頼した（"+agent+"、確認の度合い "+perm+"）", audit.OK)
 
 	if err := ac.send(Msg{T: MsgStart, Session: id, Token: token, Cwd: real, Root: root,
-		Remote: spec, Agent: agent, Perm: perm}); err != nil {
+		Remote: spec, Agent: agent, Perm: perm, Resume: res.AgentID}); err != nil {
 		// **「届かなかった」を「起きなかった」と確定しない。**
 		// 途中まで書けていれば実行面は子を起こしている。ここで exited と
 		// 書くと、あとから来る started も、繋ぎ直しの名乗りも弾いてしまい、
@@ -282,6 +304,37 @@ func (s *Supervisor) StartWith(requestedBy, host, cwd, agent, perm string) (Reco
 		return rec, err
 	}
 	return rec, nil
+}
+
+// ResumeWith は終わったセッションの続きから起こす（M48、2026-09-13）。
+//
+// **新しい行を作り、元の行はそのまま残す**（本人の決定 2026-09-13）。終わった行を生き返らせると、
+// どう終わったか・いつ・待たせたまま終わった承認が上書きされ、過去が消える。プロセスとの
+// 1 対 1（pid・起動時刻・boot_id・scope で所有権を見る）も崩れる。**画面では「元のものが
+// 生き返った」ように見せる**（台帳は別の行のまま）。
+//
+// 起こす場所・確認の度合い・エージェント・ホストは**元の行から引き継ぐ**。場所は引き継いだ
+// うえで startWith が改めて許可を照らす（許した場所が狭まっているかもしれない）。
+func (s *Supervisor) ResumeWith(requestedBy, from string) (Record, error) {
+	src, err := Get(s.db, from)
+	if err != nil {
+		return Record{}, err
+	}
+	// **走っているものは続けない。** 同じ会話を2つ開くと、Claude は「別の端末で走っている」
+	// として拒み、Codex は読み込み済みのスレッドへの上書きを無視する（どちらも実体の文言）。
+	if src.Live() {
+		return Record{}, fmt.Errorf("そのセッションはまだ終わっていない（%s）。止めてから続ける", src.State)
+	}
+	// **エージェント自身の id が要る。** これが無い行は、子が名乗る前に終わっている。
+	if src.ClaudeID == "" {
+		return Record{}, fmt.Errorf("そのセッションはエージェント側の id を名乗らないまま終わった。続きから起こせない")
+	}
+	// Phase 3.6 の Codex の行（legacy）は専用の置き場で起こしていたので、続けられない。
+	if !validPerm(permOr(src.Perm)) {
+		return Record{}, fmt.Errorf("そのセッションは確認の度合い %s で起きていた。続きから起こせない", src.Perm)
+	}
+	return s.startWith(requestedBy, src.Host, src.Cwd, src.Agent, src.Perm,
+		resumeOf{AgentID: src.ClaudeID, From: src.ID})
 }
 
 // Input は走っているセッションへ1行渡す。

@@ -131,6 +131,10 @@ type Msg struct {
 	// Perm は確認の度合い。start で頼み、started で実行面が「こう起こした」と名乗る。
 	// **空は cli と読む**（Phase 3.7 より前の実行面は名乗らない）。
 	Perm string `json:"perm,omitempty"`
+	// Resume は続きから起こすときの、エージェント自身のセッション id（start。M48、2026-09-13）。
+	// 空なら新しく起こす。**古い実行面はこの欄を読まない**ので、campd は名乗らない実行面へ
+	// 再開を頼まない（読まれずに落ちると、続きのつもりで新しい会話が始まってしまう）。
+	Resume string `json:"resume,omitempty"`
 
 	// frame（実行面 → campd）: 駆動器が畳んだ意味。**種類の文字列を campd が読み分けない**
 	// （Claude の result と Codex の turn/completed を、どちらも TurnEnd で伝える）。

@@ -48,6 +48,14 @@ type Record struct {
 	ExitReason string `json:"exit_reason,omitempty"`
 	EndedAt    string `json:"ended_at,omitempty"`
 
+	// ResumedFrom は、この行がどの行の続きか（M48、2026-09-13）。**新しい行を作り、元は
+	// そのまま残す**——終わった行を生き返らせると、どう終わったかの記録を上書きしてしまう。
+	// 画面では「元のものが生き返った」ように見せる（本人の決定）。
+	ResumedFrom string `json:"resumed_from,omitempty"`
+	// ResumedBy はこの行の続きとして起きた行（いちばん新しいもの）。台帳の列ではなく、
+	// 読むときに引く。**終わった一覧で「続きが起きている」を出す**ため。
+	ResumedBy string `json:"resumed_by,omitempty"`
+
 	// どう終わったか（end.go）。2026-09-11 より前に終わった行は空のまま。
 	EndCause string `json:"end_cause,omitempty"`
 	// 終わる直前に何をしていたか（starting / idle / running）。
@@ -94,10 +102,11 @@ func insert(db *store.DB, r Record) error {
 		return fmt.Errorf("知らない確認の度合い: %s", r.Perm)
 	}
 	_, err := db.Exec(`
-		insert into runtime_sessions(id, cwd, state, requested_by, created_at, updated_at, host, agent, perm)
-		values(?,?,?,?,?,?,?,?,?)`,
+		insert into runtime_sessions(id, cwd, state, requested_by, created_at, updated_at, host, agent, perm,
+			resumed_from)
+		values(?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.Cwd, r.State, r.RequestedBy, r.CreatedAt, r.UpdatedAt, nzs(r.Host), agentOr(r.Agent),
-		permOr(r.Perm))
+		permOr(r.Perm), nzs(r.ResumedFrom))
 	return err
 }
 
@@ -228,7 +237,10 @@ var selectCols = `
 	       coalesce(host,''), coalesce(remote_pid,0), coalesce(remote_started,0),
 	       coalesce(remote_boot_id,''), coalesce(remote_scope,''),
 	       exit_code, coalesce(exit_reason,''), coalesce(ended_at,''),
-	       coalesce(end_cause,''), coalesce(end_state,''),
+	       coalesce(end_cause,''), coalesce(end_state,''), coalesce(resumed_from,''),
+	       coalesce((select r2.id from runtime_sessions r2
+	                  where r2.resumed_from = runtime_sessions.id
+	                  order by r2.created_at desc limit 1), ''),
 	       (select count(*) from approvals a where a.session_id = runtime_sessions.id),
 	       (select count(*) from approvals a where a.session_id = runtime_sessions.id
 	          and a.reason = '` + BySessionEnd + `'),
@@ -246,7 +258,7 @@ func scanOne(s scanner) (Record, error) {
 	err := s.Scan(&r.ID, &r.Agent, &r.Perm, &r.ClaudeID, &r.Cwd, &r.State, &r.RequestedBy,
 		&r.CreatedAt, &r.UpdatedAt, &r.PID, &r.Started, &r.BootID, &r.Scope,
 		&r.Host, &r.RemotePID, &r.RemoteStarted, &r.RemoteBootID, &r.RemoteScope,
-		&code, &r.ExitReason, &r.EndedAt, &r.EndCause, &r.EndState,
+		&code, &r.ExitReason, &r.EndedAt, &r.EndCause, &r.EndState, &r.ResumedFrom, &r.ResumedBy,
 		&r.Asked, &r.LeftWaiting, &r.TimedOut)
 	if err != nil {
 		return r, err

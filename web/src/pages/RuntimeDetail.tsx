@@ -165,6 +165,19 @@ export default function RuntimeDetail() {
           {rec.exit_reason ? <span className="muted"> · {rec.exit_reason}</span> : null}
         </p>
       )}
+      {/* **元のものが生き返ったように見せる**（本人の決定 2026-09-13）。台帳では別の行だが、
+          エージェント側の会話は1本のまま繋がっている（記録も同じファイルへ追記される）。 */}
+      {rec?.resumed_from && (
+        <p className="sub">
+          <Link to={`/runtime/${rec.resumed_from}`}>前のセッション</Link> の続き。
+          <span className="muted"> 会話はエージェント側で1本に繋がっている。</span>
+        </p>
+      )}
+      {rec?.resumed_by && (
+        <p className="sub">
+          <Link to={`/runtime/${rec.resumed_by}`}>続きが起きている</Link>。
+        </p>
+      )}
       {one.error && <Failed error={one.error} />}
 
       <Ask id={id} rows={waiting} onAnswered={() => setTick((v) => v + 1)} />

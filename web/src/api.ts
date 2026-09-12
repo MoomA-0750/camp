@@ -136,6 +136,12 @@ export type RuntimeSession = {
   exit_code?: number; exit_reason?: string; ended_at?: string
   // どう終わったか（2026-09-11 から）。それより前に終わったものには無い。
   end_cause?: string; end_state?: string
+  // resumed_from は、この行がどの行の続きか（2026-09-13 から）。台帳では別の行だが、
+  // **画面では元のものが生き返ったように見せる**（本人の決定）。
+  resumed_from?: string
+  // resumed_by は、この行の続きとして起きた行（いちばん新しいもの）。終わった一覧で
+  // 「続きが起きている」を出すのに使う。
+  resumed_by?: string
   approvals_asked?: number; approvals_left_waiting?: number; approvals_timed_out?: number
 }
 
@@ -145,6 +151,8 @@ export type AgentInfo = {
   interrupt_leaves_tools?: boolean
   // 向こうのホスト（ssh）でも起こせるか。
   remote?: boolean
+  // 終わった会話の続きから起こせるか（2026-09-13 から）。**古い実行面は名乗らない。**
+  resume?: boolean
 }
 
 export type RuntimeList = {
@@ -364,6 +372,10 @@ export const api = {
   runtimeStart: (cwd: string, host = '', agent = '', perm = '') =>
     postJSON<RuntimeSession>('/api/runtime',
       { cwd, ...(host ? { host } : {}), ...(agent ? { agent } : {}), ...(perm ? { perm } : {}) }),
+  // 終わったセッションの続きから起こす（2026-09-13）。**渡すものは無い**——起こす場所・
+  // エージェント・確認の度合いは元の行から引き継ぐ。返るのは新しく起きた行。
+  runtimeResume: (id: string) =>
+    postJSON<RuntimeSession>(`/api/runtime/${encodeURIComponent(id)}/resume`, {}),
   runtimeInput: (id: string, text: string) =>
     postJSON<{ ok: boolean }>(`/api/runtime/${encodeURIComponent(id)}/input`, { text }),
   runtimeStop: (id: string, mode: 'interrupt' | 'terminate') =>

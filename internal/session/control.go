@@ -91,6 +91,9 @@ func (a *agentConn) info(agent string) (AgentInfo, bool) {
 	}
 	local := d.Info()
 	local.Perms = []string{PermCLI}
+	// **続きからも頼まない**（M48、2026-09-13）。古い実行面は start の resume を読まないので、
+	// 頼んでも黙って落ち、**続きのつもりで新しい会話が始まる**。度合いと同じ考え方。
+	local.Resume = false
 	return local, true
 }
 
@@ -110,6 +113,15 @@ func (a *agentConn) leavesTools(agent string) bool {
 func (a *agentConn) canPerm(agent, perm string) bool {
 	in, ok := a.info(agent)
 	return ok && contains(in.Perms, perm)
+}
+
+// canResume は agent を「終わった会話の続きから」起こせる実行面か（M48、2026-09-13）。
+//
+// **名乗らない実行面へは頼まない。** 読まれずに落ちると、続きのつもりで新しい会話が始まり、
+// 本人は気づけない（画面には起きたとしか出ない）。
+func (a *agentConn) canResume(agent string) bool {
+	in, ok := a.info(agent)
+	return ok && in.Resume
 }
 
 // namedInfos は hello の Drivers から、知っている駆動器・知っている度合いだけを採る。

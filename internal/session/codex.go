@@ -33,7 +33,7 @@ func (codexDriver) Info() AgentInfo {
 				"作業場所の中のコマンドも訊かずに走る。ネットワークや場所の外への書き込みは、Codex が権限を上げて頼まない限り" +
 				"訊かれずに失敗する（2026-09-12 実測）",
 		},
-		InterruptLeavesTools: true, Remote: true}
+		InterruptLeavesTools: true, Remote: true, Resume: true}
 }
 
 // RemoteLaunch は向こうで探す名前と置き場（$CODEX_HOME、無ければ ~/.codex。CLI と同じ）。
@@ -43,7 +43,9 @@ func (codexDriver) RemoteLaunch() RemoteLaunch {
 
 // Argv は `codex app-server`（stdio の JSON-RPC）。確認の度合いは引数でなく thread/start の欄で渡す
 // （codexPerms）。
-func (codexDriver) Argv(perm string) ([]string, error) {
+// Argv は app-server だけ。**続きから起こすのは引数では頼まない**——Codex は
+// `thread/resume` という呼び出しで続ける（handshake の中。M48、2026-09-13）。
+func (codexDriver) Argv(perm, _ string) ([]string, error) {
 	if !validPerm(perm) {
 		return nil, fmt.Errorf("Codex の確認の度合い %s は扱わない", perm)
 	}
@@ -210,8 +212,12 @@ func (cs *codexState) threadID() string {
 //
 // 方針（承認・sandbox）は何も渡さない——本人の設定のまま（CLI と同じ）。確認の度合いを
 // セッションごとに選ぶ口は Phase 3.7 の M41 で足す（渡したものだけ照らす）。
+// resume が空でなければ `thread/start` の代わりに `thread/resume` を呼び、その会話の続きから
+// 始める（M48、2026-09-13）。**続けたスレッドの id は元と同じであることまで照らす**——
+// 違う id が返ったら、別の会話の続きを本人に見せることになる。
 func (cs *codexState) handshake(sc *bufio.Scanner, w io.Writer, cwd string,
-	checkHome func(json.RawMessage) error, perm map[string]any, rec func(kind string, line []byte)) error {
+	checkHome func(json.RawMessage) error, perm map[string]any, resume string,
+	rec func(kind string, line []byte)) error {
 	write := func(b []byte) error {
 		_, err := w.Write(append(b, '\n'))
 		return err
@@ -236,21 +242,34 @@ func (cs *codexState) handshake(sc *bufio.Scanner, w io.Writer, cwd string,
 		return err
 	}
 	// 確認の度合いの欄だけを足す（cli なら cwd だけ。本人の設定のまま）。
-	params := map[string]any{"cwd": cwd}
+	//
+	// 続きから起こすときは `thread/resume {threadId}`（実測 2026-09-13。一発で通り、文脈が
+	// 続き、スレッド id は元のまま）。**確認の度合いはここでも頼む**——元が「毎回訊く」だった
+	// のに続きで本人の設定へ戻ると、安全側でない驚きになる。効いたかは下の verifyCodexPerm が
+	// 照らし、効いていなければ話し始めない（実体には「読み込み済みのスレッドへの上書きは無視」
+	// という文言があるので、無視されたらそこで止まる）。
+	method, params := "thread/start", map[string]any{"cwd": cwd}
+	if resume != "" {
+		method, params = "thread/resume", map[string]any{"threadId": resume}
+	}
 	for k, v := range perm {
 		params[k] = v
 	}
-	start, key := cs.request("start", "thread/start", params)
+	start, key := cs.request("start", method, params)
 	if err := write(start); err != nil {
 		return err
 	}
 	res, err = cs.await(sc, w, key, rec)
 	if err != nil {
-		return fmt.Errorf("thread/start: %w", err)
+		return fmt.Errorf("%s: %w", method, err)
 	}
 	thread, err := verifyCodexStart(res, cwd)
 	if err != nil {
 		return err
+	}
+	// **続けたのが頼んだスレッドか。** 別の id が返ったら、別の会話の続きを見せることになる。
+	if resume != "" && thread != resume {
+		return fmt.Errorf("Codex が別のスレッド %s を続けた（%s のはず）。話し始めない", thread, resume)
 	}
 	if err := verifyCodexPerm(res, perm); err != nil {
 		return err

@@ -166,7 +166,7 @@ func (a *Agent) startRemote(m Msg) {
 		fail(fmt.Sprintf("%s は向こうのホストで起こせない", agent))
 		return
 	}
-	args, err := d.Argv(perm)
+	args, err := d.Argv(perm, m.Resume)
 	if err != nil {
 		fail(err.Error())
 		return
@@ -281,7 +281,8 @@ func (a *Agent) startRemote(m Msg) {
 	}
 	k := &child{id: m.Session, token: m.Token, cmd: cmd, stdin: stdin,
 		pending: map[string]chan []byte{}, remote: &o, spec: spec, name: agent,
-		conv: d.Open(OpenOpts{Session: m.Session, Perm: perm, Cwd: o.Cwd, Remote: true, RemoteHomes: homes})}
+		conv: d.Open(OpenOpts{Session: m.Session, Perm: perm, Cwd: o.Cwd, Remote: true,
+			RemoteHomes: homes, Resume: m.Resume})}
 	if lg, err := OpenLog(a.LogDir, m.Session); err == nil {
 		k.log = lg
 	} else {

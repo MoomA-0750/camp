@@ -42,6 +42,12 @@ type AgentInfo struct {
 	InterruptLeavesTools bool `json:"interrupt_leaves_tools,omitempty"`
 	// Remote は向こうのホスト（ssh）でも起こせるか。
 	Remote bool `json:"remote,omitempty"`
+	// Resume は終わった会話の続きから起こせるか（M48、2026-09-13）。
+	//
+	// **名乗らない実行面へは再開を頼まない。** 古い実行面は Msg.Resume を読まないので、
+	// 頼んでも黙って落ち、続きのつもりで**新しい会話が始まってしまう**。
+	// 起こせない指示を出さないのは、確認の度合い（Perm）と同じ考え方。
+	Resume bool `json:"resume,omitempty"`
 }
 
 // Launch は起こすのに要る、実行面の設定のうちそのエージェントの分。
@@ -66,7 +72,11 @@ type Driver interface {
 	Launch(a *Agent) (Launch, error)
 	// Argv は子の引数（実体の後ろ）。**このマシンでも向こうのホストでも同じものを使う**
 	// （向こうは M42）。確認の度合いは、渡すものがある度合いだけ引数に足す（cli は何も足さない）。
-	Argv(perm string) ([]string, error)
+	//
+	// resume はエージェント自身のセッション id（空なら新しく起こす）。**引数で続きから起こす
+	// エージェント（Claude の --resume）だけがここで使う。** 呼び出しで続けるもの
+	// （Codex の thread/resume）は Open と Begin で受ける（M48、2026-09-13）。
+	Argv(perm, resume string) ([]string, error)
 	// Open は子1本ぶんの会話を作る。
 	Open(o OpenOpts) Conversation
 	// Usage は残量の問い合わせ（get_usage・get_context_usage）の答えを共通の形に直す（campd 側）。

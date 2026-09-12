@@ -692,7 +692,7 @@ func TestTheDefaultCommandUsesTheUsersOwnSettings(t *testing.T) {
 		a.Scope = scope
 		for _, name := range []string{AgentClaude, AgentCodex} {
 			d := drivers[name]
-			args, err := d.Argv(PermCLI)
+			args, err := d.Argv(PermCLI, "")
 			codexNoErr(t, err)
 			l, err := d.Launch(a)
 			codexNoErr(t, err)
@@ -711,7 +711,7 @@ func TestTheDefaultCommandUsesTheUsersOwnSettings(t *testing.T) {
 			}
 		}
 	}
-	if args, _ := (codexDriver{}).Argv(PermCLI); strings.Join(args, " ") != "app-server" {
+	if args, _ := (codexDriver{}).Argv(PermCLI, ""); strings.Join(args, " ") != "app-server" {
 		t.Fatalf("Codex の起こし方が違う: %v", args)
 	}
 }

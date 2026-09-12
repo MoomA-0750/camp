@@ -49,7 +49,9 @@ func (fake3Driver) Launch(*Agent) (Launch, error) {
 	return Launch{Bin: b}, nil
 }
 
-func (fake3Driver) Argv(perm string) ([]string, error) {
+// **続きからは名乗らない**（Info の Resume が false）。名乗らない駆動器へ campd が再開を
+// 頼まないことを、これで縛れる（resume_test.go）。
+func (fake3Driver) Argv(perm, _ string) ([]string, error) {
 	if perm != PermCLI {
 		return nil, fmt.Errorf("fake3 は確認の度合い %s を扱わない", perm)
 	}

@@ -29,6 +29,7 @@ func (s *Server) runtimeRoutes() {
 	m.HandleFunc("GET /api/runtime/ended", s.handleRuntimeEnded)
 	m.HandleFunc("GET /api/runtime/{id}", s.handleRuntimeOne)
 	m.HandleFunc("POST /api/runtime", s.handleRuntimeStart)
+	m.HandleFunc("POST /api/runtime/{id}/resume", s.handleRuntimeResume)
 	m.HandleFunc("POST /api/runtime/{id}/input", s.handleRuntimeInput)
 	m.HandleFunc("POST /api/runtime/{id}/stop", s.handleRuntimeStop)
 	m.HandleFunc("POST /api/runtime/{id}/approve", s.handleRuntimeApprove)
@@ -113,6 +114,27 @@ func (s *Server) handleRuntimeStart(w http.ResponseWriter, r *http.Request) {
 		code := http.StatusBadRequest
 		if errors.Is(err, session.ErrNoAgent) {
 			code = http.StatusServiceUnavailable
+		}
+		s.fail(w, r, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+// handleRuntimeResume は終わったセッションの続きから起こす（M48、2026-09-13）。
+//
+// **中身は要らない。** 起こす場所・エージェント・確認の度合いは元の行から引き継ぐので、
+// 画面から渡せるものは無い（渡せるようにすると、続きのつもりで別の場所を指せてしまう）。
+// 許可の照合は起こすときに改めて走る。
+func (s *Server) handleRuntimeResume(w http.ResponseWriter, r *http.Request) {
+	rec, err := s.sessions.ResumeWith("user", r.PathValue("id"))
+	if err != nil {
+		code := http.StatusBadRequest
+		switch {
+		case errors.Is(err, session.ErrNoAgent):
+			code = http.StatusServiceUnavailable
+		case errors.Is(err, session.ErrNotFound):
+			code = http.StatusNotFound
 		}
 		s.fail(w, r, code, err.Error())
 		return

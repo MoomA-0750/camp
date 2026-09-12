@@ -8,6 +8,8 @@ type codexConv struct {
 	cwd  string
 	home string
 	perm map[string]any // thread/start へ足す確認の度合いの欄（cli なら空）
+	// resume は続けるスレッド id（空なら新しく起こす。M48、2026-09-13）。
+	resume string
 	// remote は向こうのホストの子か。remoteHomes は向こうの sh が名乗った置き場。
 	remote      bool
 	remoteHomes []string
@@ -17,7 +19,7 @@ var _ Conversation = (*codexConv)(nil)
 
 func (codexDriver) Open(o OpenOpts) Conversation {
 	return &codexConv{cs: newCodexState(), cwd: o.Cwd, home: o.Home, perm: codexPerms[o.Perm],
-		remote: o.Remote, remoteHomes: o.RemoteHomes}
+		resume: o.Resume, remote: o.Remote, remoteHomes: o.RemoteHomes}
 }
 
 func (c *codexConv) Begin(o BeginOpts) error {
@@ -25,7 +27,7 @@ func (c *codexConv) Begin(o BeginOpts) error {
 	if c.remote {
 		check = func(res json.RawMessage) error { return verifyRemoteCodexHome(res, c.remoteHomes) }
 	}
-	return c.cs.handshake(o.Scanner, o.W, c.cwd, check, c.perm, o.Record)
+	return c.cs.handshake(o.Scanner, o.W, c.cwd, check, c.perm, c.resume, o.Record)
 }
 
 func (c *codexConv) Fold(line []byte) Event {
