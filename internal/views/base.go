@@ -19,6 +19,10 @@ const (
 	KindLifeTracker = "life-tracker"
 )
 
+// KindChart は独自定義での時系列の種別。**変換器は `life-tracker` を `chart` と書く**
+// （本人の決定、2026-09-13）。`.base` を読むときは Obsidian の名前のまま。
+const KindChart = "chart"
+
 // Base は1つの `.base` ファイル。
 type Base struct {
 	Path     string            `json:"path"`
@@ -51,12 +55,22 @@ type View struct {
 	// columnConfigs・timeFrame など）。**捨てずに持つ。** 捨てると、
 	// Obsidian が書いた設定が Camp を経由しただけで消える。
 	Extra map[string]any `json:"extra,omitempty"`
+
+	// 時系列（Phase 4 / M51、2026-09-13）。**独自定義だけが持つ。** `.base` の life-tracker は
+	// これを `columnConfigs`・`timeFrame` として Extra に持ち、変換器（`ConvertCharts`）が移す。
+	//
+	// `Time` と `Measures` は **`shape`（人とモデルが共有する分析）**、`Emit` は描き方だけ
+	// （設計レビューの指摘3）。`DiffBases` はどれも比べない——`.base` 版には対応物が無いので、
+	// 比べると併読の間ずっと差が出る。
+	Time     *TimeSpec         `json:"time,omitempty"`
+	Measures map[string]string `json:"measures,omitempty"`
+	Emit     *Emit             `json:"emit,omitempty"`
 }
 
 // SortKey は並べ替え1段。
 type SortKey struct {
-	Property  string `json:"property"`
-	Direction string `json:"direction,omitempty"` // ASC / DESC
+	Property  string `json:"property" yaml:"property"`
+	Direction string `json:"direction,omitempty" yaml:"direction,omitempty"` // ASC / DESC
 }
 
 // Filter は絞り込み。and / or / not の入れ子か、葉の式。

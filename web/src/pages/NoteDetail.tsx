@@ -34,6 +34,7 @@ export default function NoteDetail() {
         <span className="mono">{n.path}</span>
         {' · '}{n.kind}{' · '}{num(n.size)} バイト
         {n.mtime && <>{' · '}更新 {short(n.mtime)}</>}
+        {' · '}<Link to={`/graph?note=${n.id}&depth=1`}>グラフで見る</Link>
       </p>
 
       {n.missing_at && (

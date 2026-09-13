@@ -1,6 +1,8 @@
 import { useMemo } from 'react'
-import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { api, type ViewColumn } from '../api'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { api, type ViewColumn, type ViewResult } from '../api'
+import GraphPlot from '../GraphPlot'
+import TimeChart from '../TimeChart'
 import { Empty, Failed, Loading, num, useAsync } from '../ui'
 
 /**
@@ -16,6 +18,7 @@ export default function ViewDetail() {
   const params = useParams()
   const id = (params['*'] ?? '') as string
   const [sp, setSp] = useSearchParams()
+  const navigate = useNavigate()
   const showAll = sp.get('cols') === 'all'
   const res = useAsync(() => api.view(id), [id])
 
@@ -31,6 +34,15 @@ export default function ViewDetail() {
   if (!r) return <Empty>そのビューは無い。</Empty>
 
   const hidden = r.columns.length - cols.length
+  // 描き方（2026-09-13 から）。独自定義が `emit` を持っていればその順に描く。
+  // **チャートだけを挙げた定義でも行は捨てない**——たたんで下に置く（開けば読める）。
+  const human = r.emit?.human ?? []
+  const charts = human.filter((h) => h.kind === 'chart')
+  // グラフのビュー（2026-09-13 から）。節と辺はサーバーが行から作って渡す（`r.graph`）。
+  // 描き方の指定が無くても、種別が graph なら描く（色分けが無いだけ）。
+  const graphEnc = human.find((h) => h.kind === 'graph') ?? (r.graph ? { kind: 'graph' } : undefined)
+  const drawn = charts.length > 0 || (graphEnc !== undefined && r.graph !== undefined)
+  const tableEnc = human.find((h) => h.kind === 'table')
 
   return (
     <>
@@ -46,6 +58,47 @@ export default function ViewDetail() {
         <p key={i} className="notice">読めなかった式: {w}</p>
       ))}
 
+      {charts.map((enc, ci) => (enc.values ?? []).map((key) => {
+        const s = r.series?.find((x) => x.key === key)
+        return s
+          ? <TimeChart key={`${ci}-${key}`} series={s} enc={enc} />
+          : <p key={`${ci}-${key}`} className="notice">{key} の時系列が返ってきていない。</p>
+      }))}
+
+      {graphEnc && r.graph && (
+        <section className="chart">
+          <p className="sub muted">
+            {num(r.graph.nodes.length)} 節 / {num(r.graph.edges.length)} 辺
+            {' · '}行どうしのリンクを持たない {num(r.graph.unlinked)} 件は出していない
+            {' · '}節を押すとそのノートから辿るグラフへ
+          </p>
+          {r.graph.nodes.length === 0
+            ? <p className="muted">行どうしのリンクが無い。</p>
+            : <GraphPlot graph={r.graph} colors={graphEnc.colors}
+                onPick={(n) => navigate(`/graph?note=${n.id}&depth=1`)} />}
+        </section>
+      )}
+
+      {drawn && !tableEnc
+        ? (
+          <details className="rows-fold">
+            <summary>元の行を見る（{num(r.total)} 行）</summary>
+            <Rows r={r} cols={cols} hidden={hidden} showAll={showAll} sp={sp} setSp={setSp} />
+          </details>
+        )
+        : <Rows r={r} cols={cols} hidden={hidden} showAll={showAll} sp={sp} setSp={setSp}
+            widths={tableEnc?.widths} />}
+    </>
+  )
+}
+
+function Rows({ r, cols, hidden, showAll, sp, setSp, widths }: {
+  r: ViewResult; cols: ViewColumn[]; hidden: number; showAll: boolean
+  sp: URLSearchParams; setSp: (next: URLSearchParams) => void
+  widths?: Record<string, number>
+}) {
+  return (
+    <>
       <form className="filters" onSubmit={(e) => e.preventDefault()}>
         <label>
           <input
@@ -66,7 +119,9 @@ export default function ViewDetail() {
           <thead>
             <tr>
               {cols.map((c) => (
-                <th key={c.key} className={c.pinned ? 'pin' : ''} title={c.key}>
+                <th key={c.key} className={c.pinned ? 'pin' : ''} title={c.key}
+                  // 列幅は本人が Obsidian で合わせた値（`.base` の columnSize から持ち越した）。
+                  style={widths?.[c.key] ? { width: widths[c.key], minWidth: widths[c.key] } : undefined}>
                   {c.label}
                   {c.formula && <span className="tag">式</span>}
                 </th>

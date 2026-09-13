@@ -67,3 +67,55 @@ test('読めない式を画面に出す', async () => {
     </MemoryRouter>)
   await waitFor(() => expect(screen.getByText(/読めなかった式/)).toBeTruthy())
 })
+
+// チャートを描く定義でも行は捨てない（たたんで下に置く）。2026-09-13 から。
+test('チャートの定義は時系列を描き、行はたたむ', async () => {
+  stub(() => ({
+    ...result, view: '銀行-残高推移', kind: 'life-tracker',
+    time: { axis: 'date', bucket: 'day' },
+    series: [{ key: 'steps', label: 'steps', measure: 'last', rows: 2,
+      points: [{ t: '2026-01-01', v: 8000, n: 1 }, { t: '2026-01-02', v: 9000, n: 3 }] }],
+    emit: { human: [{ kind: 'chart', values: ['steps'], chart: 'line' }] },
+  }))
+  const { container } = render(
+    <MemoryRouter initialEntries={['/views/Payments/銀行-残高推移']}>
+      <Routes><Route path="/views/*" element={<ViewDetail />} /></Routes>
+    </MemoryRouter>)
+  await waitFor(() => expect(container.querySelector('svg.plot')).toBeTruthy())
+  const fold = container.querySelector('details.rows-fold')
+  expect(fold).toBeTruthy()
+  expect(fold!.querySelector('table')).toBeTruthy()
+  expect(screen.getByText('元の行を見る（2 行）')).toBeTruthy()
+})
+
+test('表の列幅は定義の値で描く', async () => {
+  stub(() => ({ ...result, emit: { human: [{ kind: 'table', widths: { steps: 487 } }] } }))
+  const { container } = render(
+    <MemoryRouter initialEntries={['/views/Health/テーブル']}>
+      <Routes><Route path="/views/*" element={<ViewDetail />} /></Routes>
+    </MemoryRouter>)
+  await waitFor(() => expect(screen.getByText('steps')).toBeTruthy())
+  const th = screen.getByTitle('steps') as HTMLElement
+  expect(th.style.width).toBe('487px')
+  expect(container.querySelector('details.rows-fold')).toBeNull()
+})
+
+// グラフのビューは節と辺を描き、行はたたむ。色分けの凡例も出す（2026-09-13 から）。
+test('グラフのビューは構成図を描き、行はたたむ', async () => {
+  stub(() => ({
+    ...result, view: '構成図', kind: 'graph',
+    graph: { unlinked: 2, nodes: [
+      { id: 1, path: 'lab/a.md', name: 'a', tags: ['east'], degree: 1, hops: 0 },
+      { id: 2, path: 'lab/b.md', name: 'b', degree: 1, hops: 0 }],
+    edges: [{ from: 1, to: 2 }] },
+    emit: { human: [{ kind: 'graph', colors: [{ tag: 'east', color: '#2e7d32' }] }] },
+  }))
+  const { container } = render(
+    <MemoryRouter initialEntries={['/views/Homelab/構成図']}>
+      <Routes><Route path="/views/*" element={<ViewDetail />} /></Routes>
+    </MemoryRouter>)
+  await waitFor(() => expect(container.querySelector('svg.graph')).toBeTruthy())
+  expect(screen.getByText(/行どうしのリンクを持たない 2 件は出していない/)).toBeTruthy()
+  expect(screen.getByText('#east')).toBeTruthy()
+  expect(container.querySelector('details.rows-fold')).toBeTruthy()
+})

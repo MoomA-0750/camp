@@ -253,3 +253,32 @@ td.wrap { overflow-wrap: anywhere; width: 100%; }
 .badge.s-orphaned,
 .badge.s-stopping { border-color: #d08b2f; color: #d08b2f; }
 .badge.s-exited   { opacity: .7; }
+
+/* 時系列（2026-09-13 から）。色は地の文と同じ変数から取る（明暗どちらでも読める）。 */
+.chart { margin: 0 0 1.4rem; }
+.chart-head { font-size: .95rem; margin: 0 0 .1rem; display: flex; gap: .4rem; align-items: baseline; }
+svg.plot { display: block; max-width: 100%; }
+svg.plot .grid-line { stroke: var(--line); }
+svg.plot .axis { fill: var(--muted); font-size: 11px; }
+svg.plot .line { fill: none; stroke: var(--accent); stroke-width: 1.6; }
+svg.plot .dot { fill: var(--accent); }
+svg.plot .bar { fill: color-mix(in srgb, var(--accent) 70%, transparent); }
+details.rows-fold > summary { cursor: pointer; color: var(--muted); margin: 0 0 .6rem; }
+
+/* グラフ（2026-09-13 から）。節と辺の色も地の文の変数から取る。 */
+svg.graph { display: block; max-width: 100%; border: 1px solid var(--line); border-radius: .4rem; }
+svg.graph .edge { stroke: var(--line); stroke-width: 1; }
+svg.graph .node { cursor: pointer; }
+svg.graph .node circle { fill: var(--muted); stroke: var(--bg); stroke-width: 1.2; }
+svg.graph .node.center circle { fill: var(--accent); stroke: var(--fg); stroke-width: 1.5; }
+svg.graph .node.far circle { opacity: .45; }
+svg.graph .node:hover circle { stroke: var(--accent); stroke-width: 2; }
+/* 文字は押せない（ほかの節の上に重なって、その節を押せなくしていた。2026-09-13、実ブラウザで見つけた）。 */
+svg.graph .label { fill: var(--fg); font-size: 11px; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; pointer-events: none; }
+.legend { display: flex; gap: .9rem; flex-wrap: wrap; margin-top: .4rem; }
+.swatch { display: inline-block; width: .7rem; height: .7rem; border-radius: 50%; margin-right: .3rem; vertical-align: -.05rem; }
+.graph-refs { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 0 1.4rem; margin-top: 1rem; }
+/* 出ていくリンクはハブで 83 本ある。ページを 4,000px に伸ばさない（2026-09-13、画面写しで見つけた）。 */
+ul.refs { margin: 0; padding-left: 1.1rem; max-height: 22rem; overflow-y: auto; }
+ul.refs li { overflow-wrap: anywhere; }
+button.btn.on { background: var(--soft); font-weight: 600; }

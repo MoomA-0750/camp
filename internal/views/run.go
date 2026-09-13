@@ -2,6 +2,7 @@ package views
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,6 +73,17 @@ type Result struct {
 	Total    int                `json:"total"`
 	Summary  map[string]float64 `json:"summary,omitempty"`
 	Warnings []string           `json:"warnings,omitempty"`
+
+	// 時系列（M51）。**モデルにも同じものを渡す**——人が「日ごとの残高推移」を見ているのに、
+	// モデルは同じ id で「526行の先頭50行」しか見られない、を避ける（設計レビューの指摘3）。
+	Time   *TimeSpec `json:"time,omitempty"`
+	Series []Series  `json:"series,omitempty"`
+	// Emit は人向けの描き方。モデルには渡さない（中身は Series にある）。
+	Emit *Emit `json:"emit,omitempty"`
+
+	// Graph は `kind: graph` のビューの節と辺（M52）。`Run` は作らない——リンクは行の材料に
+	// 入っていないので、呼び出し側が `AttachGraph` で付ける。
+	Graph *Graph `json:"graph,omitempty"`
 }
 
 // Run は1ビューを回す。
@@ -162,6 +174,9 @@ func Run(b *Base, v *View, recs []*Record) (*Result, error) {
 	for i := range res.Groups {
 		res.Groups[i].Summary = summarize(res.Groups[i].Rows, v.Summaries)
 	}
+	// 6) 時系列。**表の並べ替えのあとの行から作る**（`last` の並びは `time.within` が別に決める）。
+	res.Time, res.Emit = v.Time, v.Emit
+	res.Series = buildSeries(b, v, kept, res.Columns)
 	// 警告は行数ぶん出ても意味がない。同じものは1回だけ。
 	res.Warnings = dedup(res.Warnings)
 	return res, nil
@@ -190,7 +205,12 @@ func cellNum(s string) (float64, bool) {
 		return 0, false
 	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	return f, err == nil
+	// NaN・Inf は数として扱わない。`encoding/json` が書けず、ビューの応答が丸ごと落ちる
+	// （実装後レビュー、codex の指摘6・Fable の指摘10）。
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
 }
 
 func formulaKey(k string) string { return "formula." + k }

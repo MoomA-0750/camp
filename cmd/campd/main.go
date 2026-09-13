@@ -1493,6 +1493,10 @@ func cmdViews(args []string) error {
 	vaultID := fs.Int64("vault", 1, "Vault の id")
 	limit := fs.Int("n", 5, "出す行数")
 	cols := fs.Int("c", 8, "出す列数")
+	// Phase 4 / M50（2026-09-13）。
+	convert := fs.Bool("convert", false, "`.base` を独自定義へ変換して DB へ入れる")
+	compare := fs.Bool("compare", false, "`.base` 版と独自定義版を突き合わせる（併読の確かめ）")
+	force := fs.Bool("force", false, "-convert で、手で直した定義も上書きする")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1508,12 +1512,21 @@ func cmdViews(args []string) error {
 	if err := db.QueryRow(`select root from vaults where id = ?`, *vaultID).Scan(&root); err != nil {
 		return err
 	}
-	bases, err := views.LoadBases(db, *vaultID, func(rel string) ([]byte, error) {
-		return vault.Read(root, rel)
-	})
+	read := func(rel string) ([]byte, error) { return vault.Read(root, rel) }
+	bases, err := views.LoadBases(db, *vaultID, read)
 	if err != nil {
 		return err
 	}
+
+	// **変換**（M50、2026-09-13）。`.base` を独自定義にして DB へ入れる。`.base` は触らない。
+	if *convert {
+		return convertViews(db, *vaultID, bases, read, *force)
+	}
+	// **突き合わせ**（併読の確かめ。本人の決定3）。
+	if *compare {
+		return compareViews(db, *vaultID, bases, read)
+	}
+
 	recs, err := views.LoadRecords(db, *vaultID)
 	if err != nil {
 		return err
@@ -1580,6 +1593,224 @@ func cmdViews(args []string) error {
 				fmt.Printf("  集計: %v\n", r.Summary)
 			}
 			fmt.Println()
+		}
+	}
+	return nil
+}
+
+// convertViews は `.base` を独自定義にして DB へ入れる（Phase 4 / M50、2026-09-13）。
+//
+// **`.base` は読むだけ。書き換えない・消さない**（Obsidian を退避先として残す）。
+// 持ち越さなかった鍵は必ず報告する——黙って消すのが一番悪い。
+func convertViews(db *store.DB, vaultID int64, bases []*views.Base,
+	read func(string) ([]byte, error), force bool) error {
+	// チャートの時間軸は行を見て決める（M51）。
+	recs, err := views.LoadRecords(db, vaultID)
+	if err != nil {
+		return err
+	}
+	current, err := views.LoadNativeDefs(db, vaultID)
+	if err != nil {
+		return err
+	}
+	byName := map[string]*views.Base{}
+	for _, c := range current {
+		byName[c.Name] = c
+	}
+	dups := duplicateBaseNames(bases)
+	done, same, skipped, failed := 0, 0, 0, 0
+	for _, b := range bases {
+		if paths := dups[b.Name]; len(paths) > 1 {
+			// **同じ名前の台紙は1行に潰れる**（id が `台紙の名前/ビュー名` なので。codex の指摘4）。
+			// どちらかを黙って選ばない。
+			fmt.Printf("!! %-14s 同じ名前の .base が %d つある（%s）。名前を変えるまで変換しない\n",
+				b.Name, len(paths), strings.Join(paths, "・"))
+			failed++
+			continue
+		}
+		if b.ParseError != "" {
+			fmt.Printf("!! %-14s 読めないので飛ばす: %s\n", b.Name, b.ParseError)
+			failed++
+			continue
+		}
+		notes := views.ConvertCharts(b, recs)
+		// **`.base` で言えない部分（時間軸・集約・グラフのビュー）は今の定義から引き継ぐ**
+		// （本人の決定、2026-09-13）。引き継いでから描けるかを確かめる。
+		if cur := byName[b.Name]; cur != nil && cur.ParseError == "" {
+			views.CarryOver(b, cur)
+		}
+		report := views.Report(b, notes, views.ChartProblems(b, recs))
+		body, err := views.ToNative(b)
+		if err != nil {
+			fmt.Printf("!! %-14s 書き出せない: %v\n", b.Name, err)
+			failed++
+			continue
+		}
+		def := &views.Def{Base: b.Name, Body: string(body), Origin: b.Path}
+		// `.base` の中身の指紋を控える。併読中に Obsidian 側で変わったのを
+		// 「変換の誤り」と誤診しないため。
+		if src, err := read(b.Path); err == nil {
+			def.OriginSHA256 = views.SHA256(src)
+		}
+		before, _ := views.LoadDef(db, vaultID, b.Name)
+		if err := views.SaveDef(db, vaultID, def, views.ByConvert, force); err != nil {
+			switch {
+			case views.IsHandEdited(err):
+				fmt.Printf("—  %-14s 絞り込み・列・並び・集計・描き方を手で直してあるので飛ばす（上書きするなら -force。時間軸・集約・構成図は -force でも引き継ぐ）\n", b.Name)
+				skipped++
+			case views.IsConflict(err):
+				fmt.Printf("!! %-14s 変換している間に画面から書き換えられた。もう一度 -convert する\n", b.Name)
+				failed++
+			default:
+				fmt.Printf("!! %-14s 保存できない: %v\n", b.Name, err)
+				failed++
+			}
+			continue
+		}
+		if before != nil && before.Body == def.Body && before.OriginSHA256 == def.OriginSHA256 {
+			fmt.Printf("=  %-14s 変わらない\n", b.Name)
+			same++
+		} else {
+			fmt.Printf("✓  %-14s ビュー %d 本\n", b.Name, len(b.Views))
+			done++
+		}
+		if dropped := views.DroppedKeys(b); len(dropped) > 0 {
+			fmt.Printf("     持ち越さなかった鍵: %s\n", strings.Join(dropped, ", "))
+		}
+		for _, n := range report {
+			fmt.Printf("     要確認: %s\n", n)
+		}
+	}
+	fmt.Printf("\n変換 %d / 変わらない %d / 手編集で飛ばした %d / 失敗 %d\n", done, same, skipped, failed)
+	if failed > 0 {
+		return fmt.Errorf("%d 枚が変換できていない", failed)
+	}
+	return nil
+}
+
+// duplicateBaseNames は同じ名前の `.base` を集める（名前 → パス）。
+func duplicateBaseNames(bases []*views.Base) map[string][]string {
+	out := map[string][]string{}
+	for _, b := range bases {
+		out[b.Name] = append(out[b.Name], b.Path)
+	}
+	return out
+}
+
+// compareViews は `.base` 版と独自定義版を突き合わせる（併読の確かめ。本人の決定3）。
+//
+// **2段で見る**（設計レビューの指摘1）。行数・列数・グループ数だけでは、`order` から列を
+// 落としても `sort` の向きを変えても「一致」と出てしまう。
+//
+// 実装後レビュー（2026-09-13）で直したこと:
+//   - **`.base` の指紋は常に照合する。** 以前は食い違いが出たときだけ見ていたので、
+//     `timeFrame` のように比べない所を Obsidian で変えると「一致」と言い、変更が届かないことに
+//     誰も気づけなかった（codex の指摘1・Fable の指摘3）。違えば「変換し直しが要る」に数える
+//   - **比べる相手は「変換が最後に書いた版」。** 人が画面で直した差は「手で直した差」として
+//     別に出し、変換の誤りに数えない（Fable の指摘3。数えると併読をやめる条件が永久に満たせない）
+//   - **描き方（チャートの列・線/棒・期間、表の列幅）も比べる**（Fable の指摘4）
+func compareViews(db *store.DB, vaultID int64, bases []*views.Base,
+	read func(string) ([]byte, error)) error {
+	native, err := views.LoadNativeDefs(db, vaultID)
+	if err != nil {
+		return err
+	}
+	recs, err := views.LoadRecords(db, vaultID)
+	if err != nil {
+		return err
+	}
+	byBase := map[string]*views.Base{}
+	for _, b := range native {
+		byBase[b.Name] = b
+	}
+	dups := duplicateBaseNames(bases)
+
+	agree, differ, stale, absent := 0, 0, 0, 0
+	for _, b := range bases {
+		if paths := dups[b.Name]; len(paths) > 1 {
+			fmt.Printf("✗  %-14s 同じ名前の .base が %d つある（%s）\n", b.Name, len(paths), strings.Join(paths, "・"))
+			differ++
+			continue
+		}
+		n := byBase[b.Name]
+		if n == nil {
+			fmt.Printf("—  %-14s 独自定義が無い（まだ変換していない）\n", b.Name)
+			absent++
+			continue
+		}
+		src, srcErr := read(b.Path)
+		def, _ := views.LoadDef(db, vaultID, b.Name)
+		if def != nil && def.OriginSHA256 != "" && srcErr == nil && views.SHA256(src) != def.OriginSHA256 {
+			fmt.Printf("↻  %-14s `.base` が変換したときと違う。`-convert` し直すのが先（突き合わせはそのあと）\n", b.Name)
+			stale++
+			continue
+		}
+
+		var found, hand []string
+		target := n
+		if n.ParseError != "" {
+			found = append(found, "独自定義が読めない: "+n.ParseError)
+		} else {
+			if body, err := views.LastConverted(db, vaultID, b.Name); err == nil {
+				if conv, err := views.ParseNative(b.Name, []byte(body)); err == nil {
+					target = conv
+					hand = append(views.DiffBases(conv, n), views.DiffEmit(conv, n)...)
+				}
+			}
+			found = append(found, views.DiffBases(b, target)...)
+			// 描き方は、`.base` をもう一度変換したものと比べる（変換器の誤りを見る）。
+			if srcErr == nil {
+				if fresh, err := views.ParseBase(b.Path, src); err == nil {
+					views.ConvertCharts(fresh, recs)
+					found = append(found, views.DiffEmit(fresh, target)...)
+				}
+			}
+			for i := range b.Views {
+				va := &b.Views[i]
+				vb := findNativeView(target, va.Name)
+				if vb == nil {
+					continue // 構造の差分が既に言っている
+				}
+				ra, ea := views.Run(b, va, recs)
+				rb, eb := views.Run(target, vb, recs)
+				if ea != nil || eb != nil {
+					found = append(found, fmt.Sprintf("ビュー %q: 回せない（元 %v / 移行 %v）",
+						va.Name, ea, eb))
+					continue
+				}
+				for _, d := range views.DiffResults(ra, rb, 20) {
+					found = append(found, fmt.Sprintf("ビュー %q: %s", va.Name, d))
+				}
+			}
+		}
+		if len(found) == 0 {
+			fmt.Printf("✓  %-14s 一致（構造・描き方・実行結果とも）\n", b.Name)
+			agree++
+		} else {
+			differ++
+			fmt.Printf("✗  %-14s 食い違い %d 件\n", b.Name, len(found))
+			for _, d := range found {
+				fmt.Printf("     %s\n", d)
+			}
+		}
+		if len(hand) > 0 {
+			fmt.Printf("     手で直した差 %d 件（変換の誤りではない）\n", len(hand))
+			for _, d := range hand {
+				fmt.Printf("       %s\n", d)
+			}
+		}
+	}
+	fmt.Printf("\n一致 %d / 食い違い %d / 変換し直しが要る %d / 独自定義なし %d\n", agree, differ, stale, absent)
+	if differ > 0 || stale > 0 {
+		return fmt.Errorf("食い違い %d 枚・変換し直しが要る %d 枚", differ, stale)
+	}
+	return nil
+}
+
+func findNativeView(b *views.Base, name string) *views.View {
+	for i := range b.Views {
+		if b.Views[i].Name == name {
+			return &b.Views[i]
 		}
 	}
 	return nil

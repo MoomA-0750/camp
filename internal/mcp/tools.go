@@ -202,7 +202,9 @@ func (s *Server) builtinTools() []Tool {
 		{
 			Name: "view",
 			Description: "ビューを実行して行と列を返す。**人が画面で見るのと同じ結果**。" +
-				"列は定義が挙げたものだけでなく実在する全部が入る。",
+				"列は定義が挙げたものだけでなく実在する全部が入る。" +
+				"groups にグループ別の集計、series に時系列（区切りごとに集約済みの点）が入る。" +
+				"**集計と時系列は自分で行から計算し直さない**（同じ日に複数行ある残高などで間違える）。",
 			Schema: obj(map[string]any{
 				"id":    strProp(`ビューID（"Health/テーブル" のような base/name）`),
 				"limit": intProp("行数の上限（既定50）"),
@@ -210,7 +212,7 @@ func (s *Server) builtinTools() []Tool {
 			}, "id"),
 			Run: func(a map[string]any) (any, error) {
 				id := str(a, "id")
-				bases, recs, err := s.viewData()
+				bases, recs, links, err := s.viewMaterial()
 				if err != nil {
 					return nil, err
 				}
@@ -223,10 +225,50 @@ func (s *Server) builtinTools() []Tool {
 						if err != nil {
 							return nil, err
 						}
+						views.AttachGraph(r, &b.Views[i], links)
 						return clipResult(r, num(a, "limit", 50), str(a, "cols") == "all"), nil
 					}
 				}
 				return nil, fmt.Errorf("ビュー %q が無い", id)
+			},
+		},
+		{
+			Name: "note_graph",
+			Description: "ノートからリンクを辿ったグラフ（向きを問わず depth 歩以内）。path も id も無ければ" +
+				"リンクの一番多いノートを中心にする。節は中心に近い順で、hops が歩数、degree がこのグラフの中のつながりの数。" +
+				"辺の from が to を指す。リンクを1本も持たないノートは節にしない（unlinked が数）。",
+			Schema: obj(map[string]any{
+				"path":  strProp("中心のノートの Vault ルートからの相対パス（完全一致）"),
+				"id":    intProp("中心のノートID（path の代わりに）"),
+				"depth": intProp("何歩まで辿るか 1〜4（既定1）。0 はリンクを持つノート全部"),
+				"limit": intProp("節の上限（既定100）。遠いほうから切る"),
+			}),
+			Run: func(a map[string]any) (any, error) {
+				_, recs, links, err := s.viewMaterial()
+				if err != nil {
+					return nil, err
+				}
+				center := int64(num(a, "id", 0))
+				if p := str(a, "path"); p != "" {
+					center = -1
+					for _, r := range recs {
+						if r.NPath == p {
+							center = r.NoteID
+						}
+					}
+					if center < 0 {
+						return nil, fmt.Errorf("%q というノートは無い（完全一致で探す。search_notes で探してから渡す）", p)
+					}
+				}
+				depth := num(a, "depth", 1)
+				if depth < 0 || depth > 4 {
+					return nil, fmt.Errorf("depth は 0〜4")
+				}
+				g, err := views.Neighborhood(recs, links, center, depth)
+				if err != nil {
+					return nil, err
+				}
+				return graphForModel(g, num(a, "limit", 100)), nil
 			},
 		},
 		{
@@ -287,11 +329,33 @@ func clipResult(r *views.Result, limit int, allCols bool) map[string]any {
 		}
 	}
 
+	// **グループ別の集計をここで渡す**（M50、2026-09-13）。D-004 の約束は「集計は Camp が
+	// 計算し、モデルには算術させない」。
+	//
+	// **全体の集計（`r.Summary`）は前から渡していた**（下の `out["summary"]`）。落ちていたのは
+	// **グループ鍵（`g.Key`）とグループ別集計（`g.Summary`）**だけ——`r.Groups` を平らにして
+	// 行を積んでいたので、`カード-すべて` の月別合計はモデルに見えなかった。
+	//
+	// 行は切り詰めても**集計は切り詰めない**（数個の数で、これが正確さの源だから）。
+	groups := make([]map[string]any, 0, len(r.Groups))
+	for _, g := range r.Groups {
+		e := map[string]any{"rows": len(g.Rows)}
+		if g.Key != "" {
+			e["key"] = g.Key
+		}
+		if len(g.Summary) > 0 {
+			e["summary"] = g.Summary
+		}
+		groups = append(groups, e)
+	}
+
 	out := map[string]any{
 		"view": r.View, "kind": r.Kind,
 		"columns": cols, "rows": rows,
 		"total_rows": r.Total, "shown_rows": shown,
 		"total_columns": len(r.Columns), "shown_columns": len(cols),
+		// **グループは鍵と件数と集計だけ。** 行そのものは上の rows（切り詰め済み）にある。
+		"groups": groups,
 	}
 	if shown < r.Total {
 		out["truncated"] = fmt.Sprintf("全 %d 行のうち先頭 %d 行", r.Total, shown)
@@ -307,5 +371,96 @@ func clipResult(r *views.Result, limit int, allCols bool) map[string]any {
 	if len(r.Warnings) > 0 {
 		out["warnings"] = r.Warnings
 	}
+	// **時系列も人と同じものを渡す**（M51）。人が「日ごとの残高推移」を見ているのに、モデルが
+	// 行の先頭だけを読んで自分で集約し直すと、同日8件の日で残高を間違える。
+	// 点は新しいほうから切り詰める（切ったことは書く）。描けない理由（`error`）は切らない。
+	if len(r.Series) > 0 {
+		series := make([]map[string]any, 0, len(r.Series))
+		for _, s := range r.Series {
+			e := map[string]any{"key": s.Key, "label": s.Label, "rows": s.Rows}
+			if s.Measure != "" {
+				e["measure"] = s.Measure
+			}
+			if s.Error != "" {
+				e["error"] = s.Error
+			}
+			if s.Skipped > 0 {
+				e["skipped_rows"] = s.Skipped
+			}
+			pts := s.Points
+			if len(pts) > maxSeriesPoints {
+				e["truncated"] = fmt.Sprintf("全 %d 点のうち新しい %d 点", len(pts), maxSeriesPoints)
+				pts = pts[len(pts)-maxSeriesPoints:]
+			}
+			if len(pts) > 0 {
+				e["points"] = pts
+			}
+			series = append(series, e)
+		}
+		out["time"] = r.Time
+		out["series"] = series
+	}
+	// **グラフのビューは節と辺も渡す**（M52）。行（上）とは別に、つながりそのものを。
+	if r.Graph != nil {
+		out["graph"] = graphForModel(r.Graph, 200)
+	}
 	return out
 }
+
+// graphForModel はグラフを節の上限で切り、辺をパスで書く（id の突き合わせをモデルにさせない）。
+// 節は近い順に並んでいるので、切ると遠いほうが落ちる。**切ったことは書く。**
+//
+// **degree は返す節と辺の中で数え直す**（実装後レビュー、codex の指摘7）。切る前の数を転記すると、
+// 星形の中心が「返したグラフの中で 399 のつながり」と読めてしまう。切ったと書くときは**切る前の
+// 全体の数**を言う（サーバーが先に 400 で切っていても、元の数を失わない）。
+func graphForModel(g *views.Graph, limit int) map[string]any {
+	if limit <= 0 {
+		limit = 100
+	}
+	nodes := g.Nodes
+	out := map[string]any{"unlinked": g.Unlinked, "total_nodes": g.Total}
+	if len(nodes) > limit {
+		nodes = nodes[:limit]
+	}
+	if len(nodes) < g.Total {
+		out["truncated"] = fmt.Sprintf("全 %d 節のうち近い %d 節（degree は返した節の中で数えた）", g.Total, len(nodes))
+	}
+	path := make(map[int64]string, len(nodes))
+	for _, n := range nodes {
+		path[n.ID] = n.Path
+	}
+	es := []map[string]string{}
+	degree := map[int64]int{}
+	pair := map[[2]int64]bool{}
+	for _, e := range g.Edges {
+		if path[e.From] == "" || path[e.To] == "" {
+			continue
+		}
+		es = append(es, map[string]string{"from": path[e.From], "to": path[e.To]})
+		a, b := e.From, e.To
+		if a > b {
+			a, b = b, a
+		}
+		if !pair[[2]int64{a, b}] { // 往復のリンクはつながり1つ
+			pair[[2]int64{a, b}] = true
+			degree[e.From]++
+			degree[e.To]++
+		}
+	}
+	ns := make([]map[string]any, 0, len(nodes))
+	for _, n := range nodes {
+		e := map[string]any{"path": n.Path, "hops": n.Hops, "degree": degree[n.ID]}
+		if len(n.Tags) > 0 {
+			e["tags"] = n.Tags
+		}
+		ns = append(ns, e)
+	}
+	out["nodes"], out["edges"] = ns, es
+	if c := path[g.Center]; c != "" {
+		out["center"], out["depth"] = c, g.Depth
+	}
+	return out
+}
+
+// maxSeriesPoints は1本あたりに渡す点の上限。日ごとで1年ぶん。
+const maxSeriesPoints = 366

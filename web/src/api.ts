@@ -89,7 +89,28 @@ export type Ghost = {
 export type ViewInfo = {
   base: string; name: string; kind: string; id: string
   rows: number; columns: number; pinned: number; error?: string
+  // from_db は Camp の独自定義から来たか（2026-09-13 から）。無ければ `.base` を読んでいる。
+  // 併読の間はどちらを描いたかを出す——出さないと、変換したつもりで `.base` を見続けていても
+  // 気づけない。
+  from_db?: boolean
 }
+
+// 台紙1枚ぶんの定義（2026-09-13 から）。body は YAML そのまま。
+// origin_sha256 は変換したときの `.base` の中身の指紋——併読中に Obsidian 側で
+// `.base` が変わったのを「変換の誤り」と誤診しないために控えてある。
+export type ViewDef = {
+  base: string; body: string
+  origin?: string; origin_sha256?: string
+  converted_at?: string; updated_at: string
+  // body_sha256 は保存のときに返す（読んだ版の上にしか書かない）。
+  body_sha256?: string
+  // hand_edited は変換のあとで `.base` で言える部分を人が直したか。**サーバーが決める**——
+  // 画面で時刻を比べ直すと、`-convert` が実際に上書きするかと食い違う。
+  hand_edited?: boolean
+}
+
+// 書き換え1回。by は convert / user（`.base` にあった git 履歴の代わり）。
+export type ViewRevision = { at: string; by: string; body: string }
 
 export type ViewColumn = {
   key: string; label: string; formula?: boolean; pinned?: boolean
@@ -100,10 +121,38 @@ export type ViewRow = { note_id: number; path: string; name: string; cells: Reco
 
 export type ViewGroup = { key: string; rows: ViewRow[]; summary?: Record<string, number> }
 
+// 時系列（2026-09-13 から）。点は**サーバーが集約済み**——画面は行から描き直さない。
+// n はその点にまとめた行の数（銀行の残高は同じ日に最大8件ある）。
+// error があれば点は無い（嘘の点を描くより、描けない理由を出す）。
+export type ViewPoint = { t: string; v: number; n: number }
+export type ViewSeries = {
+  key: string; label: string; measure?: string
+  points?: ViewPoint[]; rows: number; skipped?: number; error?: string
+  // holes は値はあるのに数として読めない行を含むので、点にしなかった区切りの数。
+  holes?: number
+}
+export type ViewTime = { axis: string; bucket: string; within?: { property: string; direction?: string }[] }
+// 描き方。window（last-N-days）だけは画面が切る。widths は表の列幅（本人の調整値）。
+export type ViewEncoding = {
+  kind: string; values?: string[]; chart?: string; window?: string; widths?: Record<string, number>
+  colors?: { tag: string; color: string }[]
+}
+
+// グラフ（2026-09-13 から）。節は中心に近い順。hops は中心からの歩数（ビューのグラフでは 0、辿れない島は -1）。
+// 辺の from が to を指す。unlinked はリンクを持たないので出さなかったノートの数。
+export type GraphNode = { id: number; path: string; name: string; tags?: string[]; degree: number; hops: number }
+export type GraphEdge = { from: number; to: number }
+export type Graph = {
+  nodes: GraphNode[]; edges: GraphEdge[]; center?: number; depth?: number
+  unlinked: number; truncated?: string
+}
+
 export type ViewResult = {
   view: string; kind: string
   columns: ViewColumn[]; groups: ViewGroup[]
   total: number; summary?: Record<string, number>; warnings?: string[]
+  time?: ViewTime; series?: ViewSeries[]; emit?: { human?: ViewEncoding[] }
+  graph?: Graph
 }
 
 export type Touch = {
@@ -332,6 +381,15 @@ export const api = {
       })).then((r) => r.audit),
 
   views: () => fetchJSON<ViewInfo[]>('/api/views'),
+  // 台紙1枚ぶんの定義（YAML）。2026-09-13 から。書き換えは POST（ほかの書き口と揃える）。
+  viewDef: (base: string) =>
+    fetchJSON<ViewDef>(`/api/views/${encodeURIComponent(base)}/def`),
+  // base_sha256 は読み込んだ本文の指紋（GET の body_sha256）。**読んだ版の上にしか書かない**——
+  // ほかのタブや -convert が間に書いていれば 409 で断られる（2026-09-13 の実装後レビュー）。
+  viewDefSave: (base: string, def: string, baseSha256?: string) =>
+    postJSON<{ ok: boolean }>(`/api/views/${encodeURIComponent(base)}/def`, { def, base_sha256: baseSha256 ?? '' }),
+  viewHistory: (base: string, n = 50) =>
+    fetchJSON<ViewRevision[]>(`/api/views/${encodeURIComponent(base)}/history` + qs({ n })),
   view: (id: string) =>
     fetchJSON<ViewResult>('/api/views/' + id.split('/').map(encodeURIComponent).join('/')),
 
@@ -351,6 +409,15 @@ export const api = {
 
   noteLinks: (id: number) =>
     fetchJSON<{ out: Ref[]; back: Ref[] }>(`/api/notes/${id}/links`),
+
+  // depth は 0（全部）も意味を持つので qs を通さない（qs は 0 を落とす）。
+  graph: (o: { note?: number; depth?: number }) => {
+    const p = new URLSearchParams()
+    if (o.note) p.set('note', String(o.note))
+    if (o.depth !== undefined) p.set('depth', String(o.depth))
+    const s = p.toString()
+    return fetchJSON<Graph>('/api/graph' + (s ? `?${s}` : ''))
+  },
 
   noteSessions: (id: number) => fetchJSON<NoteTouch[]>(`/api/notes/${id}/sessions`),
 

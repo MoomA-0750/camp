@@ -14,6 +14,8 @@ import VaultHealth from './pages/VaultHealth'
 import Audit from './pages/Audit'
 import Views from './pages/Views'
 import ViewDetail from './pages/ViewDetail'
+import ViewDefEdit from './pages/ViewDefEdit'
+import Graph from './pages/Graph'
 import './styles.css'
 
 // ルーティングは本物のURLに乗せる（BrowserRouter）。
@@ -42,6 +44,9 @@ function App() {
         <NavLink to="/views" className={({ isActive }) => (isActive ? 'on' : '')}>
           ビュー
         </NavLink>
+        <NavLink to="/graph" className={({ isActive }) => (isActive ? 'on' : '')}>
+          グラフ
+        </NavLink>
         <NavLink to="/vault" className={({ isActive }) => (isActive ? 'on' : '')}>
           Vault の点検
         </NavLink>
@@ -63,7 +68,11 @@ function App() {
           <Route path="/notes" element={<Notes />} />
           <Route path="/notes/:id" element={<NoteDetail />} />
           <Route path="/views" element={<Views />} />
+          {/* 定義の編集は `/views/` の下に置かない——`/views/*` が詳細の catch-all なので
+              飲まれる（2026-09-13）。独立させれば `def` という名前の台紙でも壊れない。 */}
+          <Route path="/viewdefs/:base" element={<ViewDefEdit />} />
           <Route path="/views/*" element={<ViewDetail />} />
+          <Route path="/graph" element={<Graph />} />
           <Route path="/vault" element={<VaultHealth />} />
           <Route path="/audit" element={<Audit />} />
           <Route path="*" element={<NotFound />} />

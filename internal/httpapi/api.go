@@ -47,6 +47,13 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/vault/issues", s.handleIssues)
 	m.HandleFunc("GET /api/audit", s.handleAudit)
 	m.HandleFunc("GET /api/views", s.handleViews)
+	m.HandleFunc("GET /api/graph", s.handleGraph)
+	// 定義の読み書きと履歴（M50、2026-09-13）。**書きは POST**——ほかの書き口と揃える
+	// （この API に PUT は1つも無い）。`{id...}` より literal を含むこちらが優先される。
+	// そのぶん `def`・`history` という名前のビューは開けない（実在しないので許す）。
+	m.HandleFunc("GET /api/views/{base}/def", s.handleViewDef)
+	m.HandleFunc("POST /api/views/{base}/def", s.handleViewDefSave)
+	m.HandleFunc("GET /api/views/{base}/history", s.handleViewHistory)
 	m.HandleFunc("GET /api/views/{id...}", s.handleView)
 }
 
