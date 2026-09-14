@@ -282,3 +282,49 @@ svg.graph .label { fill: var(--fg); font-size: 11px; paint-order: stroke; stroke
 ul.refs { margin: 0; padding-left: 1.1rem; max-height: 22rem; overflow-y: auto; }
 ul.refs li { overflow-wrap: anywhere; }
 button.btn.on { background: var(--soft); font-weight: 600; }
+
+/* 書く画面（Phase 5 / M54）。 */
+.edit-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
+.edit-one > div { min-width: 0; }
+.edit-status { margin: .4rem 0 .8rem; }
+.edit-preview { border-left: 1px solid var(--line); padding-left: 1rem; min-width: 0; overflow-wrap: anywhere; }
+.edit-one .edit-preview { border-left: 0; padding-left: 0; }
+.edit-conflict { border: 1px solid #c0392b; border-radius: .4rem; padding: .6rem .8rem; margin: .6rem 0; }
+.cm-host { border: 1px solid var(--line); border-radius: .35rem; min-height: 60dvh; }
+.cm-host .cm-editor { min-height: 60dvh; font-size: 15px; }
+.cm-host .cm-editor.cm-focused { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); }
+.md { overflow-wrap: anywhere; }
+.md pre.md-code { background: var(--soft); padding: .5rem .7rem; border-radius: .35rem; overflow-x: auto; }
+.md blockquote { margin: .5rem 0; padding: .1rem .8rem; border-left: 3px solid var(--line); }
+.md-callout { margin: .6rem 0; padding: .4rem .8rem; border-left: 3px solid var(--accent); background: var(--soft); border-radius: 0 .35rem .35rem 0; }
+.md-callout-title { font-weight: 600; }
+.md-table { overflow-x: auto; }
+.md table { border-collapse: collapse; }
+.md th, .md td { border: 1px solid var(--line); padding: .2rem .5rem; text-align: left; vertical-align: top; }
+.md-fm { font-size: .9em; margin-bottom: .8rem; }
+.md-fm th, .md-fm td { text-align: left; vertical-align: top; }
+.md-fm th { color: var(--muted); font-weight: normal; }
+.md-missing { color: var(--muted); text-decoration: line-through dotted; }
+.md-image { color: var(--muted); }
+.md table, table.md-fm { width: auto; max-width: 100%; }
+.md th { font-size: 1em; color: inherit; }
+
+/* 行き来（Phase 5 / M55）: スイッチャー・新しいノート・被リンク・.trash へ移す */
+.switcher-back { position: fixed; inset: 0; background: color-mix(in srgb, CanvasText 25%, transparent); z-index: 50;
+  display: flex; justify-content: center; align-items: flex-start; padding: 10dvh .75rem 0; }
+.switcher { background: var(--bg); border: 1px solid var(--line); border-radius: .5rem; width: min(40rem, 100%);
+  max-height: 75dvh; display: flex; flex-direction: column; padding: .6rem; box-shadow: 0 .5rem 2rem color-mix(in srgb, CanvasText 20%, transparent); }
+.switcher input { font-size: 16px; padding: .5rem .6rem; border: 1px solid var(--line); border-radius: .35rem; background: var(--bg); color: inherit; }
+.switcher-actions { display: flex; gap: .4rem; flex-wrap: wrap; margin: .5rem 0; }
+.switcher ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+.switcher li { padding: .4rem .5rem; border-radius: .3rem; cursor: pointer; overflow-wrap: anywhere; }
+.switcher li.on { background: var(--soft); }
+.note-new { display: grid; gap: .7rem; max-width: 40rem; }
+.note-new label { display: grid; gap: .25rem; }
+.note-new input, .note-new select, .note-new textarea { font-size: 16px; padding: .4rem .5rem; border: 1px solid var(--line);
+  border-radius: .35rem; background: var(--bg); color: inherit; max-width: 100%; }
+.edit-backlinks { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .4rem; }
+.edit-backlinks ul { padding-left: 1.1rem; margin: .3rem 0; }
+.edit-trash { margin: 1.5rem 0 .5rem; }
+.cm-tooltip-autocomplete ul li[aria-selected] { background: var(--soft); color: inherit; }
+.cm-completionDetail { margin-left: .6rem; color: var(--muted); font-style: normal; }

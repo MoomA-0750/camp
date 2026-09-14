@@ -35,6 +35,7 @@ export default function NoteDetail() {
         {' · '}{n.kind}{' · '}{num(n.size)} バイト
         {n.mtime && <>{' · '}更新 {short(n.mtime)}</>}
         {' · '}<Link to={`/graph?note=${n.id}&depth=1`}>グラフで見る</Link>
+        {n.kind === 'markdown' && !n.missing_at && <>{' · '}<Link to={`/notes/${n.id}/edit`}>書く</Link></>}
       </p>
 
       {n.missing_at && (

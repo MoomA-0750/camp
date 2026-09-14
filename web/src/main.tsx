@@ -1,7 +1,9 @@
-import { StrictMode } from 'react'
+import { StrictMode, Suspense, lazy, useCallback, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { api } from './api'
+import Switcher, { useSwitcherKey } from './Switcher'
+import NoteNew from './pages/NoteNew'
 import Sessions from './pages/Sessions'
 import Runtime from './pages/Runtime'
 import RuntimeDetail from './pages/RuntimeDetail'
@@ -16,14 +18,23 @@ import Views from './pages/Views'
 import ViewDetail from './pages/ViewDetail'
 import ViewDefEdit from './pages/ViewDefEdit'
 import Graph from './pages/Graph'
+import { clearAll as clearDrafts } from './editor/drafts'
+
+// 書く画面は CodeMirror を抱えるので遅れて読む（ほかの画面の読み込みを重くしない）。
+const NoteEdit = lazy(() => import('./pages/NoteEdit'))
 import './styles.css'
 
 // ルーティングは本物のURLに乗せる（BrowserRouter）。
 // ブックマークも戻る/進むもそのまま効く。深いURLを直接開いても
 // 404にならないのは、サーバー側の catch-all が殻を返すから（D-020）。
 function App() {
+  // クイックスイッチャー（Ctrl+O・⌘O・ナビの「開く」）。Phase 5 / M55。
+  const [switcher, setSwitcher] = useState(false)
+  const openSwitcher = useCallback(() => setSwitcher(true), [])
+  useSwitcherKey(openSwitcher)
   return (
     <div className="app">
+      {switcher && <Switcher onClose={() => setSwitcher(false)} />}
       <nav>
         <h1>Camp</h1>
         <NavLink to="/sessions" className={({ isActive }) => (isActive ? 'on' : '')}>
@@ -53,8 +64,9 @@ function App() {
         <NavLink to="/audit" className={({ isActive }) => (isActive ? 'on' : '')}>
           監査ログ
         </NavLink>
+        <button onClick={openSwitcher} title="Ctrl+O">開く</button>
         <div className="spacer" />
-        <button onClick={() => void api.logout()}>ログアウト</button>
+        <button onClick={() => { clearDrafts(); void api.logout() }}>ログアウト</button>
       </nav>
       <main>
         <Routes>
@@ -66,7 +78,9 @@ function App() {
           <Route path="/search" element={<Search />} />
           <Route path="/usage" element={<Usage />} />
           <Route path="/notes" element={<Notes />} />
+          <Route path="/notes/new" element={<NoteNew />} />
           <Route path="/notes/:id" element={<NoteDetail />} />
+          <Route path="/notes/:id/edit" element={<Suspense fallback={<p className="muted">読み込み中…</p>}><NoteEdit /></Suspense>} />
           <Route path="/views" element={<Views />} />
           {/* 定義の編集は `/views/` の下に置かない——`/views/*` が詳細の catch-all なので
               飲まれる（2026-09-13）。独立させれば `def` という名前の台紙でも壊れない。 */}

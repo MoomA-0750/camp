@@ -49,6 +49,8 @@ type agentConn struct {
 	infos map[string]AgentInfo
 	// build は hello で名乗った実行ファイルの指紋。**空なら名乗らない古い実行面。**
 	build string
+	// noteVault は書ける Vault の実パス（hello で名乗る。Phase 5 / M53）。空なら書けない。
+	noteVault string
 }
 
 // announced は hello で名乗った起こせる名前か。**名乗らない古い実行面は claude だけ。**
@@ -293,6 +295,7 @@ func (c *Control) handle(conn net.Conn) {
 	a.agents = hello.Agents
 	a.infos = namedInfos(a, hello.Drivers)
 	a.build = hello.Build
+	a.noteVault = hello.NoteVault
 	c.s.agent = a
 	c.s.mu.Unlock()
 
@@ -813,7 +816,7 @@ func (c *Control) dispatch(a *agentConn, m Msg) {
 			s.audit(m.Session, "session.reap", strconv.Itoa(r.PID), m.Reason, out)
 		}
 
-	case MsgTailRes, MsgSSHRes, MsgCtlRes, MsgSSHResolved, MsgRecListRes, MsgRecReadRes:
+	case MsgTailRes, MsgSSHRes, MsgCtlRes, MsgSSHResolved, MsgRecListRes, MsgRecReadRes, MsgNoteRes:
 		s.deliver(m)
 
 	case MsgDropped:

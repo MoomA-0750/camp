@@ -31,6 +31,8 @@ import (
 	"github.com/MoomA-0750/camp/internal/ingest"
 	"github.com/MoomA-0750/camp/internal/limits"
 	"github.com/MoomA-0750/camp/internal/mcp"
+	"github.com/MoomA-0750/camp/internal/noteedit"
+	"github.com/MoomA-0750/camp/internal/notes"
 	"github.com/MoomA-0750/camp/internal/remoteingest"
 	"github.com/MoomA-0750/camp/internal/report"
 	"github.com/MoomA-0750/camp/internal/retain"
@@ -1047,6 +1049,12 @@ func cmdServe(args []string) error {
 	// 終わった直後だけになる。続けて失敗した接続先は間隔が伸びる。
 	recordEvery := fs.Duration("record-every", time.Hour,
 		"向こうのホストの記録を見に行く間隔（0 でやめる）")
+	commitAfter := fs.Duration("commit-after", time.Minute,
+		"編集面で書いたノートを、書かれなくなってから commit・push するまで（本人の決定: 自動）")
+	pushRetry := fs.Duration("push-retry", 5*time.Minute,
+		"ノートの commit を出せなかったとき（エージェントの commit が確認待ち・網など）にもう一度試すまで")
+	indexEvery := fs.Duration("index-every", 10*time.Minute,
+		"Vault（CAMP_VAULT）を索引し直す間隔（0 でやめる。エージェントや取り込みの変更を拾う）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1083,9 +1091,19 @@ func cmdServe(args []string) error {
 		fmt.Printf("前回の残り  幽霊 %d / 孤児 %d / 判定できず %d\n", g, o, u)
 	}
 
+	// **ノートの編集**（Phase 5 / M53）。書くのは実行面で、campd は頼んで覚えるだけ。
+	edit := &noteedit.Service{DB: db, W: sup, CommitAfter: *commitAfter, PushRetry: *pushRetry,
+		IsBusy: func(err error) bool { return errors.Is(err, session.ErrNoteBusy) }}
+	if p, d, err := edit.Reconcile(); err != nil {
+		return fmt.Errorf("書きかけのノートを照合できない: %w", err)
+	} else if p+d > 0 {
+		fmt.Printf("書きかけのノート  書けていた %d / 書けていなかった %d\n", p, d)
+	}
+	edit.WantPush() // 前回出せなかった commit があるかもしれない
+
 	srv, err := httpapi.New(db, httpapi.Options{
 		Addr: *addr, WebDir: *web, Origins: allow, SecureCookie: *secure,
-		Sessions: sup,
+		Sessions: sup, Notes: edit,
 	})
 	if err != nil {
 		return err
@@ -1148,6 +1166,13 @@ func cmdServe(args []string) error {
 		fmt.Printf("記録の取り込み  %v ごと（向こうのホスト。台帳で許した組み合わせだけ）\n", *recordEvery)
 	}
 
+	// commit・push を回し、Vault を索引し直す（Phase 5 / M53）。
+	//
+	// **索引は serve の中で回す。** 別のプロセス（timer）にすると、全体の索引の間 DB の書き込みが
+	// 待たされ、保存が失敗しうる（Fable の設計レビュー 9）。本番ではこれまで索引が自動で
+	// 新しくならず、最後に手で索引したときのままだった（Phase 5 着手時に見つけた）。
+	go runNoteLoop(supDone, db, edit, defaultVaultRoot(), *indexEvery)
+
 	// Ctrl-C で受け付けをやめ、走っている要求を待つ。
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -1168,6 +1193,36 @@ func cmdServe(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return hs.Shutdown(ctx)
+	}
+}
+
+// runNoteLoop は commit・push を 20 秒ごとに見て、Vault を indexEvery ごとに索引し直す。
+func runNoteLoop(done <-chan struct{}, db *store.DB, edit *noteedit.Service, root string, indexEvery time.Duration) {
+	tick := time.NewTicker(20 * time.Second)
+	defer tick.Stop()
+	var lastIndex time.Time
+	for {
+		select {
+		case <-done:
+			return
+		case now := <-tick.C:
+			edit.Tick(now)
+			if indexEvery <= 0 || now.Sub(lastIndex) < indexEvery {
+				continue
+			}
+			lastIndex = now
+			id, err := vault.VaultByRoot(db, root)
+			if err != nil || id == 0 {
+				continue // 一度も手で索引していない Vault は勝手に作らない
+			}
+			_, name, host, err := vault.VaultRoot(db, id)
+			if err != nil {
+				continue
+			}
+			if _, err := vault.Index(db, host, root, name); err != nil {
+				fmt.Fprintln(os.Stderr, "Vault の索引に失敗:", err)
+			}
+		}
 	}
 }
 
@@ -2563,6 +2618,8 @@ func cmdAgent(args []string) error {
 	codexHome := fs.String("codex-home", session.DefaultCodexHome(),
 		"本人の Codex の置き場（CLI と同じ。Codex がここで起きたかを照らす。Camp は書き換えない）")
 	scope := fs.Bool("scope", true, "systemd の transient scope で包む（孫まで止めるため）")
+	vaultDir := fs.String("vault", os.Getenv("CAMP_AGENT_VAULT"),
+		"ノートを書く Vault の作業コピー（空なら書かない。Phase 5。campd からは場所を受け取らない）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -2578,7 +2635,18 @@ func cmdAgent(args []string) error {
 	if _, err := os.Stat(*codexBin); err == nil {
 		a.Codex = *codexBin
 	}
+	if *vaultDir != "" {
+		d, err := notes.OpenDisk(*vaultDir)
+		if err != nil {
+			return fmt.Errorf("Vault を開けない: %w", err)
+		}
+		defer d.Close()
+		a.Notes = &notes.Git{Disk: d}
+	}
 	fmt.Printf("実行面    %s\nscope     %v\n落とし先  %s\n", *sock, *scope, a.LogDir)
+	if a.Notes != nil {
+		fmt.Printf("Vault     %s（ノートを書く・commit・push する）\n", *vaultDir)
+	}
 	// 名乗りと同じ見分け方で出す（駆動器が「この設定なら起こせる」と言うか）。
 	for _, d := range session.AgentSummary(a) {
 		fmt.Printf("%-9s %s\n", d.Name, d.Note)

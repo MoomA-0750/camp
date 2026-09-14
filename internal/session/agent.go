@@ -12,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/MoomA-0750/camp/internal/notes"
 )
 
 // Agent は実行面。**本人のユーザーで動き、`claude` を起こすことだけをする。**
@@ -50,6 +52,10 @@ type Agent struct {
 	CodexHome string
 	// CodexWithoutScope は scope 無しでも Codex を起こしてよいか。**テストの偽物のためだけ。**
 	CodexWithoutScope bool
+
+	// Notes は Vault のノートを書く者（agent_notes.go、Phase 5 / M53）。nil なら書かない。
+	// **Vault の場所は実行面の設定で決める**（campd agent -vault）。campd からは受け取らない。
+	Notes *notes.Git
 
 	// scope の後始末を確かめる口（scope.go）。テストで差し替える。nil なら systemd に訊く。
 	ScopeProcs func(scope string) ([]int, error)
@@ -151,7 +157,7 @@ func (a *Agent) Dial(version string) error {
 	// **起こせるエージェントも名乗る。** 名乗らないと、campd は Codex を頼んでよいか
 	// 分からない（古い実行面は claude を起こしてしまう）。
 	if err := a.send(Msg{T: MsgHello, Version: version, Build: selfBuild(), Held: a.held(),
-		Agents: a.agents(), Drivers: a.driverInfos()}); err != nil {
+		Agents: a.agents(), Drivers: a.driverInfos(), NoteVault: a.noteVaultDir()}); err != nil {
 		c.Close()
 		return err
 	}
@@ -301,6 +307,14 @@ func (a *Agent) Run() error {
 			go a.recRead(m)
 		case MsgControl:
 			go a.control(m)
+		case MsgNoteWrite:
+			go a.noteWrite(m)
+		case MsgNoteCommit:
+			go a.noteCommit(m)
+		case MsgNotePush:
+			go a.notePush(m)
+		case MsgNoteTrash:
+			go a.noteTrash(m)
 		case MsgError:
 			fmt.Fprintln(os.Stderr, "campd:", m.Error)
 			if strings.Contains(m.Error, "既に繋がっている") ||

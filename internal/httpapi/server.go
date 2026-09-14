@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"github.com/MoomA-0750/camp/internal/noteedit"
 	"html"
 	"io/fs"
 	"log/slog"
@@ -37,6 +38,8 @@ type Options struct {
 	// Sessions があれば /api/runtime を開く。無ければ開かない
 	// （campd serve 以外の入口から、うっかり実行面を生やさないため）。
 	Sessions *session.Supervisor
+	// Notes があればノートの編集の口（/api/notes/{id}/source・/api/notes/sync）を開く（Phase 5 / M53）。
+	Notes *noteedit.Service
 }
 
 // Server は Camp の HTTP サーバー。
@@ -111,6 +114,7 @@ func New(db *store.DB, o Options) (*Server, error) {
 	s.routes()
 	s.runtimeRoutes()
 	s.allowlistRoutes()
+	s.noteRoutes()
 	s.sshRoutes()
 	s.recordRoutes()
 	return s, nil

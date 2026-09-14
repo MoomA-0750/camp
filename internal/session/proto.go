@@ -3,6 +3,8 @@ package session
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/MoomA-0750/camp/internal/notes"
 )
 
 // 実行面と campd のあいだで流れるものの全部。1行1JSON。
@@ -149,6 +151,29 @@ type Msg struct {
 	// （訊いたあとで差分が変わった）・Codex 側で片付いた・答えが子へ届かなかった。
 	// **campd の台帳を「待っている」のまま残さない**（Fable の実装後レビュー 2）。
 	Withdrawn bool `json:"withdrawn,omitempty"`
+	// Vault のノートを書く（Phase 5 / M53）。**Vault の場所は運ばない**——実行面が自分で持ち、
+	// campd から来るのは Vault の中の相対パスだけ（設計書「書く口」）。
+	//
+	// NoteVault は実行面が書く Vault の実パス（hello）。古い実行面は名乗らないので書けない扱い。
+	// **campd は場所を送らない。** 名乗られた場所と、ノートの属する Vault の場所を照らし、
+	// 違えば頼まない（別の Vault の同じ相対パスを書かないため）。
+	NoteVault  string `json:"note_vault,omitempty"`
+	NotePath   string `json:"note_path,omitempty"`
+	NoteBase   string `json:"note_base,omitempty"`
+	NoteBody   string `json:"note_body,omitempty"`
+	NoteCreate bool   `json:"note_create,omitempty"`
+	// NoteReauth は「パスワードを入れ直した保存」。指示の紙はこれが無ければ実行面も書かない。
+	NoteReauth  bool          `json:"note_reauth,omitempty"`
+	NoteEntries []notes.Entry `json:"note_entries,omitempty"`
+	// NoteKnown は campd が覚えている Camp の commit の id（push でこれ以外が混ざれば出さない）。
+	NoteKnown   []string            `json:"note_known,omitempty"`
+	NoteWrote   *notes.Result       `json:"note_wrote,omitempty"`
+	NoteCommit  *notes.CommitResult `json:"note_commit,omitempty"`
+	NotePush    *notes.PushResult   `json:"note_push,omitempty"`
+	NoteTrashed *notes.TrashResult  `json:"note_trashed,omitempty"`
+	// NoteBusy は「待ってやり直せばよい」失敗（ほかの git が動いている）。
+	NoteBusy bool `json:"note_busy,omitempty"`
+
 	// Halt は、頼んだ確認の度合いで起きていなかった（frame。理由は Error）。**campd は孫まで止めて
 	// 「起こせなかった」と書く**（起こしたときに1回だけ照らす。途中の変化は Note で記録するだけ）。
 	Halt bool `json:"halt,omitempty"`
@@ -202,6 +227,9 @@ const (
 	// 向こうのホストの記録（M47）。**読むだけ。向こうへは書かない。**
 	MsgRecListRes = "rec_list_result"
 	MsgRecReadRes = "rec_read_result"
+
+	// MsgNoteRes は note_write・note_commit・note_push の返事（Phase 5 / M53）。
+	MsgNoteRes = "note_result"
 )
 
 // campd → 実行面
@@ -228,6 +256,12 @@ const (
 	// MsgRecRead は記録の中身を範囲で寄こせ。**まとめて頼む**——1本ずつ繋ぎ直すと、
 	// 変わっていない記録40本でも40回 ssh することになる。
 	MsgRecRead = "rec_read"
+
+	// Vault のノートを書く（Phase 5 / M53）。**書くのは実行面**（campd は Vault に書けない、D-024）。
+	MsgNoteWrite  = "note_write"  // 1本書く。書き始めた中身のハッシュが今と同じときだけ
+	MsgNoteCommit = "note_commit" // 待ち行のうち、Camp が書いたままのものを commit する
+	MsgNotePush   = "note_push"   // push を待つ commit が全部 Camp のものなら出す
+	MsgNoteTrash  = "note_trash"  // 1本を .trash/ へ移す。今の中身のハッシュが見ていた版と同じときだけ（M55）
 )
 
 // 状態機械。**この5つ以外の状態を作らない。**

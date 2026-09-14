@@ -295,6 +295,91 @@ export type RuntimeUsage = {
   running: number; max: number; warning?: string
 }
 
+// ノートの編集（Phase 5 / M53・M54）。
+export type NoteSource = {
+  note_id: number; path: string; body: string; sha256: string
+  editable: boolean; instruction?: boolean; read_only?: string
+}
+export type NoteSaveResult = {
+  status: 'saved' | 'merged' | 'conflict'
+  sha256: string
+  // 画面が送った本文のハッシュ。**merged のあとの base はこれ**（合わせた版の sha ではない）。
+  sent_sha256: string
+  body?: string
+  disk?: string
+  disk_sha256?: string
+}
+/** 保存の返事。code 0 は網の失敗（届かなかった）。 */
+export type NoteSaveReply = { ok: true; res: NoteSaveResult } | { ok: false; code: number; error: string }
+export type WikiTarget = { to_id?: number; to_path?: string; ambiguous?: boolean; candidates?: string[] }
+export type NoteSync = {
+  pending: number
+  overwritten: { id: number; path: string; sha256: string; disk_sha256?: string; at: string }[]
+  push: { kind: string; detail?: string; pending?: number; merged?: boolean }
+  push_at?: string
+  vault?: string
+  vault_id?: number
+}
+
+// 行き来（Phase 5 / M55）。link は wikilink に入れる形（サーバーが resolve.go の規則で決める。空なら書けない名前）。
+export type NoteName = { id: number; path: string; link?: string; editable?: boolean }
+export type NoteNames = { gen: string; same?: boolean; names?: NoteName[] }
+export type NoteCreated = { note_id: number; path: string; created: boolean; warn?: string }
+export type NoteWriteRow = { id: number; sha256: string; state: string; op: string; at: string; detail?: string }
+export type NoteTrashed = { status: 'trashed' | 'changed' | 'gone' | 'kept' | 'waiting'; to?: string; disk_sha256?: string }
+/** 作る・移すの返事。409 は既にある（note_id はそのノート）。 */
+export type NoteReply<T> = { ok: true; res: T } | { ok: false; code: number; error: string; note_id?: number; path?: string }
+
+async function postQuiet<T>(path: string, body: unknown): Promise<NoteReply<T>> {
+  let res: Response
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch (e) {
+    return { ok: false, code: 0, error: (e as Error).message || '届かなかった' }
+  }
+  const b = await res.json().catch(() => ({}))
+  if (res.ok) return { ok: true, res: b as T }
+  const e = b as { error?: string; note_id?: number; path?: string }
+  return { ok: false, code: res.status, error: e.error ?? `${res.status}`, note_id: e.note_id, path: e.path }
+}
+
+export const createNote = (vault: number, path: string, body: string) =>
+  postQuiet<NoteCreated>(`/api/vaults/${vault}/notes`, { path, body })
+export const dailyNote = (vault: number, date: string) =>
+  postQuiet<NoteCreated>(`/api/vaults/${vault}/daily`, { date })
+export const trashNote = (id: number, base: string, password?: string) =>
+  postQuiet<NoteTrashed>(`/api/notes/${id}/trash`, { base_sha256: base, ...(password ? { password } : {}) })
+
+export async function saveNote(id: number, base: string, body: string, password?: string): Promise<NoteSaveReply> {
+  let res: Response
+  try {
+    res = await fetch(`/api/notes/${id}/source`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ base_sha256: base, body, ...(password ? { password } : {}) }),
+    })
+  } catch (e) {
+    return { ok: false, code: 0, error: (e as Error).message || '届かなかった' }
+  }
+  const b = await res.json().catch(() => ({}))
+  if (res.ok) return { ok: true, res: b as NoteSaveResult }
+  return { ok: false, code: res.status, error: (b as { error?: string }).error ?? `${res.status}` }
+}
+
+/**
+ * 書く画面の定期の問い合わせ用。**401 でもログイン画面へ飛ばさない**——書いている途中で画面ごと移ると、
+ * 保存していない分が画面から消える（控えはあるが、本人の手を止める）。保存の側が 401 を画面に出す。
+ */
+async function fetchQuiet<T>(path: string): Promise<T> {
+  const res = await fetch(path, { headers: { Accept: 'application/json' } })
+  if (!res.ok) throw new Error(`${res.status}`)
+  return res.json() as Promise<T>
+}
+
 /** 認証が切れていたらログイン画面へ送る。画面ごとに書かない。 */
 async function fetchJSON<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
@@ -394,6 +479,21 @@ export const api = {
     fetchJSON<ViewResult>('/api/views/' + id.split('/').map(encodeURIComponent).join('/')),
 
   // 本文は blobs から返る。ノートが Vault から消えていても読める。
+  noteSource: (id: number) => fetchJSON<NoteSource>(`/api/notes/${id}/source`),
+  noteDiskSha: (id: number) => fetchQuiet<{ sha256: string }>(`/api/notes/${id}/source/sha`),
+  noteResolve: async (id: number, targets: string[]) => {
+    // 書く画面から呼ぶので 401 でも飛ばさない（fetchQuiet と同じ理由）。
+    const res = await fetch(`/api/notes/${id}/resolve`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ targets }),
+    })
+    if (!res.ok) throw new Error(`${res.status}`)
+    return res.json() as Promise<Record<string, WikiTarget>>
+  },
+  noteSync: () => fetchQuiet<NoteSync>('/api/notes/sync'),
+  noteWrites: (id: number) => fetchQuiet<NoteWriteRow[]>(`/api/notes/${id}/writes`),
+  noteNames: (vault: number, gen = '') => fetchQuiet<NoteNames>(`/api/vaults/${vault}/names` + (gen ? `?gen=${encodeURIComponent(gen)}` : '')),
+  noteWrite: (wid: number) => fetchJSON<{ id: number; note_id: number; path: string; sha256: string; state: string; body: string }>(`/api/note-writes/${wid}`),
   noteBody: async (id: number) => {
     const res = await fetch(`/api/notes/${id}/body`)
     if (res.status === 401) { location.href = '/login'; throw new Error('未認証') }

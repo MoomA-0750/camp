@@ -21,6 +21,9 @@ ExecStart=/usr/local/bin/campd agent
 # 制御口。campd が RuntimeDirectory=camp で作る /run/camp の中。
 Environment=CAMP_AGENT_SOCK=/run/camp/agent.sock
 Environment=CAMP_CLAUDE_BIN=%h/.local/bin/claude
+# ノートを書く Vault（Phase 5 / M53）。**campd は Vault に書けない**ので、書く・commit・push は
+# 実行面がする。場所はここで決め、campd からは受け取らない。
+Environment=CAMP_AGENT_VAULT=%h/Documents/git-cloned/Obsidian-Vault
 
 # campd が居ないと繋げない。落ちても諦めずに待つ。
 Restart=always
